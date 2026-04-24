@@ -1,0 +1,65 @@
+{
+    "project_root": ".",
+    "db_path": "db/news_unified.db",
+    "legacy_db_path": "news_unified.db",
+    "schema_path": "db/schema.sql",
+
+    "inbox_tiktok": "inbox/tiktok",
+    "inbox_documents": "inbox/documents",
+    "inbox_youtube": "inbox/youtube",
+
+    "processed_tiktok": "processed/tiktok",
+    "processed_youtube": "processed/youtube",
+    "processed_documents": "processed/documents",
+    "processed_telegram": "processed/telegram",
+    "processed_keyframes": "processed/keyframes",
+
+    "ollama_models_dir": "",
+    "ollama_base_url": "http://localhost:11434",
+    "ollama_host": "http://localhost:11434",
+    "ollama_model": "qwen2.5:14b",
+    "ollama_embed_model": "nomic-embed-text",
+
+    "whisper_model": "large-v3",
+    "whisper_device": "cuda",
+    "whisper_compute_type": "float16",
+
+    "ocr_engine": "paddleocr",
+    "ocr_lang": "ru",
+
+    "telegram_api_id": null,
+    "telegram_api_hash": null,
+    "telegram_session_dir": "config",
+    "telegram_collect_interval_seconds": 300,
+    "telegram_posts_per_channel": 100,
+
+    "youtube_collect_interval_seconds": 14400,
+    "youtube_format": "bestvideo[height<=720]+bestaudio/best[height<=720]",
+
+    "watch_folder_interval_seconds": 60,
+
+    "web_collect_interval_seconds": 86400,
+    "rss_collect_interval_seconds": 1800,
+
+    "classification_interval_seconds": 21600,
+    "verification_interval_seconds": 3600,
+
+    "ner_interval_seconds": 7200,
+    "quotes_interval_seconds": 7200,
+    "claims_interval_seconds": 21600,
+    "cases_interval_seconds": 86400,
+    "youtube_interval_seconds": 86400,
+    "rss_interval_seconds": 3600,
+    "llm_interval_seconds": 43200,
+    "accountability_interval_seconds": 86400,
+
+    "duma_api_token": null,
+
+    "http_proxy": null,
+    "https_proxy": null,
+
+    "log_level": "INFO",
+    "log_file": "app.log",
+
+    "obsidian_export_dir": "obsidian_export"
+}
