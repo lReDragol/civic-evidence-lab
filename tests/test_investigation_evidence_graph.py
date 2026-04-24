@@ -17,6 +17,7 @@ def create_db(db_path: Path):
         conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
         conn.executescript(
             """
+            INSERT INTO sources(id, name, category, url) VALUES(1, 'Fixture Source', 'telegram', 'https://example.test/source');
             CREATE TABLE IF NOT EXISTS official_positions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 entity_id INTEGER NOT NULL,
@@ -214,6 +215,64 @@ def create_db(db_path: Path):
                 (8, 4, "Vendor Without INN", "supplier", ""),
             ],
         )
+        conn.executemany(
+            """
+            INSERT INTO content_items(
+                id, source_id, content_type, title, body_text, published_at, status
+            ) VALUES(?,?,?,?,?,?,?)
+            """,
+            [
+                (
+                    100,
+                    1,
+                    "post",
+                    "Customer Org accuses Supplier Org",
+                    "Customer Org says Supplier Org received a questionable contract.",
+                    "2026-04-05T10:00:00",
+                    "classified",
+                ),
+                (
+                    101,
+                    1,
+                    "document",
+                    "Official contract evidence",
+                    "Supplier Org appears in the supporting procurement document.",
+                    "2026-04-06T10:00:00",
+                    "verified",
+                ),
+            ],
+        )
+        conn.executemany(
+            """
+            INSERT INTO entity_mentions(
+                entity_id, content_item_id, mention_type, confidence
+            ) VALUES(?,?,?,?)
+            """,
+            [
+                (1, 100, "organization", 1.0),
+                (2, 100, "organization", 1.0),
+                (2, 101, "organization", 1.0),
+            ],
+        )
+        conn.execute(
+            """
+            INSERT INTO claims(
+                id, content_item_id, claim_text, claim_type, status, confidence_final, needs_review
+            ) VALUES(
+                50, 100, 'Supplier Org received a questionable contract', 'government_contract',
+                'partially_confirmed', 0.8, 0
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO evidence_links(
+                claim_id, evidence_item_id, evidence_type, strength, notes, linked_by
+            ) VALUES(
+                50, 101, 'official_document', 'strong', 'fixture evidence', 'unit-test'
+            )
+            """
+        )
         conn.commit()
     finally:
         conn.close()
@@ -303,6 +362,74 @@ class InvestigationEvidenceGraphTests(unittest.TestCase):
                         chain.entity_path == [3, contract_nodes[0].entity_id, 4]
                         for chain in org_result.evidence_chains
                     )
+                )
+            finally:
+                engine.close()
+
+    def test_engine_builds_claim_content_evidence_chain(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "sample.db"
+            create_db(db_path)
+
+            engine = InvestigationEngine(str(db_path))
+            try:
+                result = engine.investigate(1, max_hops=3, min_confidence=Confidence.LIKELY)
+                claim_nodes = [node for node in result.nodes.values() if node.node_type == NodeType.CLAIM]
+                content_nodes = [node for node in result.nodes.values() if node.node_type == NodeType.CONTENT]
+
+                self.assertTrue(claim_nodes)
+                self.assertTrue(content_nodes)
+                self.assertTrue(
+                    any(
+                        edge.relation_type == "has_claim"
+                        and {edge.from_id, edge.to_id} == {1, claim_nodes[0].entity_id}
+                        for edge in result.edges
+                    )
+                )
+                self.assertTrue(
+                    any(
+                        edge.relation_type == "reported_in"
+                        and claim_nodes[0].entity_id in {edge.from_id, edge.to_id}
+                        for edge in result.edges
+                    )
+                )
+                self.assertTrue(
+                    any(
+                        edge.relation_type == "supported_by"
+                        and claim_nodes[0].entity_id in {edge.from_id, edge.to_id}
+                        for edge in result.edges
+                    )
+                )
+                self.assertTrue(
+                    any(
+                        edge.relation_type == "mentions_entity"
+                        and edge.to_id == 2
+                        for edge in result.edges
+                    )
+                )
+                self.assertTrue(
+                    any(
+                        chain.entity_path[0] == 1
+                        and claim_nodes[0].entity_id in chain.entity_path
+                        and 2 in chain.entity_path
+                        for chain in result.evidence_chains
+                    )
+                )
+            finally:
+                engine.close()
+
+    def test_engine_respects_max_nodes_limit_for_virtual_evidence_graph(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "sample.db"
+            create_db(db_path)
+
+            engine = InvestigationEngine(str(db_path), max_nodes=4, max_edges=16)
+            try:
+                result = engine.investigate(1, max_hops=3, min_confidence=Confidence.LIKELY)
+                self.assertLessEqual(len(result.nodes), 4)
+                self.assertLessEqual(len(result.edges), 16)
+                self.assertTrue(
+                    all(edge.from_id in result.nodes and edge.to_id in result.nodes for edge in result.edges)
                 )
             finally:
                 engine.close()

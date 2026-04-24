@@ -167,6 +167,9 @@ RELATION_LABELS = {
     "same_region_contract": "Контракт в регионе",
     "bill_beneficiary": "Бенефициар закона",
     "about_bill": "По законопроекту",
+    "reported_in": "Зафиксировано в",
+    "supported_by": "Подкреплено доказательством",
+    "mentions_entity": "Упоминает",
 }
 
 RELATION_INVERSE_LABELS = {
@@ -188,6 +191,9 @@ RELATION_INVERSE_LABELS = {
     "has_risk": "Фигурант риска",
     "bill_beneficiary": "Даёт выгоду",
     "about_bill": "Имеет голосование",
+    "reported_in": "Содержит заявление",
+    "supported_by": "Служит доказательством для",
+    "mentions_entity": "Упомянут в",
 }
 
 RELATION_CONFIDENCE = {
@@ -215,8 +221,11 @@ RELATION_CONFIDENCE = {
     "same_region_contract": Confidence.LIKELY,
     "bill_beneficiary": Confidence.LIKELY,
     "about_bill": Confidence.CONFIRMED,
+    "reported_in": Confidence.CONFIRMED,
+    "mentions_entity": Confidence.CONFIRMED,
     "mentioned_together": None,
     "has_claim": Confidence.LIKELY,
+    "supported_by": None,
     "has_risk": Confidence.LIKELY,
     "member_of": Confidence.CONFIRMED,
 }
