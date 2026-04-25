@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import subprocess
 import sys
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from PySide6.QtWebEngineWidgets import QWebEngineView
 from config.db_utils import CONFIG_DIR, SETTINGS_PATH, ensure_dirs, get_db, load_settings, setup_logging
 from ui.job_registry import INTERVAL_KEYS, JOB_DEFS, JOB_FUNC_MAP, get_job_def, interval_for_job
 from ui.web_bridge import DashboardBridge, DashboardDataService
+from runtime.state import DAEMON_JOB_ID, active_job_lease, request_daemon_stop
 
 
 log = logging.getLogger(__name__)
@@ -22,25 +24,42 @@ WEB_ROOT = PROJECT_ROOT / "ui_web"
 
 
 class WorkerThread(QThread):
-    finished_signal = Signal(str, bool, str)
+    finished_signal = Signal(str, bool, str, str)
 
-    def __init__(self, job_id: str, func, parent=None):
+    def __init__(self, job_id: str, command: list[str], parent=None):
         super().__init__(parent)
         self.job_id = job_id
-        self.func = func
+        self.command = command
         self._cancelled = False
+        self._process = None
 
     def run(self):
         try:
-            self.func()
+            self._process = subprocess.Popen(
+                self.command,
+                cwd=str(PROJECT_ROOT),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            stdout, stderr = self._process.communicate()
             if not self._cancelled:
-                self.finished_signal.emit(self.job_id, True, "")
+                ok = self._process.returncode == 0
+                payload = (stdout or stderr or "").strip()
+                self.finished_signal.emit(self.job_id, ok, payload, "")
         except Exception as error:
             if not self._cancelled:
-                self.finished_signal.emit(self.job_id, False, str(error))
+                self.finished_signal.emit(self.job_id, False, "", str(error))
 
     def cancel(self):
         self._cancelled = True
+        try:
+            if self._process and self._process.poll() is None:
+                self._process.terminate()
+        except Exception:
+            pass
 
 
 class WebDashboardWindow(QMainWindow):
@@ -50,9 +69,7 @@ class WebDashboardWindow(QMainWindow):
         super().__init__()
         self.settings = settings or load_settings()
         self.db = get_db(self.settings)
-        self.scheduler = None
         self._workers: dict[str, WorkerThread] = {}
-        self._job_logs: list[dict] = []
 
         self.setWindowTitle("Civic Evidence Lab")
         self.setMinimumSize(1440, 900)
@@ -75,13 +92,53 @@ class WebDashboardWindow(QMainWindow):
 
     # Controller API used by DashboardBridge
     def running_jobs(self):
-        return set(self._workers.keys())
+        active = set()
+        try:
+            for row in self.db.execute(
+                """
+                SELECT job_id
+                FROM job_leases
+                WHERE job_id != ?
+                """
+                ,
+                (DAEMON_JOB_ID,),
+            ).fetchall():
+                lease = active_job_lease(self.db, row[0])
+                if lease:
+                    active.add(str(row[0]))
+        except Exception:
+            pass
+        active.update(self._workers.keys())
+        return active
 
     def scheduler_running(self):
-        return self.scheduler is not None
+        try:
+            return active_job_lease(self.db, DAEMON_JOB_ID) is not None
+        except Exception:
+            return False
 
     def logs(self):
-        return list(self._job_logs[-80:])
+        entries = []
+        try:
+            rows = self.db.execute(
+                """
+                SELECT job_id, status, started_at, finished_at, items_new, error_summary
+                FROM job_runs
+                ORDER BY id DESC
+                LIMIT 80
+                """
+            ).fetchall()
+            for row in rows:
+                level = "success" if row["status"] == "ok" else "warning" if row["status"] == "abandoned" else "error" if row["status"] == "failed" else "info"
+                message = f"{row['job_id']}: {row['status']}"
+                if row["items_new"]:
+                    message += f" · new {row['items_new']}"
+                if row["error_summary"]:
+                    message += f" · {row['error_summary']}"
+                entries.append({"message": message, "level": level})
+        except Exception:
+            return []
+        return entries
 
     def toggle_pin_source(self, source_id: int):
         pinned = set()
@@ -109,12 +166,25 @@ class WebDashboardWindow(QMainWindow):
     def run_job(self, job_id: str):
         if not job_id or job_id in self._workers:
             return
-        func = JOB_FUNC_MAP.get(job_id)
-        if not func:
+        if job_id not in JOB_FUNC_MAP:
             self._append_log(f"Нет функции для задачи {job_id}", level="error")
             return
         self.settings[f"job_{job_id}_running"] = True
-        worker = WorkerThread(job_id, func, self)
+        worker = WorkerThread(
+            job_id,
+            [
+                sys.executable,
+                "-m",
+                "runtime.run_job",
+                "--job",
+                job_id,
+                "--trigger-mode",
+                "manual",
+                "--requested-by",
+                "ui",
+            ],
+            self,
+        )
         worker.finished_signal.connect(self._on_job_finished)
         self._workers[job_id] = worker
         self._append_log(f"Запуск задачи: {job_id}", level="info")
@@ -128,36 +198,30 @@ class WebDashboardWindow(QMainWindow):
             worker.cancel()
             worker.quit()
             worker.wait(3000)
+            self._append_log(f"Остановлена задача: {job_id}", level="warning")
+        else:
+            self._append_log(f"Для {job_id} доступна только мягкая остановка через runtime recovery", level="warning")
         self._workers.pop(job_id, None)
         self.settings[f"job_{job_id}_running"] = False
-        self._append_log(f"Остановлена задача: {job_id}", level="warning")
         self.bridge.emit_bootstrap()
         self._update_statusbar()
 
     def toggle_scheduler(self):
-        if self.scheduler is None:
-            from apscheduler.schedulers.background import BackgroundScheduler
-            from apscheduler.triggers.interval import IntervalTrigger
-
-            self.scheduler = BackgroundScheduler()
-            for job in JOB_DEFS:
-                job_id = job["id"]
-                if job_id not in JOB_FUNC_MAP:
-                    continue
-                interval_seconds = interval_for_job(self.settings, job_id)
-                self.scheduler.add_job(
-                    lambda jid=job_id: self.job_requested.emit(jid),
-                    IntervalTrigger(seconds=interval_seconds),
-                    id=job_id,
-                    name=job["name"],
-                    replace_existing=True,
-                )
-            self.scheduler.start()
-            self._append_log("Планировщик запущен", level="success")
+        if not self.scheduler_running():
+            flags = 0
+            if sys.platform.startswith("win"):
+                flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            subprocess.Popen(
+                [sys.executable, "-m", "runtime.daemon"],
+                cwd=str(PROJECT_ROOT),
+                creationflags=flags,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            self._append_log("Фоновый daemon запускается", level="success")
         else:
-            self.scheduler.shutdown(wait=False)
-            self.scheduler = None
-            self._append_log("Планировщик остановлен", level="warning")
+            request_daemon_stop(self.db, True)
+            self._append_log("Отправлен запрос на остановку daemon", level="warning")
         self.bridge.emit_bootstrap()
         self._update_statusbar()
 
@@ -177,14 +241,21 @@ class WebDashboardWindow(QMainWindow):
         self.settings["obsidian_export_dir"] = target_dir
         self._persist_settings({"obsidian_export_dir"})
 
-        db_path = self.settings.get("db_path", str(PROJECT_ROOT / "db" / "news_unified.db"))
-
-        def _export():
-            from tools.export_obsidian import export_obsidian
-
-            export_obsidian(Path(db_path), Path(target_dir), copy_media=True, mode="graph")
-
-        worker = WorkerThread("obsidian_export", _export, self)
+        worker = WorkerThread(
+            "obsidian_export",
+            [
+                sys.executable,
+                "-m",
+                "runtime.run_job",
+                "--job",
+                "obsidian_export",
+                "--trigger-mode",
+                "manual",
+                "--requested-by",
+                "ui",
+            ],
+            self,
+        )
         worker.finished_signal.connect(self._on_export_finished)
         self._workers["obsidian_export"] = worker
         self._append_log(f"Запущена выгрузка Obsidian: {target_dir}", level="info")
@@ -216,34 +287,39 @@ class WebDashboardWindow(QMainWindow):
             log.warning("Failed to refresh frontend: %s", error)
 
     def _append_log(self, message: str, *, level: str = "info", notify: bool = True):
-        entry = {
-            "message": message,
-            "level": level,
-        }
-        self._job_logs.append(entry)
-        self._job_logs = self._job_logs[-100:]
         if notify:
             self.bridge.emit_toast(message, level=level)
 
-    def _on_job_finished(self, job_id: str, success: bool, error: str):
+    def _on_job_finished(self, job_id: str, success: bool, payload: str, error: str):
         self._workers.pop(job_id, None)
         self.settings[f"job_{job_id}_running"] = False
-        if success:
-            self._append_log(f"Задача завершена: {job_id}", level="success")
+        try:
+            data = json.loads(payload) if payload else {}
+        except json.JSONDecodeError:
+            data = {}
+        if success and data.get("ok", True):
+            suffix = f" · new {data.get('items_new')}" if data.get("items_new") else ""
+            self._append_log(f"Задача завершена: {job_id}{suffix}", level="success")
         else:
-            self._append_log(f"Ошибка {job_id}: {error[:260]}", level="error")
+            message = error[:260] if error else (payload[:260] if payload else f"Ошибка {job_id}")
+            self._append_log(f"Ошибка {job_id}: {message}", level="error")
         self.bridge.emit_bootstrap()
         self._refresh_frontend()
         self._update_statusbar()
 
-    def _on_export_finished(self, job_id: str, success: bool, error: str):
+    def _on_export_finished(self, job_id: str, success: bool, payload: str, error: str):
         self._workers.pop(job_id, None)
-        if success:
+        try:
+            data = json.loads(payload) if payload else {}
+        except json.JSONDecodeError:
+            data = {}
+        if success and data.get("ok", True):
             self._append_log("Выгрузка в Obsidian завершена", level="success")
             QMessageBox.information(self, "Obsidian export", "Выгрузка в Obsidian завершена.")
         else:
-            self._append_log(f"Obsidian export error: {error[:260]}", level="error")
-            QMessageBox.critical(self, "Obsidian export", error or "Неизвестная ошибка")
+            message = error or payload or "Неизвестная ошибка"
+            self._append_log(f"Obsidian export error: {message[:260]}", level="error")
+            QMessageBox.critical(self, "Obsidian export", message)
         self.bridge.emit_bootstrap()
         self._update_statusbar()
 
@@ -272,8 +348,6 @@ class WebDashboardWindow(QMainWindow):
         )
 
     def closeEvent(self, event):
-        if self.scheduler:
-            self.scheduler.shutdown(wait=False)
         for worker in list(self._workers.values()):
             if worker.isRunning():
                 worker.cancel()

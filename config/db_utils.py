@@ -13,6 +13,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_DIR = PROJECT_ROOT / "config"
 SETTINGS_PATH = CONFIG_DIR / "settings.json"
 SECRETS_PATH = CONFIG_DIR / "secrets.json"
+SCHEMA_PATH = PROJECT_ROOT / "db" / "schema.sql"
 
 
 def load_settings() -> dict:
@@ -27,6 +28,13 @@ def load_settings() -> dict:
     return settings
 
 
+def exec_schema(conn: sqlite3.Connection, schema_path: Path | None = None):
+    target_schema = schema_path or SCHEMA_PATH
+    sql = target_schema.read_text(encoding="utf-8")
+    conn.executescript(sql)
+    conn.commit()
+
+
 def get_db(settings: dict = None) -> sqlite3.Connection:
     if settings is None:
         settings = load_settings()
@@ -38,6 +46,8 @@ def get_db(settings: dict = None) -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA busy_timeout = 30000")
     conn.execute("PRAGMA journal_mode = WAL")
+    if settings.get("ensure_schema_on_connect", True):
+        exec_schema(conn, SCHEMA_PATH)
     return conn
 
 

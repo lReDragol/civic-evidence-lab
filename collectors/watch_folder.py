@@ -16,6 +16,7 @@ if sys_path not in os.sys.path:
 
 from config.db_utils import get_db, load_settings, ensure_dirs
 from db.file_store import attach_file
+from runtime.state import record_dead_letter, update_source_sync_state
 
 log = logging.getLogger(__name__)
 
@@ -78,12 +79,52 @@ def find_source_for_file(conn: sqlite3.Connection, filename: str, inbox_type: st
     return row[0] if row else None
 
 
-def process_video_file(filepath: Path, inbox_type: str, conn: sqlite3.Connection, settings: dict) -> bool:
+def _watch_source_key(inbox_type: str, source_id: int | None) -> str:
+    return f"watch_folder:{inbox_type}:{int(source_id or 0)}"
+
+
+def _mark_watch_state(
+    conn: sqlite3.Connection,
+    *,
+    inbox_type: str,
+    source_id: int | None,
+    filepath: Path,
+    success: bool,
+    external_id: str | None,
+    hash_sha256: str | None,
+    transport_mode: str,
+    status: str,
+    last_error: str | None = None,
+    metadata: dict | None = None,
+):
+    payload = {
+        "last_filename": filepath.name,
+        "file_path": str(filepath.resolve(strict=False)),
+        "status": status,
+    }
+    if metadata:
+        payload.update(metadata)
+    update_source_sync_state(
+        conn,
+        source_key=_watch_source_key(inbox_type, source_id),
+        source_id=source_id,
+        success=success,
+        last_cursor=str(filepath.resolve(strict=False)),
+        last_external_id=external_id,
+        last_hash=hash_sha256,
+        transport_mode=transport_mode,
+        last_error=last_error,
+        metadata=payload,
+    )
+
+
+def process_video_file(filepath: Path, inbox_type: str, conn: sqlite3.Connection, settings: dict) -> str:
     source_id = find_source_for_file(conn, filepath.name, inbox_type)
     if not source_id:
         source_id = 1
 
     sha = file_hash(filepath)
+    external_id = sha[:32]
     probe = probe_video(filepath)
 
     duration = 0
@@ -109,12 +150,24 @@ def process_video_file(filepath: Path, inbox_type: str, conn: sqlite3.Connection
     ).fetchone()
     if existing:
         log.info("Already processed: %s (hash=%s)", filepath.name, sha[:12])
-        return True
+        _mark_watch_state(
+            conn,
+            inbox_type=inbox_type,
+            source_id=source_id,
+            filepath=filepath,
+            success=True,
+            external_id=external_id,
+            hash_sha256=sha,
+            transport_mode=f"watch_folder:{inbox_type}",
+            status="duplicate",
+            metadata={"raw_item_id": int(existing[0])},
+        )
+        return "duplicate"
 
     cur = conn.execute(
         """INSERT INTO raw_source_items(source_id, external_id, raw_payload, collected_at, hash_sha256, is_processed)
            VALUES(?,?,?,?,?,0)""",
-        (source_id, sha[:32], raw_json, datetime.now().isoformat(), sha),
+        (source_id, external_id, raw_json, datetime.now().isoformat(), sha),
     )
     raw_id = cur.lastrowid
 
@@ -126,7 +179,7 @@ def process_video_file(filepath: Path, inbox_type: str, conn: sqlite3.Connection
     cur2 = conn.execute(
         """INSERT INTO content_items(source_id, raw_item_id, external_id, content_type, title, body_text, published_at, collected_at, url, status)
            VALUES(?,?,?,?,?,?,?,?,?,'raw_signal')""",
-        (source_id, raw_id, sha[:32], content_type, title, "", datetime.now().isoformat(), datetime.now().isoformat(), str(filepath)),
+        (source_id, raw_id, external_id, content_type, title, "", datetime.now().isoformat(), datetime.now().isoformat(), str(filepath)),
     )
     content_id = cur2.lastrowid
 
@@ -142,61 +195,120 @@ def process_video_file(filepath: Path, inbox_type: str, conn: sqlite3.Connection
 
     try:
         shutil.copy2(str(filepath), str(dest_path))
-    except Exception as e:
-        log.error("Copy failed %s: %s", filepath, e)
-        conn.rollback()
-        return False
-    conn.execute("UPDATE content_items SET url=? WHERE id=?", (str(dest_path), content_id))
+        conn.execute("UPDATE content_items SET url=? WHERE id=?", (str(dest_path), content_id))
 
-    attach_file(
-        conn,
-        content_id,
-        raw_id,
-        dest_path,
-        "video",
-        mime_type=f"video/{filepath.suffix.lstrip('.')}",
-        hash_sha256=sha,
-        file_size=dest_path.stat().st_size,
-        metadata={"source_inbox": inbox_type, "original_path": str(filepath)},
-    )
-
-    keyframe_dir = Path(settings.get("processed_keyframes", "")) / ts / filepath.stem
-    keyframes = extract_keyframes(dest_path, keyframe_dir)
-    for kf in keyframes:
-        kf_sha = file_hash(kf)
         attach_file(
             conn,
             content_id,
             raw_id,
-            kf,
-            "keyframe",
-            mime_type="image/jpeg",
-            hash_sha256=kf_sha,
-            file_size=kf.stat().st_size,
-            is_original=0,
-            metadata={"derived_from": str(dest_path)},
+            dest_path,
+            "video",
+            mime_type=f"video/{filepath.suffix.lstrip('.')}",
+            hash_sha256=sha,
+            file_size=dest_path.stat().st_size,
+            metadata={"source_inbox": inbox_type, "original_path": str(filepath)},
         )
 
-    conn.execute("UPDATE raw_source_items SET is_processed=1 WHERE id=?", (raw_id,))
-    conn.commit()
+        keyframe_dir = Path(settings.get("processed_keyframes", "")) / ts / filepath.stem
+        keyframes = extract_keyframes(dest_path, keyframe_dir)
+        for kf in keyframes:
+            kf_sha = file_hash(kf)
+            attach_file(
+                conn,
+                content_id,
+                raw_id,
+                kf,
+                "keyframe",
+                mime_type="image/jpeg",
+                hash_sha256=kf_sha,
+                file_size=kf.stat().st_size,
+                is_original=0,
+                metadata={"derived_from": str(dest_path)},
+            )
+
+        conn.execute("UPDATE raw_source_items SET is_processed=1 WHERE id=?", (raw_id,))
+        conn.commit()
+    except Exception as e:
+        log.error("Copy failed %s: %s", filepath, e)
+        conn.rollback()
+        record_dead_letter(
+            conn,
+            failure_stage="watch_folder_copy",
+            source_key=_watch_source_key(inbox_type, source_id),
+            source_id=source_id,
+            external_id=external_id,
+            error_type=type(e).__name__,
+            error_message=str(e),
+            payload={
+                "file_path": str(filepath.resolve(strict=False)),
+                "inbox_type": inbox_type,
+                "raw_item_id": raw_id,
+                "content_item_id": content_id,
+            },
+        )
+        _mark_watch_state(
+            conn,
+            inbox_type=inbox_type,
+            source_id=source_id,
+            filepath=filepath,
+            success=False,
+            external_id=external_id,
+            hash_sha256=sha,
+            transport_mode=f"watch_folder:{inbox_type}",
+            status="failed",
+            last_error=f"{type(e).__name__}: {e}",
+            metadata={"failure_stage": "watch_folder_copy"},
+        )
+        return "failed"
+
+    _mark_watch_state(
+        conn,
+        inbox_type=inbox_type,
+        source_id=source_id,
+        filepath=filepath,
+        success=True,
+        external_id=external_id,
+        hash_sha256=sha,
+        transport_mode=f"watch_folder:{inbox_type}",
+        status="processed",
+        metadata={
+            "raw_item_id": raw_id,
+            "content_item_id": content_id,
+            "destination_path": str(dest_path.resolve(strict=False)),
+            "keyframes": len(keyframes),
+        },
+    )
 
     log.info("Processed video: %s -> %s (%d keyframes)", filepath.name, dest_path, len(keyframes))
-    return True
+    return "processed"
 
 
-def process_document_file(filepath: Path, conn: sqlite3.Connection, settings: dict) -> bool:
+def process_document_file(filepath: Path, conn: sqlite3.Connection, settings: dict) -> str:
     source_id = find_source_for_file(conn, filepath.name, "documents")
     if not source_id:
         source_id = 1
 
     sha = file_hash(filepath)
+    external_id = sha[:32]
 
     existing = conn.execute(
         "SELECT id FROM raw_source_items WHERE hash_sha256=?", (sha,)
     ).fetchone()
     if existing:
         log.info("Already processed: %s", filepath.name)
-        return True
+        _mark_watch_state(
+            conn,
+            inbox_type="documents",
+            source_id=source_id,
+            filepath=filepath,
+            success=True,
+            external_id=external_id,
+            hash_sha256=sha,
+            transport_mode="watch_folder:documents",
+            status="duplicate",
+            metadata={"raw_item_id": int(existing[0])},
+        )
+        return "duplicate"
 
     ext = filepath.suffix.lower()
     doc_type_map = {
@@ -219,7 +331,7 @@ def process_document_file(filepath: Path, conn: sqlite3.Connection, settings: di
     cur = conn.execute(
         """INSERT INTO raw_source_items(source_id, external_id, raw_payload, collected_at, hash_sha256, is_processed)
            VALUES(?,?,?,?,?,0)""",
-        (source_id, sha[:32], raw_json, datetime.now().isoformat(), sha),
+        (source_id, external_id, raw_json, datetime.now().isoformat(), sha),
     )
     raw_id = cur.lastrowid
 
@@ -227,7 +339,7 @@ def process_document_file(filepath: Path, conn: sqlite3.Connection, settings: di
     cur2 = conn.execute(
         """INSERT INTO content_items(source_id, raw_item_id, external_id, content_type, title, body_text, published_at, collected_at, url, status)
            VALUES(?,?,?,?,?,?,?,?,?,'raw_signal')""",
-        (source_id, raw_id, sha[:32], content_type, title, "", datetime.now().isoformat(), datetime.now().isoformat(), str(filepath)),
+        (source_id, raw_id, external_id, content_type, title, "", datetime.now().isoformat(), datetime.now().isoformat(), str(filepath)),
     )
     content_id = cur2.lastrowid
 
@@ -239,42 +351,88 @@ def process_document_file(filepath: Path, conn: sqlite3.Connection, settings: di
 
     try:
         shutil.copy2(str(filepath), str(dest_path))
+        conn.execute("UPDATE content_items SET url=? WHERE id=?", (str(dest_path), content_id))
+
+        mime_map = {
+            ".pdf": "application/pdf", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+            ".png": "image/png", ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        }
+
+        attach_file(
+            conn,
+            content_id,
+            raw_id,
+            dest_path,
+            attachment_type,
+            mime_type=mime_map.get(ext, "application/octet-stream"),
+            hash_sha256=sha,
+            file_size=dest_path.stat().st_size,
+            metadata={"source_inbox": "documents", "original_path": str(filepath)},
+        )
+
+        conn.execute("UPDATE raw_source_items SET is_processed=1 WHERE id=?", (raw_id,))
+        conn.commit()
     except Exception as e:
         log.error("Copy failed %s: %s", filepath, e)
         conn.rollback()
-        return False
-    conn.execute("UPDATE content_items SET url=? WHERE id=?", (str(dest_path), content_id))
+        record_dead_letter(
+            conn,
+            failure_stage="watch_folder_copy",
+            source_key=_watch_source_key("documents", source_id),
+            source_id=source_id,
+            external_id=external_id,
+            error_type=type(e).__name__,
+            error_message=str(e),
+            payload={
+                "file_path": str(filepath.resolve(strict=False)),
+                "inbox_type": "documents",
+                "raw_item_id": raw_id,
+                "content_item_id": content_id,
+            },
+        )
+        _mark_watch_state(
+            conn,
+            inbox_type="documents",
+            source_id=source_id,
+            filepath=filepath,
+            success=False,
+            external_id=external_id,
+            hash_sha256=sha,
+            transport_mode="watch_folder:documents",
+            status="failed",
+            last_error=f"{type(e).__name__}: {e}",
+            metadata={"failure_stage": "watch_folder_copy"},
+        )
+        return "failed"
 
-    mime_map = {
-        ".pdf": "application/pdf", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
-        ".png": "image/png", ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    }
-
-    attach_file(
+    _mark_watch_state(
         conn,
-        content_id,
-        raw_id,
-        dest_path,
-        attachment_type,
-        mime_type=mime_map.get(ext, "application/octet-stream"),
+        inbox_type="documents",
+        source_id=source_id,
+        filepath=filepath,
+        success=True,
+        external_id=external_id,
         hash_sha256=sha,
-        file_size=dest_path.stat().st_size,
-        metadata={"source_inbox": "documents", "original_path": str(filepath)},
+        transport_mode="watch_folder:documents",
+        status="processed",
+        metadata={
+            "raw_item_id": raw_id,
+            "content_item_id": content_id,
+            "destination_path": str(dest_path.resolve(strict=False)),
+        },
     )
 
-    conn.execute("UPDATE raw_source_items SET is_processed=1 WHERE id=?", (raw_id,))
-    conn.commit()
-
     log.info("Processed document: %s -> %s", filepath.name, dest_path)
-    return True
+    return "processed"
 
 
 def scan_inbox(inbox_dir: Path, inbox_type: str, conn: sqlite3.Connection, settings: dict):
     if not inbox_dir.exists():
-        return
+        return {"seen": 0, "processed": 0, "duplicates": 0, "failed": 0}
 
     extensions = VIDEO_EXTENSIONS if inbox_type in ("tiktok", "youtube") else DOC_EXTENSIONS
+    stats = {"seen": 0, "processed": 0, "duplicates": 0, "failed": 0}
 
     for item in sorted(inbox_dir.iterdir()):
         if item.is_dir():
@@ -284,18 +442,25 @@ def scan_inbox(inbox_dir: Path, inbox_type: str, conn: sqlite3.Connection, setti
                 continue
 
         log.info("Found: %s (%s)", item.name, item.suffix)
+        stats["seen"] += 1
 
         if inbox_type in ("tiktok", "youtube") or item.suffix.lower() in VIDEO_EXTENSIONS:
-            success = process_video_file(item, inbox_type, conn, settings)
+            status = process_video_file(item, inbox_type, conn, settings)
         else:
-            success = process_document_file(item, conn, settings)
+            status = process_document_file(item, conn, settings)
 
-        if success:
+        if status == "processed":
+            stats["processed"] += 1
             try:
                 item.unlink()
                 log.info("Removed from inbox: %s", item.name)
             except Exception as e:
                 log.warning("Cannot remove %s: %s", item, e)
+        elif status == "duplicate":
+            stats["duplicates"] += 1
+        else:
+            stats["failed"] += 1
+    return stats
 
 
 def scan_all_inboxes(settings: dict = None):
@@ -306,9 +471,25 @@ def scan_all_inboxes(settings: dict = None):
     conn = get_db(settings)
 
     try:
-        scan_inbox(Path(settings["inbox_tiktok"]), "tiktok", conn, settings)
-        scan_inbox(Path(settings["inbox_youtube"]), "youtube", conn, settings)
-        scan_inbox(Path(settings["inbox_documents"]), "documents", conn, settings)
+        per_inbox = {
+            "tiktok": scan_inbox(Path(settings["inbox_tiktok"]), "tiktok", conn, settings),
+            "youtube": scan_inbox(Path(settings["inbox_youtube"]), "youtube", conn, settings),
+            "documents": scan_inbox(Path(settings["inbox_documents"]), "documents", conn, settings),
+        }
+        total_seen = sum(item["seen"] for item in per_inbox.values())
+        total_processed = sum(item["processed"] for item in per_inbox.values())
+        total_duplicates = sum(item["duplicates"] for item in per_inbox.values())
+        total_failed = sum(item["failed"] for item in per_inbox.values())
+        warnings = [f"watch_folder_failed:{total_failed}"] if total_failed else []
+        return {
+            "ok": True,
+            "items_seen": total_seen,
+            "items_new": total_processed,
+            "items_updated": total_duplicates,
+            "failed": total_failed,
+            "warnings": warnings,
+            "by_inbox": per_inbox,
+        }
     finally:
         conn.close()
 

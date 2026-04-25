@@ -12,6 +12,7 @@ if sys_path not in sys.path:
     sys.path.insert(0, sys_path)
 
 from config.db_utils import get_db, load_settings
+from graph.relation_candidates import rebuild_and_promote_relation_candidates
 
 log = logging.getLogger(__name__)
 CO_OCCURRENCE_MIN_ITEMS = 3
@@ -167,41 +168,19 @@ def build_kremlin_act_relations(conn) -> int:
 
 
 def build_co_occurrence_from_mentions(conn, min_co_occurrence: int = 2) -> int:
-    created = 0
-    min_items = max(int(min_co_occurrence), CO_OCCURRENCE_MIN_ITEMS)
-    conn.execute(
-        """
-        DELETE FROM entity_relations
-        WHERE relation_type='mentioned_together'
-          AND COALESCE(detected_by, '') LIKE 'co_occurrence:%'
-        """
-    )
-    pairs = conn.execute(
-        """
-        SELECT
-            CASE WHEN em1.entity_id < em2.entity_id THEN em1.entity_id ELSE em2.entity_id END AS entity_a,
-            CASE WHEN em1.entity_id < em2.entity_id THEN em2.entity_id ELSE em1.entity_id END AS entity_b,
-            COUNT(DISTINCT em1.content_item_id) AS item_count,
-            COUNT(DISTINCT ci.source_id) AS source_count
-        FROM entity_mentions em1
-        JOIN entity_mentions em2
-          ON em1.content_item_id = em2.content_item_id
-         AND em1.entity_id < em2.entity_id
-        JOIN content_items ci ON ci.id = em1.content_item_id
-        GROUP BY entity_a, entity_b
-        HAVING item_count >= ? AND source_count >= ?
-        ORDER BY source_count DESC, item_count DESC
-        """,
-        (min_items, CO_OCCURRENCE_MIN_SOURCES),
-    ).fetchall()
-
-    for e1, e2, item_count, source_count in pairs:
-        strength = "strong" if item_count >= 8 and source_count >= 3 else "moderate" if item_count >= 5 else "weak"
-        detected = f"co_occurrence:items={item_count}:sources={source_count}"
-        if _ensure_relation(conn, e1, e2, "mentioned_together", strength, detected):
-            created += 1
-
-    return created
+    settings = load_settings()
+    if hasattr(conn, "execute"):
+        db_path = None
+        try:
+            row = conn.execute("PRAGMA database_list").fetchone()
+            db_path = row[2] if row and len(row) >= 3 else None
+        except Exception:
+            db_path = None
+        if db_path:
+            settings = dict(settings)
+            settings["db_path"] = db_path
+    result = rebuild_and_promote_relation_candidates(settings)
+    return int(result.get("relation_candidates_created", 0))
 
 
 def build_structural_relations(conn) -> Dict:
@@ -221,9 +200,6 @@ def build_structural_relations(conn) -> Dict:
 
     log.info("Building Kremlin/ Government act relations...")
     stats["kremlin_relations"] = build_kremlin_act_relations(conn)
-
-    log.info("Building co-occurrence relations from mentions...")
-    stats["co_occurrence"] = build_co_occurrence_from_mentions(conn, min_co_occurrence=2)
 
     conn.commit()
     return stats

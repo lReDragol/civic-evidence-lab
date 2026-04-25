@@ -12,6 +12,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from config.db_utils import load_settings
+from runtime.state import get_runtime_metadata, set_runtime_metadata
 
 
 BAD_FILENAME_CHARS = '<>:"/\\|?*\n\r\t'
@@ -108,16 +109,28 @@ def frontmatter(data: dict) -> str:
 
 
 def export_index(vault: Path, conn: sqlite3.Connection, generated_at: str):
+    pipeline_version = get_runtime_metadata(
+        conn,
+        "analysis_built_from_pipeline_version",
+        get_runtime_metadata(conn, "current_pipeline_version"),
+    )
     table_names = [
         "sources", "raw_source_items", "raw_blobs", "content_items",
         "attachments", "entities", "claims", "cases", "quotes",
         "entity_relations", "risk_patterns",
     ]
     lines = [
-        frontmatter({"type": "database_index", "generated_at": generated_at}),
+        frontmatter(
+            {
+                "type": "database_index",
+                "generated_at": generated_at,
+                "built_from_pipeline_version": pipeline_version,
+            }
+        ),
         "# Архив новостей",
         "",
         f"Экспорт создан: `{generated_at}`",
+        f"Pipeline version: `{pipeline_version or ''}`",
         "",
         "## Счётчики",
         "",
@@ -430,6 +443,16 @@ def export_obsidian(
         export_cases(vault, conn, limit)
         export_entities(vault, conn, limit)
         export_files_index(vault, conn, copy_media, limit)
+        set_runtime_metadata(
+            conn,
+            "obsidian_built_from_pipeline_version",
+            get_runtime_metadata(
+                conn,
+                "analysis_built_from_pipeline_version",
+                get_runtime_metadata(conn, "current_pipeline_version"),
+            ),
+        )
+        set_runtime_metadata(conn, "obsidian_export_generated_at", generated_at)
     finally:
         conn.close()
 

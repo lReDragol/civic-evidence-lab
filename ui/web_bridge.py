@@ -120,16 +120,36 @@ class DashboardDataService:
         }
         graph_health = {
             "evidence_backed_relations": self._count_where("entity_relations", "evidence_item_id IS NOT NULL"),
-            "weak_relations": self._count_where(
-                "entity_relations",
-                "relation_type='mentioned_together' OR COALESCE(detected_by, '') LIKE 'co_occurrence:%'",
-            ),
+            "weak_relations": self._count_where("relation_candidates", "promotion_state IN ('pending', 'review')"),
+            "promoted_candidates": self._count_where("relation_candidates", "promotion_state='promoted'"),
             "tagged_items": self._count_distinct("content_tags", "content_item_id"),
             "untagged_items": self._count_where(
                 "content_items",
                 "id NOT IN (SELECT DISTINCT content_item_id FROM content_tags)",
             ),
             "granular_pending": self._count_where("content_items", "COALESCE(granular_processed, 0)=0"),
+            "dead_letters": self._count_where("dead_letter_items", "resolved_at IS NULL"),
+            "degraded_sources": self._count_where("source_sync_state", "state='degraded'"),
+            "pipeline_version": self._runtime_metadata("last_successful_pipeline_version"),
+            "analysis_pipeline_version": self._runtime_metadata("analysis_built_from_pipeline_version"),
+            "export_pipeline_version": self._runtime_metadata("obsidian_built_from_pipeline_version"),
+            "analysis_generated_at": self._runtime_metadata("analysis_generated_at"),
+            "export_generated_at": self._runtime_metadata("obsidian_export_generated_at"),
+        }
+        runtime_health = {
+            "daemon_running": self._table_exists("job_leases")
+            and self.db.execute(
+                "SELECT COUNT(*) FROM job_leases WHERE job_id='__daemon__'"
+            ).fetchone()[0]
+            > 0,
+            "running_jobs": self._count_where("job_leases", "job_id != '__daemon__'"),
+            "failed_last_day": self._count_where(
+                "job_runs",
+                "status IN ('failed', 'abandoned') AND started_at >= datetime('now', '-1 day')",
+            ),
+            "pending_candidates": self._count_where("relation_candidates", "promotion_state IN ('pending', 'review')"),
+            "degraded_sources": self._count_where("source_sync_state", "state='degraded'"),
+            "dead_letters": self._count_where("dead_letter_items", "resolved_at IS NULL"),
         }
         low_accountability = []
         if self._table_exists("accountability_index") and self._table_exists("deputy_profiles"):
@@ -175,6 +195,7 @@ class DashboardDataService:
             "counts": counts,
             "secondary_counts": secondary_counts,
             "graph_health": graph_health,
+            "runtime_health": runtime_health,
             "low_accountability": low_accountability,
             "running_jobs": sorted(running_jobs),
             "scheduler_running": scheduler_running,
@@ -746,6 +767,23 @@ class DashboardDataService:
             (table_name,),
         ).fetchone()
         return row is not None
+
+    def _runtime_metadata(self, key: str) -> Any:
+        if not self._table_exists("runtime_metadata"):
+            return None
+        row = self.db.execute(
+            "SELECT value_text, value_json FROM runtime_metadata WHERE key=?",
+            (key,),
+        ).fetchone()
+        if not row:
+            return None
+        value_text, value_json = row
+        if value_json:
+            try:
+                return json.loads(value_json)
+            except json.JSONDecodeError:
+                return value_json
+        return value_text
 
     def _pinned_sources(self) -> set[int]:
         result: set[int] = set()

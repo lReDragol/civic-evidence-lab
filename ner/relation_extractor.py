@@ -12,6 +12,7 @@ if sys_path not in sys.path:
     sys.path.insert(0, sys_path)
 
 from config.db_utils import get_db, load_settings
+from graph.relation_candidates import rebuild_and_promote_relation_candidates
 
 log = logging.getLogger(__name__)
 
@@ -84,89 +85,16 @@ def _infer_relation_type(e1_type: str, e2_type: str, count: int) -> str:
 
 
 def extract_co_occurrence_relations(settings: dict = None, batch_size: int = 5000) -> Dict:
-    if settings is None:
-        settings = load_settings()
-
-    conn = get_db(settings)
-
-    total_content = conn.execute(
-        "SELECT COUNT(*) FROM (SELECT content_item_id FROM entity_mentions GROUP BY content_item_id HAVING COUNT(DISTINCT entity_id) >= 2)"
-    ).fetchone()[0]
-    log.info("Extracting co-occurrence relations from %d content items", total_content)
-
-    conn.execute(
-        """
-        DELETE FROM entity_relations
-        WHERE relation_type IN ({placeholders})
-          AND COALESCE(detected_by, '') LIKE 'co_occurrence:%'
-        """.format(placeholders=",".join("?" * len(CO_OCCURRENCE_RELATION_TYPES))),
-        CO_OCCURRENCE_RELATION_TYPES,
-    )
-
-    pair_rows = conn.execute(
-        """
-        WITH pair_support AS (
-            SELECT
-                CASE WHEN em1.entity_id < em2.entity_id THEN em1.entity_id ELSE em2.entity_id END AS entity_a,
-                CASE WHEN em1.entity_id < em2.entity_id THEN em2.entity_id ELSE em1.entity_id END AS entity_b,
-                COUNT(DISTINCT em1.content_item_id) AS item_count,
-                COUNT(DISTINCT ci.source_id) AS source_count
-            FROM entity_mentions em1
-            JOIN entity_mentions em2
-              ON em1.content_item_id = em2.content_item_id
-             AND em1.entity_id < em2.entity_id
-            JOIN content_items ci ON ci.id = em1.content_item_id
-            GROUP BY entity_a, entity_b
-            HAVING item_count >= ? AND source_count >= ?
-        )
-        SELECT ps.entity_a, ps.entity_b, ps.item_count, ps.source_count,
-               e1.entity_type AS e1_type, e2.entity_type AS e2_type
-        FROM pair_support ps
-        JOIN entities e1 ON e1.id = ps.entity_a
-        JOIN entities e2 ON e2.id = ps.entity_b
-        ORDER BY ps.source_count DESC, ps.item_count DESC, ps.entity_a, ps.entity_b
-        """,
-        (
-            CO_OCCURRENCE_THRESHOLDS["min_items"],
-            CO_OCCURRENCE_THRESHOLDS["min_sources"],
-        ),
-    ).fetchall()
-
-    inserted = 0
-    for row in pair_rows:
-        e1_id, e2_id, item_count, source_count, e1_type, e2_type = row
-        rel_type = _infer_relation_type(e1_type, e2_type, item_count)
-        strength = _strength_from_support(item_count, source_count)
-        conn.execute(
-            """INSERT INTO entity_relations(from_entity_id, to_entity_id, relation_type, strength, detected_by)
-               VALUES(?,?,?,?,?)""",
-            (
-                e1_id,
-                e2_id,
-                rel_type,
-                strength,
-                f"co_occurrence:items={item_count}:sources={source_count}",
-            ),
-        )
-        inserted += 1
-
-        if inserted % 500 == 0:
-            conn.commit()
-
-    conn.commit()
-
-    stats = {
-        "co_occurrence_pairs": len(pair_rows),
-        "relations_inserted": inserted,
-        "strong_relations": conn.execute("SELECT COUNT(*) FROM entity_relations WHERE strength = 'strong'").fetchone()[0],
-        "moderate_relations": conn.execute("SELECT COUNT(*) FROM entity_relations WHERE strength = 'moderate'").fetchone()[0],
-        "weak_relations": conn.execute("SELECT COUNT(*) FROM entity_relations WHERE strength = 'weak'").fetchone()[0],
+    result = rebuild_and_promote_relation_candidates(settings or load_settings())
+    log.info("Relation candidates rebuilt: %s", result)
+    return {
+        "co_occurrence_pairs": int(result.get("relation_candidates_created", 0)),
+        "relations_inserted": int(result.get("promoted_relations", 0)),
+        "strong_relations": 0,
+        "moderate_relations": 0,
+        "weak_relations": int(result.get("relation_candidates_created", 0)),
+        **result,
     }
-
-    log.info("Relations extracted: %s", stats)
-
-    conn.close()
-    return stats
 
 
 def extract_head_role_relations(settings: dict = None) -> Dict:

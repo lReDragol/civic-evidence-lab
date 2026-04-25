@@ -565,6 +565,7 @@
     const recentCases = payload.recent_cases || [];
     const counts = payload.secondary_counts || {};
     const graphHealth = payload.graph_health || {};
+    const runtimeHealth = payload.runtime_health || {};
     const lowAccountability = payload.low_accountability || [];
     const countOrder = [
       "persons",
@@ -617,12 +618,32 @@
           .join("")
       : emptyState("Нет индекса подотчётности", "Сначала пересчитайте accountability layer.");
 
+    const analysisState =
+      graphHealth.pipeline_version && graphHealth.analysis_pipeline_version
+        ? graphHealth.pipeline_version === graphHealth.analysis_pipeline_version
+          ? "sync"
+          : "lag"
+        : "unknown";
+    const exportState =
+      graphHealth.pipeline_version && graphHealth.export_pipeline_version
+        ? graphHealth.pipeline_version === graphHealth.export_pipeline_version
+          ? "sync"
+          : "lag"
+        : "unknown";
+
     const healthMarkup = [
       ["Evidence-backed", graphHealth.evidence_backed_relations, "связи с evidence item"],
-      ["Weak layer", graphHealth.weak_relations, "co-occurrence шум"],
+      ["Weak backlog", graphHealth.weak_relations, "pending relation candidates"],
+      ["Promoted weak", graphHealth.promoted_candidates, "promoted candidate edges"],
       ["Tagged items", graphHealth.tagged_items, "материалы с тегами"],
       ["Untagged", graphHealth.untagged_items, "ещё без tag pipeline"],
       ["Granular pending", graphHealth.granular_pending, "ещё без granular stage"],
+      ["Daemon", runtimeHealth.daemon_running ? "ON" : "OFF", "фоновый runtime"],
+      ["Running jobs", runtimeHealth.running_jobs, "активные lease jobs"],
+      ["Degraded sources", graphHealth.degraded_sources ?? runtimeHealth.degraded_sources, "источники в degraded state"],
+      ["Dead letters", graphHealth.dead_letters ?? runtimeHealth.dead_letters, "необработанные сбои ingest/media"],
+      ["Analysis", graphHealth.analysis_pipeline_version || "—", `build ${analysisState}`],
+      ["Export", graphHealth.export_pipeline_version || "—", `vault ${exportState}`],
     ]
       .filter(([, value]) => value !== undefined)
       .map(

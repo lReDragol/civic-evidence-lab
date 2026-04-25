@@ -15,6 +15,7 @@ if sys_path not in os.sys.path:
 
 from config.db_utils import get_db, load_settings, ensure_dirs
 from db.file_store import materialize_attachment
+from runtime.state import record_dead_letter, update_source_sync_state
 
 log = logging.getLogger(__name__)
 
@@ -36,28 +37,57 @@ def _get_source_id(conn: sqlite3.Connection, url: str) -> Optional[int]:
     return row[0] if row else None
 
 
+def _telegram_source_key(source_id: int) -> str:
+    return f"telegram:{int(source_id)}"
+
+
+def _load_telegram_cursor(conn: sqlite3.Connection, source_id: int) -> int:
+    row = conn.execute(
+        "SELECT last_external_id FROM source_sync_state WHERE source_key=? LIMIT 1",
+        (_telegram_source_key(source_id),),
+    ).fetchone()
+    if row and row[0] is not None:
+        try:
+            return int(str(row[0]).strip())
+        except (TypeError, ValueError):
+            pass
+    last_ext_id_row = conn.execute(
+        "SELECT CAST(external_id AS INTEGER) FROM raw_source_items WHERE source_id=? ORDER BY CAST(external_id AS INTEGER) DESC LIMIT 1",
+        (source_id,),
+    ).fetchone()
+    return int(last_ext_id_row[0]) if last_ext_id_row and last_ext_id_row[0] is not None else 0
+
+
 async def collect_channel(app: Client, channel_url: str, source_id: int, conn: sqlite3.Connection, settings: dict, limit: int = 100):
     handle = channel_url.replace("https://t.me/", "@").replace("http://t.me/", "@").replace("t.me/", "@")
     if not handle.startswith("@"):
         handle = "@" + handle
 
+    source_key = _telegram_source_key(source_id)
     source_name = handle
     try:
         peer = await app.get_chat(handle)
         source_name = getattr(peer, "title", handle) or handle
     except Exception as e:
         log.error("Cannot resolve %s: %s", handle, e)
+        update_source_sync_state(
+            conn,
+            source_key=source_key,
+            source_id=source_id,
+            success=False,
+            transport_mode="telegram",
+            last_error=f"{type(e).__name__}: {e}",
+            metadata={"channel_handle": handle, "channel_url": channel_url},
+        )
         return 0
 
-    last_ext_id_row = conn.execute(
-        "SELECT CAST(external_id AS INTEGER) FROM raw_source_items WHERE source_id=? ORDER BY CAST(external_id AS INTEGER) DESC LIMIT 1",
-        (source_id,),
-    ).fetchone()
-    offset_id = int(last_ext_id_row[0]) if last_ext_id_row else 0
+    offset_id = _load_telegram_cursor(conn, source_id)
 
     storage_dir = Path(settings.get("processed_telegram", str(Path(__file__).resolve().parent.parent / "processed" / "telegram")))
 
     collected = 0
+    max_external_id = offset_id
+    last_hash = None
     async for msg in app.get_chat_history(peer.id, limit=limit, offset_id=offset_id):
         if not msg:
             continue
@@ -144,8 +174,26 @@ async def collect_channel(app: Client, channel_url: str, source_id: int, conn: s
             )
 
         collected += 1
+        max_external_id = max(max_external_id, int(msg.id))
+        last_hash = hash_sha
 
     conn.commit()
+    update_source_sync_state(
+        conn,
+        source_key=source_key,
+        source_id=source_id,
+        success=True,
+        last_cursor=str(max_external_id) if max_external_id else None,
+        last_external_id=str(max_external_id) if max_external_id else None,
+        last_hash=last_hash,
+        transport_mode="telegram",
+        metadata={
+            "channel_handle": handle,
+            "channel_url": channel_url,
+            "source_title": source_name,
+            "collected": collected,
+        },
+    )
     log.info("Collected %d new messages from %s", collected, source_name)
     return collected
 
@@ -153,7 +201,7 @@ async def collect_channel(app: Client, channel_url: str, source_id: int, conn: s
 async def download_media_batch(app: Client, conn: sqlite3.Connection, settings: dict, limit: int = 200):
     rows = conn.execute(
         """
-        SELECT a.id, a.file_path, a.attachment_type, r.source_id, r.external_id, s.url
+        SELECT a.id, a.file_path, a.attachment_type, r.source_id, r.external_id, s.url, c.id AS content_id
         FROM attachments a
         JOIN content_items c ON c.id = a.content_item_id
         JOIN raw_source_items r ON r.id = c.raw_item_id
@@ -166,20 +214,34 @@ async def download_media_batch(app: Client, conn: sqlite3.Connection, settings: 
 
     if not rows:
         log.info("No media to download")
-        return
+        return {"downloaded": 0, "failed": 0}
 
     downloaded = 0
+    failed = 0
     for row in rows:
         att_id = row["id"]
         file_path = row["file_path"]
         att_type = row["attachment_type"]
+        source_id = int(row["source_id"])
         external_id = row["external_id"]
         channel_url = row["url"]
+        content_id = int(row["content_id"]) if row["content_id"] is not None else None
+        source_key = _telegram_source_key(source_id)
 
         target = Path(file_path)
         if target.exists() and target.stat().st_size > 0:
             materialize_attachment(conn, att_id)
             downloaded += 1
+            update_source_sync_state(
+                conn,
+                source_key=source_key,
+                source_id=source_id,
+                success=True,
+                last_cursor=str(external_id),
+                last_external_id=str(external_id),
+                transport_mode="telegram_media",
+                metadata={"attachment_id": att_id, "status": "materialized_existing"},
+            )
             continue
 
         handle = channel_url.replace("https://t.me/", "@").replace("http://t.me/", "@").replace("t.me/", "@")
@@ -204,11 +266,50 @@ async def download_media_batch(app: Client, conn: sqlite3.Connection, settings: 
                     if target.exists():
                         materialize_attachment(conn, att_id)
                         downloaded += 1
+                        update_source_sync_state(
+                            conn,
+                            source_key=source_key,
+                            source_id=source_id,
+                            success=True,
+                            last_cursor=str(external_id),
+                            last_external_id=str(external_id),
+                            transport_mode="telegram_media",
+                            metadata={"attachment_id": att_id, "status": "downloaded_media"},
+                        )
         except Exception as e:
             log.warning("Failed to download %s/%s: %s", handle, external_id, e)
+            failed += 1
+            record_dead_letter(
+                conn,
+                failure_stage="telegram_media_download",
+                source_key=source_key,
+                source_id=source_id,
+                external_id=str(external_id),
+                attachment_id=att_id,
+                content_item_id=content_id,
+                error_type=type(e).__name__,
+                error_message=str(e),
+                payload={
+                    "channel_url": channel_url,
+                    "file_path": file_path,
+                    "attachment_type": att_type,
+                },
+            )
+            update_source_sync_state(
+                conn,
+                source_key=source_key,
+                source_id=source_id,
+                success=False,
+                last_cursor=str(external_id),
+                last_external_id=str(external_id),
+                transport_mode="telegram_media",
+                last_error=f"{type(e).__name__}: {e}",
+                metadata={"attachment_id": att_id, "status": "download_failed"},
+            )
 
     conn.commit()
     log.info("Downloaded %d media files", downloaded)
+    return {"downloaded": downloaded, "failed": failed}
 
 
 async def run_collect(settings: dict = None):
@@ -217,7 +318,7 @@ async def run_collect(settings: dict = None):
 
     if not HAVE_PYROGRAM:
         log.error("Pyrogram not available")
-        return
+        return {"ok": False, "fatal_errors": ["pyrogram_not_available"]}
 
     api_id = settings.get("telegram_api_id")
     api_hash = settings.get("telegram_api_hash")
@@ -232,7 +333,7 @@ async def run_collect(settings: dict = None):
 
     if not api_id or not api_hash:
         log.error("telegram_api_id/hash not set. Set in config/settings.json or env DRAGO_TG_API_ID / DRAGO_TG_API_HASH")
-        return
+        return {"ok": False, "fatal_errors": ["telegram_api_credentials_missing"]}
 
     session_dir = Path(settings.get("telegram_session_dir", str(Path(__file__).resolve().parent.parent / "config")))
     session_path = session_dir / "news_collector"
@@ -251,7 +352,7 @@ async def run_collect(settings: dict = None):
 
     if not channels:
         log.info("No active Telegram sources")
-        return
+        return {"ok": True, "items_seen": 0, "items_new": 0, "items_updated": 0, "channels": 0}
 
     limit = settings.get("telegram_posts_per_channel", 100)
 
@@ -271,7 +372,19 @@ async def run_collect(settings: dict = None):
                 total += n
             log.info("Total collected: %d", total)
 
-            await download_media_batch(app, conn, settings)
+            media_stats = await download_media_batch(app, conn, settings)
+            warnings = []
+            if media_stats.get("failed"):
+                warnings.append(f"telegram_media_failed:{media_stats['failed']}")
+            return {
+                "ok": True,
+                "items_seen": len(channels),
+                "items_new": total,
+                "items_updated": int(media_stats.get("downloaded") or 0),
+                "channels": len(channels),
+                "media_failed": int(media_stats.get("failed") or 0),
+                "warnings": warnings,
+            }
         finally:
             conn.commit()
             conn.close()

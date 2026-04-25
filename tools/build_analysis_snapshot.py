@@ -19,6 +19,7 @@ from config.db_utils import load_settings
 from ner.relation_extractor import extract_co_occurrence_relations, extract_head_role_relations
 from verification.contradiction_detector import run_contradiction_detection
 from verification.evidence_linker import auto_link_by_content_type, auto_link_evidence
+from runtime.state import get_runtime_metadata, set_runtime_metadata
 
 
 STRUCTURAL_RELATION_TYPES = {
@@ -427,6 +428,17 @@ def collect_summary(conn: sqlite3.Connection) -> dict[str, Any]:
             relation_layers[layer] += int(count)
             if evidence_item_id is not None:
                 evidence_backed_relations += int(count)
+    if table_exists(conn, "relation_candidates"):
+        weak_rows = conn.execute(
+            """
+            SELECT promotion_state, COUNT(*)
+            FROM relation_candidates
+            GROUP BY promotion_state
+            """
+        ).fetchall()
+        for state, count in weak_rows:
+            if state in {"pending", "review"}:
+                relation_layers["weak_similarity"] += int(count)
 
     claims_total = counts["claims"]
     claims_with_evidence = 0
@@ -512,6 +524,7 @@ def build_analysis_snapshot(
     source_db: Path,
     target_db: Path,
     report_path: Path,
+    pipeline_version: str | None = None,
 ) -> dict[str, Any]:
     if not source_db.exists():
         raise FileNotFoundError(source_db)
@@ -521,6 +534,8 @@ def build_analysis_snapshot(
     prep_conn = sqlite3.connect(str(target_db))
     try:
         normalize_contracts_result = normalize_contracts(prep_conn)
+        if pipeline_version is None:
+            pipeline_version = get_runtime_metadata(prep_conn, "current_pipeline_version")
     finally:
         prep_conn.close()
 
@@ -575,6 +590,9 @@ def build_analysis_snapshot(
 
     conn = sqlite3.connect(str(target_db))
     try:
+        if pipeline_version:
+            set_runtime_metadata(conn, "analysis_built_from_pipeline_version", pipeline_version)
+        set_runtime_metadata(conn, "analysis_generated_at", datetime.now().isoformat(timespec="seconds"))
         summary = collect_summary(conn)
         top_hubs = collect_top_hubs(conn)
     finally:
@@ -582,6 +600,7 @@ def build_analysis_snapshot(
 
     report = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "pipeline_version": pipeline_version,
         "db": {
             "source_db": str(source_db),
             "target_db": str(target_db),
@@ -613,12 +632,17 @@ def main():
         "--report",
         default=str(PROJECT_ROOT / "reports" / "analysis_snapshot_latest.json"),
     )
+    parser.add_argument(
+        "--pipeline-version",
+        default=None,
+    )
     args = parser.parse_args()
 
     report = build_analysis_snapshot(
         source_db=Path(args.source_db),
         target_db=Path(args.target_db),
         report_path=Path(args.report),
+        pipeline_version=args.pipeline_version,
     )
     print(json.dumps(report["summary"], ensure_ascii=False, indent=2))
 

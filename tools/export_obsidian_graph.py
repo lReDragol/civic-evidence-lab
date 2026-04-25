@@ -16,6 +16,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from investigation.models import RELATION_INVERSE_LABELS, RELATION_LABELS
+from runtime.state import get_runtime_metadata, set_runtime_metadata
 
 
 BAD_FILENAME_CHARS = '<>:"/\\|?*\n\r\t'
@@ -379,6 +380,7 @@ def weak_note_path(entity_row: dict) -> str:
 
 @dataclass
 class GraphContext:
+    pipeline_version: str | None
     source_rows: list[dict]
     content_rows: list[dict]
     entity_rows: list[dict]
@@ -437,6 +439,11 @@ class GraphContext:
 
 
 def build_graph_context(conn: sqlite3.Connection) -> GraphContext:
+    pipeline_version = get_runtime_metadata(
+        conn,
+        "analysis_built_from_pipeline_version",
+        get_runtime_metadata(conn, "current_pipeline_version"),
+    )
     source_rows = []
     if table_exists(conn, "sources"):
         source_rows = [dict(r) for r in rows(conn, "SELECT * FROM sources ORDER BY category, name, id")]
@@ -741,6 +748,44 @@ def build_graph_context(conn: sqlite3.Connection) -> GraphContext:
                 else:
                     strong_relations_by_entity[entity_id].append(item)
 
+    if table_exists(conn, "relation_candidates") and table_exists(conn, "entities"):
+        entity_rows_by_id = {row["id"]: row for row in entity_rows}
+        for row in rows(
+            conn,
+            """
+            SELECT rc.*, e1.canonical_name AS entity_a_name, e1.entity_type AS entity_a_type,
+                   e2.canonical_name AS entity_b_name, e2.entity_type AS entity_b_type
+            FROM relation_candidates rc
+            JOIN entities e1 ON e1.id = rc.entity_a_id
+            JOIN entities e2 ON e2.id = rc.entity_b_id
+            WHERE rc.promotion_state IN ('pending', 'review')
+            ORDER BY rc.score DESC, rc.id DESC
+            """,
+        ):
+            record = dict(row)
+            for entity_id, other_id, other_name, other_type in (
+                (record["entity_a_id"], record["entity_b_id"], record["entity_b_name"], record["entity_b_type"]),
+                (record["entity_b_id"], record["entity_a_id"], record["entity_a_name"], record["entity_a_type"]),
+            ):
+                weak_relations_by_entity[entity_id].append(
+                    {
+                        "relation_type": record["candidate_type"],
+                        "label": record["candidate_type"],
+                        "other_entity_id": other_id,
+                        "other_name": other_name,
+                        "other_type": other_type,
+                        "strength": "candidate",
+                        "detected_by": record.get("origin") or "",
+                        "evidence_item_id": None,
+                        "support_count": record.get("support_items") or 0,
+                        "layer": "weak_similarity",
+                        "score": record.get("score") or 0,
+                    }
+                )
+                entity_row = entity_rows_by_id.get(entity_id)
+                if entity_row is not None:
+                    weak_paths[entity_id] = weak_note_path(entity_row)
+
     positions_by_entity: dict[int, list[dict]] = defaultdict(list)
     if table_exists(conn, "official_positions"):
         for row in rows(
@@ -831,6 +876,7 @@ def build_graph_context(conn: sqlite3.Connection) -> GraphContext:
                 content_to_bill_ids[content["id"]].append(bill_id)
 
     return GraphContext(
+        pipeline_version=pipeline_version,
         source_rows=source_rows,
         content_rows=content_rows,
         entity_rows=entity_rows,
@@ -891,10 +937,18 @@ def build_graph_context(conn: sqlite3.Connection) -> GraphContext:
 
 def export_graph_index(vault: Path, ctx: GraphContext, generated_at: str):
     lines = [
-        frontmatter({"type": "graph_index", "generated_at": generated_at, "mode": "graph"}),
+        frontmatter(
+            {
+                "type": "graph_index",
+                "generated_at": generated_at,
+                "mode": "graph",
+                "built_from_pipeline_version": ctx.pipeline_version,
+            }
+        ),
         "# Investigation Graph",
         "",
         f"Generated at: `{generated_at}`",
+        f"Pipeline version: `{ctx.pipeline_version or ''}`",
         "",
         "## Sections",
         "",
@@ -1685,7 +1739,7 @@ def export_graph_weak_links(vault: Path, ctx: GraphContext):
                 continue
             target = note_link(target_path, item["other_name"])
             body.append(
-                f"- support_count=`{item.get('support_count') or 0}` {target} `{item.get('label')}` `{item.get('strength') or ''}`"
+                f"- support_count=`{item.get('support_count') or 0}` score=`{item.get('score') or 0}` {target} `{item.get('label')}` `{item.get('strength') or ''}`"
             )
 
         write_note(vault, rel, "\n".join(body))
@@ -1772,5 +1826,7 @@ def export_graph_obsidian(
         export_graph_weak_links(vault, ctx)
         export_graph_tags(vault, ctx)
         export_graph_files(vault, conn, copy_media=copy_media)
+        set_runtime_metadata(conn, "obsidian_built_from_pipeline_version", ctx.pipeline_version)
+        set_runtime_metadata(conn, "obsidian_export_generated_at", generated_at)
     finally:
         conn.close()

@@ -176,6 +176,11 @@ RELATION_LABELS = {
     "involved_in_case": "Фигурант дела",
     "part_of_case": "Входит в дело",
     "documents_case": "Документирует дело",
+    "likely_association": "Вероятно связан",
+    "same_vote_pattern": "Похожий паттерн голосования",
+    "same_bill_cluster": "Кластер законопроектов",
+    "same_contract_cluster": "Кластер контрактов",
+    "same_case_cluster": "Кластер дел/рисков",
 }
 
 RELATION_INVERSE_LABELS = {
@@ -203,6 +208,11 @@ RELATION_INVERSE_LABELS = {
     "involved_in_case": "Дело включает фигуранта",
     "part_of_case": "Дело опирается на заявление",
     "documents_case": "Используется в деле",
+    "likely_association": "Имеет вероятную связь",
+    "same_vote_pattern": "Имеет похожий паттерн голосования",
+    "same_bill_cluster": "Связан общим кластером законопроектов",
+    "same_contract_cluster": "Связан общим контрактным кластером",
+    "same_case_cluster": "Связан общим кластером дел/рисков",
 }
 
 RELATION_CONFIDENCE = {
@@ -235,6 +245,11 @@ RELATION_CONFIDENCE = {
     "involved_in_case": Confidence.CONFIRMED,
     "part_of_case": Confidence.CONFIRMED,
     "documents_case": Confidence.CONFIRMED,
+    "likely_association": Confidence.LIKELY,
+    "same_vote_pattern": Confidence.LIKELY,
+    "same_bill_cluster": Confidence.LIKELY,
+    "same_contract_cluster": Confidence.LIKELY,
+    "same_case_cluster": Confidence.LIKELY,
     "mentioned_together": None,
     "has_claim": Confidence.LIKELY,
     "supported_by": None,

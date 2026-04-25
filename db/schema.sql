@@ -529,3 +529,232 @@ CREATE TABLE IF NOT EXISTS contract_parties (
 CREATE INDEX IF NOT EXISTS idx_contract_parties_contract ON contract_parties(contract_id);
 CREATE INDEX IF NOT EXISTS idx_contract_parties_entity ON contract_parties(entity_id);
 CREATE INDEX IF NOT EXISTS idx_contract_parties_inn ON contract_parties(inn);
+
+CREATE TABLE IF NOT EXISTS runtime_metadata (
+    key             TEXT PRIMARY KEY,
+    value_text      TEXT,
+    value_json      TEXT,
+    updated_at      TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS job_runs (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id          TEXT NOT NULL,
+    trigger_mode    TEXT DEFAULT 'manual',
+    requested_by    TEXT,
+    owner           TEXT,
+    pipeline_version TEXT,
+    pipeline_run_id INTEGER,
+    attempt_no      INTEGER DEFAULT 1,
+    status          TEXT NOT NULL,
+    started_at      TEXT DEFAULT (datetime('now')),
+    finished_at     TEXT,
+    items_seen      INTEGER DEFAULT 0,
+    items_new       INTEGER DEFAULT 0,
+    items_updated   INTEGER DEFAULT 0,
+    warnings_json   TEXT,
+    retriable_errors_json TEXT,
+    fatal_errors_json TEXT,
+    next_cursor     TEXT,
+    health_json     TEXT,
+    artifacts_json  TEXT,
+    error_summary   TEXT,
+    FOREIGN KEY (pipeline_run_id) REFERENCES pipeline_runs(id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_job_runs_job ON job_runs(job_id);
+CREATE INDEX IF NOT EXISTS idx_job_runs_status ON job_runs(status);
+CREATE INDEX IF NOT EXISTS idx_job_runs_started ON job_runs(started_at);
+CREATE INDEX IF NOT EXISTS idx_job_runs_pipeline ON job_runs(pipeline_run_id);
+
+CREATE TABLE IF NOT EXISTS job_leases (
+    job_id          TEXT PRIMARY KEY,
+    lease_owner     TEXT NOT NULL,
+    started_at      TEXT DEFAULT (datetime('now')),
+    heartbeat_at    TEXT DEFAULT (datetime('now')),
+    expires_at      TEXT NOT NULL,
+    payload_json    TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_job_leases_expires ON job_leases(expires_at);
+
+CREATE TABLE IF NOT EXISTS pipeline_runs (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    pipeline_version TEXT NOT NULL UNIQUE,
+    mode            TEXT NOT NULL,
+    status          TEXT NOT NULL,
+    requested_by    TEXT,
+    started_at      TEXT DEFAULT (datetime('now')),
+    finished_at     TEXT,
+    stages_json     TEXT,
+    result_json     TEXT,
+    error_summary   TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_pipeline_runs_mode ON pipeline_runs(mode);
+CREATE INDEX IF NOT EXISTS idx_pipeline_runs_status ON pipeline_runs(status);
+CREATE INDEX IF NOT EXISTS idx_pipeline_runs_started ON pipeline_runs(started_at);
+
+CREATE TABLE IF NOT EXISTS source_health_checks (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_key      TEXT NOT NULL,
+    source_id       INTEGER,
+    checked_at      TEXT DEFAULT (datetime('now')),
+    url             TEXT,
+    ok              INTEGER DEFAULT 0,
+    status_code     INTEGER,
+    elapsed_sec     REAL,
+    final_url       TEXT,
+    content_type    TEXT,
+    length          INTEGER DEFAULT 0,
+    title           TEXT,
+    link_count      INTEGER DEFAULT 0,
+    transport_mode  TEXT,
+    error           TEXT,
+    payload_json    TEXT,
+    FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_source_health_key ON source_health_checks(source_key);
+CREATE INDEX IF NOT EXISTS idx_source_health_checked ON source_health_checks(checked_at);
+CREATE INDEX IF NOT EXISTS idx_source_health_ok ON source_health_checks(ok);
+
+CREATE TABLE IF NOT EXISTS source_sync_state (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_key      TEXT NOT NULL UNIQUE,
+    source_id       INTEGER,
+    state           TEXT DEFAULT 'unknown',
+    last_success_at TEXT,
+    last_attempt_at TEXT,
+    consecutive_failures INTEGER DEFAULT 0,
+    last_cursor     TEXT,
+    last_external_id TEXT,
+    last_etag       TEXT,
+    last_hash       TEXT,
+    last_http_status INTEGER,
+    transport_mode  TEXT,
+    last_error      TEXT,
+    metadata_json   TEXT,
+    FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_source_sync_state_id ON source_sync_state(source_id);
+CREATE INDEX IF NOT EXISTS idx_source_sync_state_state ON source_sync_state(state);
+CREATE INDEX IF NOT EXISTS idx_source_sync_state_success ON source_sync_state(last_success_at);
+
+CREATE TABLE IF NOT EXISTS dead_letter_items (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_key      TEXT,
+    source_id       INTEGER,
+    raw_item_id     INTEGER,
+    external_id     TEXT,
+    attachment_id   INTEGER,
+    content_item_id INTEGER,
+    failure_stage   TEXT NOT NULL,
+    error_type      TEXT,
+    error_message   TEXT,
+    payload_json    TEXT,
+    detected_at     TEXT DEFAULT (datetime('now')),
+    resolved_at     TEXT,
+    resolution_notes TEXT,
+    FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE SET NULL,
+    FOREIGN KEY (raw_item_id) REFERENCES raw_source_items(id) ON DELETE SET NULL,
+    FOREIGN KEY (attachment_id) REFERENCES attachments(id) ON DELETE SET NULL,
+    FOREIGN KEY (content_item_id) REFERENCES content_items(id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_dead_letters_source ON dead_letter_items(source_key);
+CREATE INDEX IF NOT EXISTS idx_dead_letters_stage ON dead_letter_items(failure_stage);
+CREATE INDEX IF NOT EXISTS idx_dead_letters_detected ON dead_letter_items(detected_at);
+CREATE INDEX IF NOT EXISTS idx_dead_letters_resolved ON dead_letter_items(resolved_at);
+
+CREATE TABLE IF NOT EXISTS relation_candidates (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    entity_a_id     INTEGER NOT NULL,
+    entity_b_id     INTEGER NOT NULL,
+    candidate_type  TEXT NOT NULL,
+    origin          TEXT NOT NULL,
+    score           REAL DEFAULT 0,
+    source_independence REAL DEFAULT 0,
+    evidence_overlap REAL DEFAULT 0,
+    temporal_proximity REAL DEFAULT 0,
+    role_compatibility REAL DEFAULT 0,
+    tag_overlap     REAL DEFAULT 0,
+    text_specificity REAL DEFAULT 0,
+    support_items   INTEGER DEFAULT 0,
+    support_sources INTEGER DEFAULT 0,
+    support_domains INTEGER DEFAULT 0,
+    support_categories INTEGER DEFAULT 0,
+    first_seen_at   TEXT,
+    last_seen_at    TEXT,
+    sample_content_ids TEXT,
+    promotion_state TEXT DEFAULT 'pending',
+    promoted_relation_type TEXT,
+    promoted_at     TEXT,
+    metadata_json   TEXT,
+    FOREIGN KEY (entity_a_id) REFERENCES entities(id) ON DELETE CASCADE,
+    FOREIGN KEY (entity_b_id) REFERENCES entities(id) ON DELETE CASCADE,
+    UNIQUE(entity_a_id, entity_b_id, candidate_type, origin)
+);
+
+CREATE INDEX IF NOT EXISTS idx_relation_candidates_pair ON relation_candidates(entity_a_id, entity_b_id);
+CREATE INDEX IF NOT EXISTS idx_relation_candidates_score ON relation_candidates(score);
+CREATE INDEX IF NOT EXISTS idx_relation_candidates_state ON relation_candidates(promotion_state);
+CREATE INDEX IF NOT EXISTS idx_relation_candidates_type ON relation_candidates(candidate_type);
+
+CREATE TABLE IF NOT EXISTS relation_support (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    candidate_id    INTEGER NOT NULL,
+    support_kind    TEXT NOT NULL,
+    content_item_id INTEGER,
+    source_id       INTEGER,
+    domain          TEXT,
+    category        TEXT,
+    tag_name        TEXT,
+    evidence_item_id INTEGER,
+    metric_value    REAL,
+    metadata_json   TEXT,
+    FOREIGN KEY (candidate_id) REFERENCES relation_candidates(id) ON DELETE CASCADE,
+    FOREIGN KEY (content_item_id) REFERENCES content_items(id) ON DELETE SET NULL,
+    FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE SET NULL,
+    FOREIGN KEY (evidence_item_id) REFERENCES content_items(id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_relation_support_candidate ON relation_support(candidate_id);
+CREATE INDEX IF NOT EXISTS idx_relation_support_content ON relation_support(content_item_id);
+CREATE INDEX IF NOT EXISTS idx_relation_support_source ON relation_support(source_id);
+
+CREATE TABLE IF NOT EXISTS classifier_audit_samples (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    sample_kind     TEXT NOT NULL,
+    target_id       INTEGER,
+    target_ref      TEXT,
+    expected_label  TEXT,
+    actual_label    TEXT,
+    review_status   TEXT DEFAULT 'pending',
+    reviewed_by     TEXT,
+    reviewed_at     TEXT,
+    notes           TEXT,
+    batch_name      TEXT,
+    payload_json    TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_classifier_audit_kind ON classifier_audit_samples(sample_kind);
+CREATE INDEX IF NOT EXISTS idx_classifier_audit_status ON classifier_audit_samples(review_status);
+CREATE INDEX IF NOT EXISTS idx_classifier_audit_batch ON classifier_audit_samples(batch_name);
+
+CREATE TABLE IF NOT EXISTS investigation_leads (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    entity_id       INTEGER NOT NULL,
+    lead_type       TEXT NOT NULL,
+    title           TEXT NOT NULL,
+    score           REAL DEFAULT 0,
+    chain_json      TEXT,
+    pipeline_version TEXT,
+    generated_at    TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (entity_id) REFERENCES entities(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_investigation_leads_entity ON investigation_leads(entity_id);
+CREATE INDEX IF NOT EXISTS idx_investigation_leads_type ON investigation_leads(lead_type);
+CREATE INDEX IF NOT EXISTS idx_investigation_leads_score ON investigation_leads(score);

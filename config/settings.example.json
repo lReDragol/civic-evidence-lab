@@ -1,8 +1,11 @@
 {
     "project_root": ".",
     "db_path": "db/news_unified.db",
+    "analysis_db_path": "db/news_analysis.db",
     "legacy_db_path": "news_unified.db",
     "schema_path": "db/schema.sql",
+    "analysis_report_path": "reports/analysis_snapshot_latest.json",
+    "ensure_schema_on_connect": true,
 
     "inbox_tiktok": "inbox/tiktok",
     "inbox_documents": "inbox/documents",
@@ -61,5 +64,51 @@
     "log_level": "INFO",
     "log_file": "app.log",
 
-    "obsidian_export_dir": "obsidian_export"
+    "obsidian_export_dir": "obsidian_export_graph",
+
+    "runtime": {
+        "daemon_enabled": true,
+        "single_process_only": true
+    },
+
+    "scheduler": {
+        "max_instances": 1,
+        "misfire_grace_time": 900,
+        "coalesce": true,
+        "nightly_interval_seconds": 86400,
+        "weekly_interval_seconds": 604800,
+        "intervals": {}
+    },
+
+    "health": {
+        "timeout_seconds": 8,
+        "preflight_on_start": true
+    },
+
+    "retry": {
+        "default_retry_limit": 3,
+        "default_backoff_seconds": 60
+    },
+
+    "snapshot": {
+        "nightly_enabled": true
+    },
+
+    "export": {
+        "graph_mode_default": true,
+        "copy_media": true
+    },
+
+    "graph": {
+        "promotion_threshold": 0.68,
+        "min_support_items": 3,
+        "min_support_sources": 2,
+        "min_support_domains": 2
+    },
+
+    "classifier_audit": {
+        "gold_claims_target": 300,
+        "gold_relations_target": 300,
+        "gold_tags_target": 300
+    }
 }
