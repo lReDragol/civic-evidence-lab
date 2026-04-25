@@ -22,7 +22,7 @@
     },
     collapsedSourceGroups: {},
     collapsedTaskGroups: {},
-    tasksCollapsed: false,
+    tasksCollapsed: true,
     taskTab: "queue",
   };
 

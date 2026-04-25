@@ -1871,7 +1871,15 @@ button:disabled {
 /* === v8: overlay workspace drawer, solid scroll, clickable details === */
 .app-shell {
   grid-template-columns: var(--sidebar-width) 6px minmax(0, 1fr) !important;
+  grid-template-rows: minmax(0, 1fr) !important;
   overflow: hidden;
+  max-height: 100vh;
+}
+
+.app-shell > .sidebar-panel,
+.app-shell > .main-panel {
+  min-height: 0;
+  max-height: 100%;
 }
 
 .sidebar-panel {
@@ -1890,6 +1898,7 @@ button:disabled {
   position: fixed;
   inset: 0;
   z-index: 24;
+  display: block !important;
   background: rgba(2, 7, 5, 0.44);
   backdrop-filter: blur(10px);
   opacity: 0;
@@ -1910,6 +1919,7 @@ button:disabled {
   transform: translateX(calc(100% + 24px));
   opacity: 0;
   pointer-events: none;
+  animation: none !important;
   transition: transform 180ms ease, opacity 180ms ease, box-shadow 180ms ease;
 }
 
@@ -1939,10 +1949,13 @@ button:disabled {
 
 .tasks-collapsed .tasks-panel,
 .tasks-collapsed .tasks-backdrop {
-  display: block;
+  opacity: 0;
+  pointer-events: none;
 }
 
+.sidebar-panel,
 .main-panel,
+.sidebar-section,
 .screen-panel,
 .screen-root,
 .overview-grid,
@@ -1959,6 +1972,16 @@ button:disabled {
   min-height: 0;
 }
 
+.overview-column,
+.master-pane,
+.master-list-wrap,
+.tasks-panel,
+.job-detail-card,
+.tasks-groups {
+  display: flex;
+  flex-direction: column;
+}
+
 .screen-panel,
 .screen-root,
 .master-detail,
@@ -1969,9 +1992,20 @@ button:disabled {
 
 .screen-root {
   display: flex !important;
+  flex: 1 1 auto;
 }
 
 .screen-root > * {
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: 100%;
+}
+
+.overview-grid,
+.master-detail,
+.master-list-wrap,
+.overview-column > .overview-panel,
+.master-pane > .master-list-wrap {
   flex: 1 1 auto;
   min-height: 0;
 }
@@ -1988,6 +2022,15 @@ button:disabled {
   min-height: 0;
   scrollbar-gutter: stable;
   overscroll-behavior: contain;
+}
+
+.source-groups,
+.tasks-groups,
+.table-list,
+.data-table-wrap,
+.detail-pane,
+.job-detail-card {
+  flex: 1 1 auto;
 }
 
 .master-list-wrap {
