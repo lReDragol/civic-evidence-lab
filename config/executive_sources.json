@@ -1,0 +1,183 @@
+[
+  {
+    "key": "government",
+    "enabled": true,
+    "name": "Правительство РФ — руководство",
+    "organization": "Правительство Российской Федерации",
+    "category": "official_site",
+    "subcategory": "executive_directory",
+    "url": "http://government.ru/office/persons/",
+    "mode": "profile_links",
+    "href_patterns": [
+      "/gov/persons/"
+    ],
+    "fetch_profiles": false,
+    "credibility_tier": "A",
+    "update_frequency": "daily",
+    "notes": "Руководство и министры Правительства РФ"
+  },
+  {
+    "key": "minfin",
+    "enabled": true,
+    "name": "Минфин России — руководство",
+    "organization": "Министерство финансов Российской Федерации",
+    "category": "official_site",
+    "subcategory": "executive_directory",
+    "url": "https://minfin.gov.ru/ru/ministry/structure/",
+    "mode": "profile_links",
+    "href_patterns": [
+      "/ru/ministry/structure/management/"
+    ],
+    "allowed_position_patterns": [
+      "министр финансов",
+      "заместитель министра"
+    ],
+    "fetch_profiles": true,
+    "detail_limit": 20,
+    "credibility_tier": "A",
+    "update_frequency": "weekly"
+  },
+  {
+    "key": "rkn",
+    "enabled": true,
+    "name": "Роскомнадзор — руководство",
+    "organization": "Роскомнадзор",
+    "category": "official_site",
+    "subcategory": "executive_directory",
+    "url": "https://rkn.gov.ru/about/leadership/",
+    "mode": "text_regex",
+    "allowed_position_patterns": [
+      "руководитель",
+      "заместитель руководителя"
+    ],
+    "fetch_profiles": false,
+    "credibility_tier": "A",
+    "update_frequency": "weekly"
+  },
+  {
+    "key": "minjust",
+    "enabled": true,
+    "name": "Минюст России — руководство",
+    "organization": "Министерство юстиции Российской Федерации",
+    "category": "official_site",
+    "subcategory": "executive_directory",
+    "url": "https://minjust.gov.ru/ru/ministry/structure/",
+    "mode": "profile_links",
+    "href_patterns": [
+      "/ru/ministry/persons/"
+    ],
+    "allowed_position_patterns": [
+      "министр юстиции",
+      "заместитель министра"
+    ],
+    "fetch_profiles": true,
+    "detail_limit": 20,
+    "credibility_tier": "A",
+    "update_frequency": "weekly"
+  },
+  {
+    "key": "nalog",
+    "enabled": true,
+    "name": "ФНС России — руководство",
+    "organization": "Федеральная налоговая служба",
+    "category": "official_site",
+    "subcategory": "executive_directory",
+    "url": "https://www.nalog.gov.ru/rn77/about_fts/fts/structure_fts/ca_fns/",
+    "mode": "profile_links",
+    "href_patterns": [
+      "/rn77/about_fts/fts/structure_fts/ca_fns/"
+    ],
+    "allowed_position_patterns": [
+      "руководитель федеральной налоговой службы",
+      "заместитель руководителя федеральной налоговой службы"
+    ],
+    "fetch_profiles": true,
+    "detail_limit": 20,
+    "credibility_tier": "A",
+    "update_frequency": "weekly"
+  },
+  {
+    "key": "roskazna",
+    "enabled": true,
+    "name": "Федеральное казначейство — руководство",
+    "organization": "Федеральное казначейство",
+    "category": "official_site",
+    "subcategory": "executive_directory",
+    "url": "https://roskazna.gov.ru/o-kaznachejstve/rukovodstvo/",
+    "mode": "profile_links",
+    "href_patterns": [
+      "/personal"
+    ],
+    "allowed_position_patterns": [
+      "руководитель федерального казначейства",
+      "заместитель руководителя федерального казначейства"
+    ],
+    "exclude_text_patterns": [
+      "новейшего времени"
+    ],
+    "fetch_profiles": true,
+    "detail_limit": 20,
+    "credibility_tier": "A",
+    "update_frequency": "weekly"
+  },
+  {
+    "key": "digital",
+    "enabled": false,
+    "name": "Минцифры России — руководство",
+    "organization": "Министерство цифрового развития, связи и массовых коммуникаций Российской Федерации",
+    "category": "official_site",
+    "subcategory": "executive_directory",
+    "url": "https://digital.gov.ru/ru/ministry/about/leadership/",
+    "mode": "profile_links",
+    "href_patterns": [
+      "/ru/ministry/about/leadership/"
+    ],
+    "fetch_profiles": true,
+    "detail_limit": 20,
+    "credibility_tier": "A",
+    "update_frequency": "weekly",
+    "notes": "По состоянию на 2026-04-25 в текущей сети наблюдался timeout; оставлено в конфиге до восстановления доступа."
+  },
+  {
+    "key": "fas",
+    "enabled": true,
+    "name": "ФАС России — руководство",
+    "organization": "Федеральная антимонопольная служба",
+    "category": "official_site",
+    "subcategory": "executive_directory",
+    "url": "https://fas.gov.ru/structure",
+    "mode": "profile_links",
+    "href_patterns": [
+      "/people/"
+    ],
+    "allowed_position_patterns": [
+      "руководитель федеральной антимонопольной службы",
+      "заместитель руководителя фас россии",
+      "заместитель руководителя федеральной антимонопольной службы",
+      "статс-секретарь - заместитель руководителя фас россии"
+    ],
+    "fetch_profiles": true,
+    "detail_limit": 80,
+    "credibility_tier": "A",
+    "update_frequency": "weekly",
+    "notes": "Используется структура ФАС с profile pages; фильтр оставляет только руководителя и его заместителей."
+  },
+  {
+    "key": "rosreestr",
+    "enabled": false,
+    "name": "Росреестр — руководство",
+    "organization": "Федеральная служба государственной регистрации, кадастра и картографии",
+    "category": "official_site",
+    "subcategory": "executive_directory",
+    "url": "https://rosreestr.gov.ru/about/leadership/",
+    "mode": "profile_links",
+    "href_patterns": [
+      "/about/"
+    ],
+    "fetch_profiles": true,
+    "detail_limit": 20,
+    "credibility_tier": "A",
+    "update_frequency": "weekly",
+    "notes": "В текущей сети источник сбрасывал соединение; оставлен disabled до стабильного доступа."
+  }
+]

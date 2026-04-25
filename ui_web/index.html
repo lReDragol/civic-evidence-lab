@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Civic Evidence Lab</title>
+  <link rel="stylesheet" href="./app.css">
+</head>
+<body>
+  <div class="app-shell-gradient"></div>
+  <div class="ambient-grid"></div>
+  <div class="scanline-layer"></div>
+
+  <div class="app-shell" id="app-shell">
+    <aside class="glass-panel sidebar-panel" id="sidebar-panel">
+      <div class="brand-block">
+        <div class="brand-badge">CEL</div>
+        <div>
+          <div class="eyebrow">Evidence Operations</div>
+          <h1>Civic Evidence Lab</h1>
+          <p>Мониторинг · проверка · evidence.</p>
+        </div>
+      </div>
+
+      <section class="sidebar-section">
+        <div class="section-head">
+          <span>Источники</span>
+          <button class="ghost-chip" id="refresh-sources-btn" type="button">Обновить</button>
+        </div>
+        <div class="source-tools">
+          <input id="source-search-input" class="glass-input" type="search" placeholder="Поиск источника">
+          <div class="source-filter-row">
+            <button class="filter-chip active" data-source-category="">Все</button>
+            <button class="filter-chip" data-source-category="official">Офиц.</button>
+            <button class="filter-chip" data-source-category="telegram">TG</button>
+            <button class="filter-chip" data-source-category="media">СМИ</button>
+            <button class="filter-chip" data-source-category="youtube">YouTube</button>
+          </div>
+        </div>
+        <div class="source-groups" id="source-groups"></div>
+      </section>
+    </aside>
+
+    <div class="resize-handle left" id="sidebar-resize" aria-hidden="true"></div>
+
+    <main class="main-panel">
+      <header class="glass-panel top-panel">
+        <div class="top-meta">
+          <div class="eyebrow">Workspace</div>
+          <div class="breadcrumb-line" id="breadcrumb-line" aria-hidden="true"></div>
+        </div>
+
+        <div class="nav-cluster" aria-label="Основная навигация">
+          <div class="nav-group-row" id="nav-group-row"></div>
+          <div class="nav-section-row" id="nav-section-row"></div>
+        </div>
+
+        <div class="top-actions">
+          <button class="secondary-btn" id="manual-refresh-btn" type="button">Обновить</button>
+          <button class="secondary-btn" id="export-obsidian-btn" type="button">Obsidian</button>
+          <button class="secondary-btn" id="toggle-tasks-btn" type="button">Панель</button>
+        </div>
+      </header>
+
+      <section class="summary-strip" id="summary-strip"></section>
+
+      <section class="glass-panel screen-panel">
+        <div class="screen-heading">
+          <div>
+            <div class="eyebrow" id="screen-eyebrow">MONITORING</div>
+            <h2 id="screen-title">Обзор</h2>
+          </div>
+          <div class="screen-caption" id="screen-caption">Последние данные по текущему разделу.</div>
+        </div>
+        <div class="screen-root" id="screen-root"></div>
+      </section>
+    </main>
+
+    <div class="resize-handle right" id="tasks-resize" aria-hidden="true"></div>
+
+    <aside class="glass-panel tasks-panel" id="tasks-panel">
+      <div class="section-head">
+        <span>Рабочая панель</span>
+        <button class="ghost-chip" id="scheduler-toggle-btn" type="button">Планировщик</button>
+      </div>
+
+      <div class="tasks-groups" id="tasks-groups"></div>
+
+      <div class="job-detail-card" id="job-detail-card"></div>
+    </aside>
+  </div>
+
+  <div class="toast-stack" id="toast-stack"></div>
+
+  <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+  <script src="./app.js"></script>
+</body>
+</html>

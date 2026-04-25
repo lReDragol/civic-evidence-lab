@@ -25,6 +25,9 @@ log = logging.getLogger(__name__)
 
 
 CHAIN_RELATION_WEIGHTS = {
+    "involved_in_case": 1.15,
+    "part_of_case": 1.1,
+    "documents_case": 1.05,
     "contradicts": 1.35,
     "has_risk": 1.25,
     "government_contract": 1.2,
@@ -54,6 +57,9 @@ CHAIN_RELATION_WEIGHTS = {
 }
 
 CHAIN_SOURCE_QUALITY = {
+    "cases": 1.05,
+    "case_claims": 1.05,
+    "case_events": 1.0,
     "bill_votes": 1.1,
     "bill_vote_sessions": 1.15,
     "bill_sponsors": 1.1,
@@ -73,6 +79,7 @@ CHAIN_SOURCE_QUALITY = {
 }
 
 CHAIN_NODE_BONUS = {
+    NodeType.CASE: 0.32,
     NodeType.BILL: 0.45,
     NodeType.CONTRACT: 0.4,
     NodeType.VOTE_SESSION: 0.25,
@@ -91,8 +98,9 @@ class InvestigationEngine:
         "bill": 1_000_000_000,
         "vote_session": 2_000_000_000,
         "contract": 3_000_000_000,
-        "claim": 4_000_000_000,
-        "content": 5_000_000_000,
+        "case": 4_000_000_000,
+        "claim": 5_000_000_000,
+        "content": 6_000_000_000,
     }
 
     def __init__(self, db_path: str, max_nodes: int = 500, max_edges: int = 2000):
@@ -292,6 +300,15 @@ class InvestigationEngine:
         if title:
             return title[:140]
         return "Госконтракт"
+
+    def _case_label(self, case_title: Optional[str], case_type: Optional[str], case_id: Any) -> str:
+        title = (case_title or "").strip()
+        case_type = (case_type or "").strip()
+        if title:
+            return title[:140]
+        if case_type:
+            return f"Дело {case_type} #{case_id}"
+        return f"Дело #{case_id}"
 
     def _claim_label(self, claim_text: Optional[str], claim_type: Optional[str], claim_id: Any) -> str:
         text = (claim_text or "").strip()
@@ -659,6 +676,8 @@ class InvestigationEngine:
                 return self._find_bill_node_connections(entity_id, source_id)
             if kind == "contract":
                 return self._find_contract_node_connections(entity_id, source_id)
+            if kind == "case":
+                return self._find_case_node_connections(entity_id, source_id)
             if kind == "claim":
                 return self._find_claim_node_connections(entity_id, source_id)
             if kind == "content":
@@ -669,6 +688,7 @@ class InvestigationEngine:
         connections.extend(self._find_entity_relations(entity_id, relation_types))
         connections.extend(self._find_bill_connections(entity_id))
         connections.extend(self._find_claim_connections(entity_id))
+        connections.extend(self._find_case_connections(entity_id))
         connections.extend(self._find_position_connections(entity_id))
         connections.extend(self._find_content_connections(entity_id))
         connections.extend(self._find_investigative_connections(entity_id))
@@ -733,6 +753,69 @@ class InvestigationEngine:
                         "evidence_count": row["evidence_count"],
                         "case_count": row["case_count"],
                         "published_at": row["published_at"],
+                    },
+                },
+            })
+        return connections
+
+    def _find_case_connections(self, entity_id: int) -> List[Dict]:
+        if not self._table_exists("cases") or not self._table_exists("case_claims") or not self._table_exists("claims"):
+            return []
+
+        rows = self.conn.execute(
+            """
+            SELECT DISTINCT cs.id AS case_id, cs.title, cs.case_type, cs.status, cs.started_at,
+                   COUNT(DISTINCT cc.claim_id) AS claim_count,
+                   COUNT(DISTINCT ce.id) AS event_count
+            FROM cases cs
+            LEFT JOIN case_claims cc ON cc.case_id = cs.id
+            LEFT JOIN claims cl ON cl.id = cc.claim_id
+            LEFT JOIN entity_mentions em
+              ON em.content_item_id = cl.content_item_id
+             AND em.entity_id = ?
+            LEFT JOIN case_events ce ON ce.case_id = cs.id
+            LEFT JOIN entity_mentions eme
+              ON eme.content_item_id = ce.content_item_id
+             AND eme.entity_id = ?
+            WHERE em.entity_id IS NOT NULL OR eme.entity_id IS NOT NULL
+            GROUP BY cs.id
+            ORDER BY claim_count DESC, event_count DESC, COALESCE(cs.started_at, cs.id) DESC
+            LIMIT 100
+            """,
+            (entity_id, entity_id),
+        ).fetchall()
+
+        connections: List[Dict] = []
+        for row in rows:
+            case_node_id = self._virtual_node_id("case", row["case_id"])
+            case_label = self._case_label(row["title"], row["case_type"], row["case_id"])
+            connections.append({
+                "other_entity_id": case_node_id,
+                "other_name": case_label,
+                "other_type": "case",
+                "relation_type": "involved_in_case",
+                "source": "cases",
+                "bidirectional": False,
+                "metadata": {
+                    "case_id": row["case_id"],
+                    "case_title": row["title"],
+                    "case_type": row["case_type"],
+                    "case_status": row["status"],
+                    "started_at": row["started_at"],
+                    "claim_count": row["claim_count"],
+                    "event_count": row["event_count"],
+                    "context_type": "case",
+                    "context_id": row["case_id"],
+                    "virtual_node_type": "case",
+                    "virtual_node_label": case_label,
+                    "virtual_node_extra": {
+                        "case_id": row["case_id"],
+                        "case_title": row["title"],
+                        "case_type": row["case_type"],
+                        "case_status": row["status"],
+                        "started_at": row["started_at"],
+                        "claim_count": row["claim_count"],
+                        "event_count": row["event_count"],
                     },
                 },
             })
@@ -1578,6 +1661,120 @@ class InvestigationEngine:
                 })
         return connections
 
+    def _find_case_node_connections(self, node_id: int, case_id: int) -> List[Dict]:
+        if not self._table_exists("cases"):
+            return []
+
+        case_row = self.conn.execute(
+            """
+            SELECT id, title, description, case_type, status, region, started_at
+            FROM cases
+            WHERE id=?
+            """,
+            (case_id,),
+        ).fetchone()
+        if not case_row:
+            return []
+
+        connections: List[Dict] = []
+
+        if self._table_exists("case_claims") and self._table_exists("claims"):
+            claim_rows = self.conn.execute(
+                """
+                SELECT cc.id AS case_claim_id, cc.claim_id, cc.role,
+                       cl.claim_text, cl.claim_type, cl.status AS claim_status,
+                       cl.content_item_id, cl.confidence_final
+                FROM case_claims cc
+                JOIN claims cl ON cl.id = cc.claim_id
+                WHERE cc.case_id=?
+                ORDER BY cc.id
+                LIMIT 80
+                """,
+                (case_id,),
+            ).fetchall()
+            for row in claim_rows:
+                claim_node_id = self._virtual_node_id("claim", row["claim_id"])
+                claim_label = self._claim_label(row["claim_text"], row["claim_type"], row["claim_id"])
+                connections.append({
+                    "other_entity_id": claim_node_id,
+                    "other_name": claim_label,
+                    "other_type": "claim",
+                    "relation_type": "part_of_case",
+                    "source": "case_claims",
+                    "bidirectional": False,
+                    "metadata": {
+                        "case_id": case_id,
+                        "case_claim_id": row["case_claim_id"],
+                        "claim_id": row["claim_id"],
+                        "role": row["role"],
+                        "context_type": "case_claim",
+                        "context_id": row["case_claim_id"],
+                        "virtual_node_type": "claim",
+                        "virtual_node_label": claim_label,
+                        "virtual_node_extra": {
+                            "claim_id": row["claim_id"],
+                            "claim_text": row["claim_text"],
+                            "claim_type": row["claim_type"],
+                            "claim_status": row["claim_status"],
+                            "content_item_id": row["content_item_id"],
+                            "confidence_final": row["confidence_final"],
+                        },
+                    },
+                })
+
+        if self._table_exists("case_events"):
+            event_rows = self.conn.execute(
+                """
+                SELECT ce.id AS case_event_id, ce.event_date, ce.event_title, ce.event_description,
+                       ce.content_item_id,
+                       ci.title, ci.body_text, ci.content_type, ci.published_at, ci.url,
+                       ci.status AS content_status, ci.source_id
+                FROM case_events ce
+                LEFT JOIN content_items ci ON ci.id = ce.content_item_id
+                WHERE ce.case_id=? AND ce.content_item_id IS NOT NULL
+                ORDER BY COALESCE(ce.event_date, ''), ce.event_order, ce.id
+                LIMIT 80
+                """,
+                (case_id,),
+            ).fetchall()
+            for row in event_rows:
+                content_node_id = self._virtual_node_id("content", row["content_item_id"])
+                content_label = self._content_label(row["title"], row["body_text"], row["content_item_id"])
+                connections.append({
+                    "other_entity_id": content_node_id,
+                    "other_name": content_label,
+                    "other_type": "content",
+                    "relation_type": "documents_case",
+                    "source": "case_events",
+                    "bidirectional": False,
+                    "metadata": {
+                        "case_id": case_id,
+                        "case_event_id": row["case_event_id"],
+                        "event_date": row["event_date"],
+                        "event_title": row["event_title"],
+                        "event_description": row["event_description"],
+                        "content_item_id": row["content_item_id"],
+                        "context_type": "case_event",
+                        "context_id": row["case_event_id"],
+                        "virtual_node_type": "content",
+                        "virtual_node_label": content_label,
+                        "virtual_node_extra": {
+                            "content_item_id": row["content_item_id"],
+                            "content_type": row["content_type"],
+                            "title": row["title"],
+                            "published_at": row["published_at"],
+                            "url": row["url"],
+                            "status": row["content_status"],
+                            "source_id": row["source_id"],
+                            "case_event_id": row["case_event_id"],
+                            "event_title": row["event_title"],
+                            "event_date": row["event_date"],
+                        },
+                    },
+                })
+
+        return connections
+
     def _find_contract_node_connections(self, node_id: int, contract_id: int) -> List[Dict]:
         connections: List[Dict] = []
         party_rows = []
@@ -1745,7 +1942,7 @@ class InvestigationEngine:
         source = conn.get("source", "")
         if source in ("entity_relations", "bill_sponsors", "bill_sponsors_co",
                        "official_positions", "inn_match", "zakupki", "contracts", "bill_vote_sessions",
-                       "claim_content", "content_mentions"):
+                       "claim_content", "content_mentions", "cases", "case_claims", "case_events"):
             return Confidence.CONFIRMED
         if source in ("co_mentions",):
             return Confidence.UNCONFIRMED
@@ -1837,6 +2034,41 @@ class InvestigationEngine:
                 description=(
                     f"Упоминание в content_item #{meta.get('content_item_id')} "
                     f"({meta.get('mention_type', '')})"
+                ).strip(),
+                confidence=Confidence.CONFIRMED,
+            ))
+
+        elif source == "cases":
+            evidence.append(EvidenceItem(
+                source_type="case_registry",
+                source_url="",
+                source_name="Cases registry",
+                description=(
+                    f"Дело #{meta.get('case_id')}: "
+                    f"{(meta.get('case_title') or '')[:100]}"
+                ).strip(),
+                confidence=Confidence.CONFIRMED,
+            ))
+
+        elif source == "case_claims":
+            evidence.append(EvidenceItem(
+                source_type="case_claim",
+                source_url="",
+                source_name="Case claims",
+                description=(
+                    f"Claim #{meta.get('claim_id')} включён в дело #{meta.get('case_id')}"
+                ),
+                confidence=Confidence.CONFIRMED,
+            ))
+
+        elif source == "case_events":
+            evidence.append(EvidenceItem(
+                source_type="case_event",
+                source_url=meta.get("url", ""),
+                source_name="Case events",
+                description=(
+                    f"Event #{meta.get('case_event_id')}: "
+                    f"{(meta.get('event_title') or '')[:100]}"
                 ).strip(),
                 confidence=Confidence.CONFIRMED,
             ))
@@ -2121,6 +2353,8 @@ class InvestigationEngine:
             "has_risk",
             "foreign_agent",
             "government_contract",
+            "involved_in_case",
+            "part_of_case",
             "same_inn",
             "investigated_by",
             "about_bill",

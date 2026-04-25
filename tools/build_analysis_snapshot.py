@@ -97,9 +97,15 @@ def copy_database(source_db: Path, target_db: Path):
         source_conn.close()
 
 
-def semantic_relation_layer(relation_type: str, detected_by: str | None) -> str:
+def semantic_relation_layer(
+    relation_type: str,
+    detected_by: str | None,
+    evidence_item_id: Any | None = None,
+) -> str:
     if relation_type in WEAK_RELATION_TYPES or (detected_by or "").startswith("co_occurrence:"):
         return "weak_similarity"
+    if evidence_item_id is not None or relation_type == "contradicts":
+        return "evidence"
     if relation_type in STRUCTURAL_RELATION_TYPES:
         return "structural"
     return "evidence"
@@ -139,6 +145,17 @@ def normalize_name(value: Any) -> str:
     if value is None:
         return ""
     return " ".join(str(value).strip().split()).casefold()
+
+
+def normalize_party_role(value: Any) -> str:
+    role = normalize_name(value)
+    if role in {"заказчик", "customer", "client"}:
+        return "customer"
+    if role in {"поставщик", "supplier", "vendor", "исполнитель", "подрядчик"}:
+        return "supplier"
+    if role in {"", "party"}:
+        return ""
+    return role
 
 
 def resolve_party_entity_id(
@@ -271,7 +288,7 @@ def normalize_contracts(conn: sqlite3.Connection) -> dict[str, int]:
                 if not isinstance(item, dict):
                     continue
                 entity_id = coerce_int(item.get("entity_id"))
-                party_role = str(item.get("role") or "").strip().lower()
+                party_role = normalize_party_role(item.get("role"))
                 party_name = str(item.get("name") or "").strip()
                 party_inn = normalize_inn(item.get("inn"))
 
@@ -308,7 +325,7 @@ def normalize_contracts(conn: sqlite3.Connection) -> dict[str, int]:
                     else:
                         party_role = "party"
 
-                key = (entity_id, party_role, party_name, party_inn)
+                key = (party_role, normalize_name(party_name), party_inn)
                 if key in seen_party_keys:
                     continue
                 seen_party_keys.add(key)
@@ -343,7 +360,7 @@ def normalize_contracts(conn: sqlite3.Connection) -> dict[str, int]:
                 party_name,
                 party_inn,
             )
-            key = (entity_id, party_role, party_name, party_inn)
+            key = (party_role, normalize_name(party_name), party_inn)
             if key in seen_party_keys:
                 continue
             seen_party_keys.add(key)
@@ -406,7 +423,7 @@ def collect_summary(conn: sqlite3.Connection) -> dict[str, Any]:
             GROUP BY relation_type, evidence_item_id, detected_by
             """
         ).fetchall():
-            layer = semantic_relation_layer(relation_type, detected_by)
+            layer = semantic_relation_layer(relation_type, detected_by, evidence_item_id)
             relation_layers[layer] += int(count)
             if evidence_item_id is not None:
                 evidence_backed_relations += int(count)

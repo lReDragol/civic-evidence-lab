@@ -15,51 +15,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-JOB_DEFS = [
-    ("watch_folder", "Inbox-сканер", "Сбор", 60),
-    ("telegram", "Telegram", "Сбор", 300),
-    ("youtube", "YouTube", "Сбор", 86400),
-    ("rss", "RSS/СМИ", "Сбор", 3600),
-    ("official", "Офиц. реестры", "Сбор", 86400),
-    ("playwright_official", "Офиц. JS-сайты", "Сбор", 86400),
-    ("tagger", "Тегирование", "Анализ", 21600),
-    ("llm", "LLM-классификатор", "Анализ", 43200),
-    ("asr", "ASR (Whisper)", "Медиа", 3600),
-    ("ocr", "OCR (PaddleOCR)", "Медиа", 3600),
-    ("ner", "NER (Natasha)", "Анализ", 7200),
-    ("entity_resolve", "Разрешение сущностей", "Анализ", 43200),
-    ("quotes", "Извлечение цитат", "Анализ", 7200),
-    ("claims", "Заявления/верификация", "Анализ", 21600),
-    ("evidence_link", "Привязка свидетельств", "Анализ", 43200),
-    ("cases", "Построение дел", "Дела", 86400),
-    ("accountability", "Индекс подотчётности", "Дела", 86400),
-    ("risk_patterns", "Детекция рисков", "Дела", 86400),
-    ("relations", "Связи сущностей", "Анализ", 86400),
-    ("backup", "Бэкап БД", "Система", 86400),
-]
-
-INTERVAL_KEYS = {
-    "watch_folder": "watch_folder_interval_seconds",
-    "telegram": "telegram_collect_interval_seconds",
-    "youtube": "youtube_interval_seconds",
-    "rss": "rss_interval_seconds",
-    "official": "official_interval_seconds",
-    "playwright_official": "playwright_interval_seconds",
-    "tagger": "classification_interval_seconds",
-    "llm": "llm_interval_seconds",
-    "asr": None,
-    "ocr": None,
-    "ner": "ner_interval_seconds",
-    "entity_resolve": "entity_resolve_interval_seconds",
-    "quotes": "quotes_interval_seconds",
-    "claims": "claims_interval_seconds",
-    "evidence_link": "evidence_link_interval_seconds",
-    "cases": "cases_interval_seconds",
-    "accountability": "accountability_interval_seconds",
-    "risk_patterns": "risk_interval_seconds",
-    "relations": "relations_interval_seconds",
-    "backup": "backup_interval_seconds",
-}
+from ui.job_registry import INTERVAL_KEYS
+from ui.job_registry import JOB_DEFS as JOB_DEFS_STRUCT
 
 SOURCE_GROUP_LABELS = {
     "pinned": "Закреплённые",
@@ -396,7 +353,11 @@ class JobDetailPanel(QWidget):
         self._job_tree.clear()
 
         groups = {}
-        for job_id, name, group, interval in JOB_DEFS:
+        for job in JOB_DEFS_STRUCT:
+            job_id = job["id"]
+            name = job["name"]
+            group = job["group"]
+            interval = job["default_interval"]
             groups.setdefault(group, []).append((job_id, name, interval))
 
         for group_name, jobs in groups.items():
@@ -428,12 +389,14 @@ class JobDetailPanel(QWidget):
             self._job_tree.setCurrentItem(self._job_items[job_id])
             return
 
-        job_def = next((job for job in JOB_DEFS if job[0] == job_id), None)
+        job_def = next((job for job in JOB_DEFS_STRUCT if job["id"] == job_id), None)
         if not job_def:
             self._set_placeholder()
             return
 
-        _, name, group, default_interval = job_def
+        name = job_def["name"]
+        group = job_def["group"]
+        default_interval = job_def["default_interval"]
         running = self.settings.get(f"job_{job_id}_running", False)
         interval_value = self._interval_for_job(job_id, default_interval)
         self._title.setText(name)

@@ -49,6 +49,7 @@ class NodeType(Enum):
     ORGANIZATION = "organization"
     LAW = "law"
     BILL = "bill"
+    CASE = "case"
     REGION = "region"
     PARTY = "party"
     COMMITTEE = "committee"
@@ -68,6 +69,7 @@ class NodeType(Enum):
             NodeType.ORGANIZATION: (60, 180, 80),
             NodeType.LAW: (200, 180, 60),
             NodeType.BILL: (210, 190, 50),
+            NodeType.CASE: (220, 110, 70),
             NodeType.REGION: (160, 100, 200),
             NodeType.PARTY: (220, 80, 80),
             NodeType.COMMITTEE: (100, 180, 200),
@@ -94,6 +96,7 @@ class NodeType(Enum):
             NodeType.ORGANIZATION: "Организация",
             NodeType.LAW: "Закон",
             NodeType.BILL: "Законопроект",
+            NodeType.CASE: "Дело",
             NodeType.REGION: "Регион",
             NodeType.PARTY: "Партия",
             NodeType.COMMITTEE: "Комитет",
@@ -170,6 +173,9 @@ RELATION_LABELS = {
     "reported_in": "Зафиксировано в",
     "supported_by": "Подкреплено доказательством",
     "mentions_entity": "Упоминает",
+    "involved_in_case": "Фигурант дела",
+    "part_of_case": "Входит в дело",
+    "documents_case": "Документирует дело",
 }
 
 RELATION_INVERSE_LABELS = {
@@ -194,6 +200,9 @@ RELATION_INVERSE_LABELS = {
     "reported_in": "Содержит заявление",
     "supported_by": "Служит доказательством для",
     "mentions_entity": "Упомянут в",
+    "involved_in_case": "Дело включает фигуранта",
+    "part_of_case": "Дело опирается на заявление",
+    "documents_case": "Используется в деле",
 }
 
 RELATION_CONFIDENCE = {
@@ -223,6 +232,9 @@ RELATION_CONFIDENCE = {
     "about_bill": Confidence.CONFIRMED,
     "reported_in": Confidence.CONFIRMED,
     "mentions_entity": Confidence.CONFIRMED,
+    "involved_in_case": Confidence.CONFIRMED,
+    "part_of_case": Confidence.CONFIRMED,
+    "documents_case": Confidence.CONFIRMED,
     "mentioned_together": None,
     "has_claim": Confidence.LIKELY,
     "supported_by": None,

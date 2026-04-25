@@ -1,4 +1,4 @@
-# Новостной доказательный архив
+# Civic Evidence Lab
 
 Локальная система для сбора публичных сигналов, файлов, фото, документов и последующей сборки проверяемых утверждений, доказательств и кейсов.
 
@@ -15,6 +15,22 @@ python main.py
 Локальные машинные настройки хранятся в `config/settings.json`.
 В репозитории лежит шаблон `config/settings.example.json` без абсолютных путей и локальных секретов.
 
+## UI
+
+`main.py` запускает встроенный HTML/CSS/JS dashboard внутри PySide6 через `QWebEngineView + QWebChannel`.
+Web bundle лежит в `ui_web/`, bridge и controller-логика — в `ui/web_bridge.py` и `ui/web_window.py`.
+
+## Executive directories
+
+Официальный сбор руководителей и заместителей госорганов живёт в `collectors/executive_directory_scraper.py`.
+Активные leadership sources сейчас описаны в `config/executive_sources.json`.
+
+Быстрый ручной прогон:
+
+```powershell
+python -m collectors.executive_directory_scraper
+```
+
 ## Файловая модель
 
 - `raw_source_items` хранит исходный сигнал и сырой JSON.
@@ -30,17 +46,18 @@ Smoke-test:
 python tools\export_obsidian.py --limit 5 --vault .\obsidian_export_smoke
 ```
 
-Полный экспорт:
+Полный graph-export:
 
 ```powershell
-python tools\export_obsidian.py --vault .\obsidian_export
+python tools\build_analysis_snapshot.py
+python tools\export_obsidian.py --db .\db\news_analysis.db --vault .\obsidian_export_graph --mode graph
 ```
 
-Экспорт создаёт разделы `Sources`, `Content`, `Claims`, `Cases`, `Entities`, `Files` и копирует медиа в `Attachments`.
+Экспорт создаёт разделы `Sources`, `Content`, `Claims`, `Cases`, `Entities`, `Bills`, `VoteSessions`, `Contracts`, `Risks`, `WeakLinks`, `Tags`, `Files` и копирует медиа в `Attachments`.
 
 ## Проверка
 
 ```powershell
-python -m compileall -q .
-python db\migrate.py --no-legacy
+python -m unittest discover -s tests -v
+python -m py_compile main.py ui\web_window.py ui\web_bridge.py collectors\executive_directory_scraper.py collectors\zakupki_scraper.py tools\build_analysis_snapshot.py
 ```

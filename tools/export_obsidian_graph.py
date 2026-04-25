@@ -1312,10 +1312,15 @@ def export_graph_entities(vault: Path, ctx: GraphContext):
         positions = ctx.positions_by_entity.get(ent["id"], [])
         if positions:
             body.extend(["", "## Positions", ""])
+            seen_positions: set[tuple[str, str]] = set()
             for position in positions[:10]:
                 active = " [active]" if position.get("is_active") else ""
                 organization = position.get("organization") or ""
                 title_text = position.get("position_title") or ""
+                position_key = (title_text, organization)
+                if position_key in seen_positions:
+                    continue
+                seen_positions.add(position_key)
                 body.append(f"- {title_text} @ {organization}{active}".strip())
 
         parties = ctx.parties_by_entity.get(ent["id"], [])

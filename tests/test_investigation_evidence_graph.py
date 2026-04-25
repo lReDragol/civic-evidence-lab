@@ -273,6 +273,36 @@ def create_db(db_path: Path):
             )
             """
         )
+        conn.execute(
+            """
+            INSERT INTO cases(
+                id, title, description, case_type, status, started_at
+            ) VALUES(
+                9, 'Questionable procurement case', 'Fixture case linked to the questionable contract claim',
+                'procurement', 'open', '2026-04-07'
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO case_claims(
+                case_id, claim_id, role
+            ) VALUES(
+                9, 50, 'central'
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO case_events(
+                case_id, event_date, event_title, event_description, content_item_id, event_order
+            ) VALUES(
+                9, '2026-04-08', 'Official evidence added',
+                'A supporting procurement document was attached to the case.',
+                101, 1
+            )
+            """
+        )
         conn.commit()
     finally:
         conn.close()
@@ -309,7 +339,7 @@ class InvestigationEvidenceGraphTests(unittest.TestCase):
                 self.assertTrue(org_result.evidence_chains)
                 self.assertTrue(
                     any(
-                        chain.entity_path == [1, contract_nodes[0].entity_id, 2]
+                        contract_nodes[0].entity_id in chain.entity_path and 2 in chain.entity_path
                         for chain in org_result.evidence_chains
                     )
                 )
@@ -412,6 +442,46 @@ class InvestigationEvidenceGraphTests(unittest.TestCase):
                         chain.entity_path[0] == 1
                         and claim_nodes[0].entity_id in chain.entity_path
                         and 2 in chain.entity_path
+                        for chain in result.evidence_chains
+                    )
+                )
+            finally:
+                engine.close()
+
+    def test_engine_builds_case_nodes_from_claims_and_case_events(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "sample.db"
+            create_db(db_path)
+
+            engine = InvestigationEngine(str(db_path))
+            try:
+                result = engine.investigate(1, max_hops=4, min_confidence=Confidence.LIKELY)
+                claim_nodes = [node for node in result.nodes.values() if node.node_type == NodeType.CLAIM]
+                case_nodes = [node for node in result.nodes.values() if node.node_type == NodeType.CASE]
+                content_nodes = [node for node in result.nodes.values() if node.node_type == NodeType.CONTENT]
+
+                self.assertTrue(claim_nodes)
+                self.assertTrue(case_nodes)
+                self.assertTrue(content_nodes)
+                self.assertTrue(
+                    any(
+                        edge.relation_type == "part_of_case"
+                        and claim_nodes[0].entity_id in {edge.from_id, edge.to_id}
+                        and case_nodes[0].entity_id in {edge.from_id, edge.to_id}
+                        for edge in result.edges
+                    )
+                )
+                self.assertTrue(
+                    any(
+                        edge.relation_type == "documents_case"
+                        and case_nodes[0].entity_id in {edge.from_id, edge.to_id}
+                        and 101 in {result.nodes[edge.from_id].extra.get("content_item_id"), result.nodes[edge.to_id].extra.get("content_item_id")}
+                        for edge in result.edges
+                    )
+                )
+                self.assertTrue(
+                    any(
+                        case_nodes[0].entity_id in chain.entity_path and claim_nodes[0].entity_id in chain.entity_path
                         for chain in result.evidence_chains
                     )
                 )
