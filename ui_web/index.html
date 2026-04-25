@@ -12,6 +12,7 @@
   <div class="scanline-layer"></div>
 
   <div class="app-shell" id="app-shell">
+    <div class="sidebar-backdrop" id="sidebar-backdrop" aria-hidden="true"></div>
     <aside class="glass-panel sidebar-panel" id="sidebar-panel">
       <div class="brand-block">
         <div class="brand-badge">CEL</div>
@@ -58,6 +59,7 @@
         <div class="top-actions">
           <button class="secondary-btn" id="manual-refresh-btn" type="button">Обновить</button>
           <button class="secondary-btn" id="export-obsidian-btn" type="button">Obsidian</button>
+          <button class="secondary-btn" id="toggle-sources-btn" type="button">Источники</button>
           <button class="secondary-btn" id="toggle-tasks-btn" type="button">Панель</button>
         </div>
       </header>
@@ -75,6 +77,8 @@
         <div class="screen-root" id="screen-root"></div>
       </section>
     </main>
+
+    <div class="relation-map-overlay-host" id="relation-map-overlay-host" aria-hidden="true"></div>
 
     <div class="tasks-backdrop" id="tasks-backdrop" aria-hidden="true"></div>
     <div class="resize-handle right" id="tasks-resize" aria-hidden="true"></div>

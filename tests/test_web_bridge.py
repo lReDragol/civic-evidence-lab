@@ -46,13 +46,21 @@ def create_db(db_path: Path):
                 11, 2, 'exec:2', 'post', 'Повторное сообщение об Иванове',
                 'Иванов Иван Иванович занимает должность министра',
                 '2026-04-26', 'raw_signal', 'https://example.test/post/11'
+            ),
+            (
+                12, 1, 'exec:3', 'document', 'Приказ о назначении Иванова',
+                'Назначить Иванова Ивана Ивановича министром тестирования.',
+                '2026-04-24', 'official_document', 'https://example.test/minfin/order/12'
             );
 
             INSERT INTO entity_mentions(entity_id, content_item_id, mention_type, confidence)
             VALUES
                 (1, 10, 'subject', 1.0),
                 (2, 10, 'organization', 1.0),
-                (1, 11, 'subject', 1.0);
+                (1, 11, 'subject', 1.0),
+                (3, 11, 'subject', 1.0),
+                (1, 12, 'subject', 1.0),
+                (2, 12, 'organization', 1.0);
 
             INSERT INTO claims(id, content_item_id, claim_text, status, needs_review)
             VALUES
@@ -68,11 +76,31 @@ def create_db(db_path: Path):
                 (31, 22, 'central'),
                 (31, 23, 'central');
 
+            INSERT INTO evidence_links(id, claim_id, evidence_item_id, evidence_type, strength, notes)
+            VALUES
+                (51, 21, 12, 'official_document', 'strong', 'Приказ о назначении');
+
             INSERT INTO entity_relations(
                 id, from_entity_id, to_entity_id, relation_type, evidence_item_id, strength, detected_by
             ) VALUES
                 (41, 1, 2, 'works_at', 10, 'strong', 'official_positions'),
                 (42, 1, 3, 'mentioned_together', NULL, 'weak', 'co_occurrence:3');
+
+            INSERT INTO bills(id, number, title, status, registration_date, duma_url)
+            VALUES(71, '901048-8', 'О проекте федерального закона о тестировании', 'registered', '2026-04-20', 'https://example.test/duma/bill/71');
+
+            INSERT INTO bill_sponsors(bill_id, entity_id, sponsor_name)
+            VALUES
+                (71, 1, 'Иванов Иван Иванович'),
+                (71, 3, 'Петров Пётр Петрович');
+
+            INSERT INTO contracts(id, contract_number, title, publication_date, customer_inn, supplier_inn)
+            VALUES(81, 'T-2026-81', 'Контракт на тестовую поставку', '2026-04-22', '1002003004', '5006007008');
+
+            INSERT INTO contract_parties(contract_id, entity_id, party_name, party_role, inn)
+            VALUES
+                (81, 2, 'Министерство тестирования', 'customer', '1002003004'),
+                (81, 3, 'Петров Пётр Петрович', 'supplier', '5006007008');
             """
         )
         conn.commit()
@@ -97,7 +125,7 @@ class DashboardDataServiceTests(unittest.TestCase):
             finally:
                 conn.close()
 
-            self.assertEqual(payload["summary"]["counts"]["content"], 2)
+            self.assertEqual(payload["summary"]["counts"]["content"], 3)
             self.assertEqual(payload["summary"]["counts"]["claims"], 3)
             self.assertEqual(payload["summary"]["counts"]["officials"], 1)
             self.assertIn("secondary_counts", payload["summary"])
@@ -154,6 +182,9 @@ class DashboardDataServiceTests(unittest.TestCase):
             self.assertEqual(payload["items"][0]["relation_label"], "Работает в")
             self.assertEqual(payload["items"][0]["detected_label"], "официальные должности")
             self.assertEqual(payload["detail"]["id"], 41)
+            self.assertEqual(payload["map_graph"]["kind"], "relation_map")
+            self.assertTrue(payload["map_graph"]["edges"])
+            self.assertTrue(any(edge["kind"] == "evidence" for edge in payload["map_graph"]["edges"]))
 
     def test_relation_layer_treats_evidence_backed_structural_edge_as_evidence(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -190,6 +221,140 @@ class DashboardDataServiceTests(unittest.TestCase):
                 payload["detail"]["claims"][0]["claim_text"],
                 "Иванов Иван Иванович занимает должность министра",
             )
+
+    def test_claim_detail_contains_evidence_graph(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "bridge.db"
+            create_db(db_path)
+
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            try:
+                service = DashboardDataService(conn, {})
+                payload = service.screen_payload("claims", {"selected_id": 21})
+            finally:
+                conn.close()
+
+            graph = payload["detail"]["evidence_graph"]
+            self.assertEqual(graph["kind"], "claim")
+            node_roles = {node["role"] for node in graph["nodes"]}
+            self.assertIn("claim", node_roles)
+            self.assertIn("content_origin", node_roles)
+            self.assertIn("evidence", node_roles)
+            self.assertIn("case", node_roles)
+            edge_labels = {edge["label"] for edge in graph["edges"]}
+            self.assertIn("источник", edge_labels)
+            self.assertIn("official_document", edge_labels)
+            self.assertTrue(all(node.get("description") for node in graph["nodes"]))
+
+    def test_relation_detail_contains_evidence_graph(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "bridge.db"
+            create_db(db_path)
+
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            try:
+                service = DashboardDataService(conn, {})
+                payload = service.screen_payload("relations", {"selected_id": 41})
+            finally:
+                conn.close()
+
+            graph = payload["detail"]["evidence_graph"]
+            self.assertEqual(graph["kind"], "relation")
+            node_roles = {node["role"] for node in graph["nodes"]}
+            self.assertIn("relation", node_roles)
+            self.assertIn("entity_from", node_roles)
+            self.assertIn("entity_to", node_roles)
+            self.assertIn("evidence", node_roles)
+            edge_labels = {edge["label"] for edge in graph["edges"]}
+            self.assertIn("Работает в", edge_labels)
+            self.assertIn("доказательство", edge_labels)
+            self.assertTrue(all(node.get("description") for node in graph["nodes"]))
+
+    def test_relation_map_includes_review_candidates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "bridge.db"
+            create_db(db_path)
+
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO relation_candidates(
+                        id, entity_a_id, entity_b_id, candidate_type, origin, score,
+                        support_items, support_sources, support_domains, promotion_state, metadata_json
+                    ) VALUES(
+                        81, 1, 3, 'same_case_cluster', 'candidate_builder:hybrid', 0.44,
+                        4, 2, 2, 'review',
+                        '{"case_overlap": 2, "support_items": 4}'
+                    )
+                    """
+                )
+                conn.commit()
+                service = DashboardDataService(conn, {})
+                payload = service.screen_payload("relations", {})
+            finally:
+                conn.close()
+
+            map_graph = payload["map_graph"]
+            self.assertEqual(map_graph["kind"], "relation_map")
+            edge_kinds = {edge["kind"] for edge in map_graph["edges"]}
+            self.assertIn("weak_similarity", edge_kinds)
+            self.assertTrue(any("общие дела" in (edge.get("summary") or "") for edge in map_graph["edges"]))
+
+    def test_relation_map_contains_bridge_nodes_and_detail_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "bridge.db"
+            create_db(db_path)
+
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            try:
+                service = DashboardDataService(conn, {})
+                payload = service.screen_payload("relations", {"selected_id": 42})
+            finally:
+                conn.close()
+
+            map_graph = payload["map_graph"]
+            node_roles = {node["role"] for node in map_graph["nodes"]}
+            self.assertIn("bridge_claim", node_roles)
+            self.assertIn("bridge_case", node_roles)
+            self.assertIn("bridge_content", node_roles)
+            self.assertIn("bridge_evidence", node_roles)
+            self.assertIn("bridge_bill", node_roles)
+            self.assertIn("bridge_contract", node_roles)
+
+            bridge_paths = payload["detail"].get("bridge_paths") or []
+            self.assertTrue(bridge_paths)
+            self.assertTrue(any("Claim" in path["label"] for path in bridge_paths))
+            self.assertTrue(any("Законопроект" in path["label"] or "Контракт" in path["label"] for path in bridge_paths))
+
+    def test_settings_screen_contains_workspace_detail(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "bridge.db"
+            create_db(db_path)
+
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            try:
+                service = DashboardDataService(
+                    conn,
+                    {
+                        "db_path": "db/news_unified.db",
+                        "obsidian_export_dir": "obsidian_export_graph",
+                        "executive_directory_interval_seconds": 604800,
+                    },
+                )
+                payload = service.screen_payload("settings", {})
+            finally:
+                conn.close()
+
+            self.assertIn("project_root", payload["detail"])
+            keys = {item["key"] for item in payload["items"]}
+            self.assertIn("db_path", keys)
+            self.assertIn("obsidian_export_dir", keys)
 
 
 if __name__ == "__main__":

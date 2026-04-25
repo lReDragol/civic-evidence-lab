@@ -560,6 +560,1075 @@ class DashboardDataService:
         ).fetchone()
         return self._row_to_dict(row) if row else None
 
+    @staticmethod
+    def _compact_text(value: Any, limit: int = 92) -> str:
+        text = re.sub(r"\s+", " ", str(value or "").strip())
+        if len(text) <= limit:
+            return text
+        return f"{text[: limit - 1].rstrip()}…"
+
+    @staticmethod
+    def _full_text(value: Any) -> str:
+        return re.sub(r"\s+", " ", str(value or "").strip())
+
+    @staticmethod
+    def _json_object(raw_value: Any) -> dict[str, Any]:
+        if not raw_value:
+            return {}
+        try:
+            payload = json.loads(str(raw_value))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def _graph_node(
+        self,
+        node_id: str,
+        role: str,
+        label: str,
+        title: Any,
+        meta: Any = "",
+        *,
+        description: Any = "",
+        jump_screen: str | None = None,
+        jump_id: int | None = None,
+    ) -> dict[str, Any]:
+        node = {
+            "id": str(node_id),
+            "role": role,
+            "label": self._compact_text(label, 24),
+            "title": self._compact_text(title, 112) or "—",
+            "meta": self._compact_text(meta, 84),
+            "description": self._full_text(description),
+        }
+        if jump_screen and jump_id:
+            node["jump_screen"] = jump_screen
+            node["jump_id"] = int(jump_id)
+        return node
+
+    def _content_entities(self, content_item_id: int | None, limit: int = 3) -> list[dict[str, Any]]:
+        if not content_item_id or not self._table_exists("entity_mentions"):
+            return []
+        rows = self.db.execute(
+            """
+            SELECT e.id, e.canonical_name, e.entity_type, em.mention_type
+            FROM entity_mentions em
+            JOIN entities e ON e.id = em.entity_id
+            WHERE em.content_item_id=?
+            ORDER BY
+                CASE em.mention_type
+                    WHEN 'subject' THEN 0
+                    WHEN 'organization' THEN 1
+                    ELSE 2
+                END,
+                e.canonical_name
+            LIMIT ?
+            """,
+            (content_item_id, int(limit)),
+        ).fetchall()
+        return [self._row_to_dict(row) for row in rows]
+
+    def _claim_evidence_graph(self, detail: dict[str, Any] | None) -> dict[str, Any] | None:
+        if not detail or not detail.get("id"):
+            return None
+
+        claim_id = int(detail["id"])
+        claim_node_id = f"claim:{claim_id}"
+        nodes = [
+            self._graph_node(
+                claim_node_id,
+                "claim",
+                "Claim",
+                detail.get("claim_text") or f"Claim #{claim_id}",
+                " · ".join(
+                    value
+                    for value in [
+                        detail.get("status"),
+                        f"conf {detail.get('confidence_final')}" if detail.get("confidence_final") not in (None, "") else "",
+                    ]
+                    if value
+                ),
+                description=detail.get("claim_text") or f"Claim #{claim_id}",
+                jump_screen="claims",
+                jump_id=claim_id,
+            )
+        ]
+        edges: list[dict[str, Any]] = []
+
+        content_id = detail.get("content_id")
+        if content_id:
+            content_node_id = f"content:{int(content_id)}"
+            nodes.append(
+                self._graph_node(
+                    content_node_id,
+                    "content_origin",
+                    "Источник",
+                    detail.get("content_title") or f"Content #{content_id}",
+                    " · ".join(
+                        value
+                        for value in [
+                            detail.get("source_name"),
+                            detail.get("published_at"),
+                            detail.get("content_type"),
+                        ]
+                        if value
+                    ),
+                    description=detail.get("body_text") or detail.get("content_title") or f"Content #{content_id}",
+                    jump_screen="content",
+                    jump_id=int(content_id),
+                )
+            )
+            edges.append({"from": content_node_id, "to": claim_node_id, "label": "источник", "kind": "origin"})
+
+            for entity in self._content_entities(int(content_id), limit=3):
+                entity_id = entity.get("id")
+                if not entity_id:
+                    continue
+                entity_node_id = f"entity:{int(entity_id)}"
+                nodes.append(
+                    self._graph_node(
+                        entity_node_id,
+                        "entity",
+                        entity.get("entity_type") or "entity",
+                        entity.get("canonical_name") or f"Entity #{entity_id}",
+                        entity.get("mention_type") or "",
+                        description=entity.get("canonical_name") or f"Entity #{entity_id}",
+                        jump_screen="entities",
+                        jump_id=int(entity_id),
+                    )
+                )
+                edges.append(
+                    {
+                        "from": entity_node_id,
+                        "to": claim_node_id,
+                        "label": entity.get("mention_type") or "упоминание",
+                        "kind": "entity",
+                    }
+                )
+
+        case_id = detail.get("case_id")
+        if case_id:
+            case_node_id = f"case:{int(case_id)}"
+            nodes.append(
+                self._graph_node(
+                    case_node_id,
+                    "case",
+                    "Дело",
+                    detail.get("case_title") or f"Case #{case_id}",
+                    detail.get("case_type") or detail.get("status") or "",
+                    description=detail.get("case_title") or f"Case #{case_id}",
+                    jump_screen="cases",
+                    jump_id=int(case_id),
+                )
+            )
+            edges.append({"from": case_node_id, "to": claim_node_id, "label": "в деле", "kind": "case"})
+
+        for index, evidence in enumerate(detail.get("evidence") or []):
+            evidence_key = evidence.get("id") or evidence.get("evidence_item_id") or f"{claim_id}:{index}"
+            evidence_node_id = f"evidence:{evidence_key}"
+            evidence_title = (
+                evidence.get("evidence_title")
+                or evidence.get("notes")
+                or evidence.get("evidence_type")
+                or f"Evidence #{index + 1}"
+            )
+            evidence_meta = " · ".join(
+                value
+                for value in [
+                    evidence.get("evidence_type"),
+                    evidence.get("evidence_source_name"),
+                    evidence.get("evidence_published_at"),
+                    evidence.get("strength"),
+                ]
+                if value
+            )
+            node_kwargs: dict[str, Any] = {}
+            if evidence.get("evidence_item_id"):
+                node_kwargs = {
+                    "jump_screen": "content",
+                    "jump_id": int(evidence["evidence_item_id"]),
+                }
+            nodes.append(
+                self._graph_node(
+                    evidence_node_id,
+                    "evidence",
+                    "Evidence",
+                    evidence_title,
+                    evidence_meta,
+                    description=evidence.get("notes")
+                    or evidence.get("evidence_title")
+                    or evidence.get("evidence_type")
+                    or f"Evidence #{index + 1}",
+                    **node_kwargs,
+                )
+            )
+            edges.append(
+                {
+                    "from": evidence_node_id,
+                    "to": claim_node_id,
+                    "label": evidence.get("evidence_type") or "подтверждает",
+                    "kind": "evidence",
+                }
+            )
+
+        if len(nodes) < 2:
+            return None
+        return {"kind": "claim", "nodes": nodes, "edges": edges}
+
+    def _relation_evidence_graph(self, detail: dict[str, Any] | None) -> dict[str, Any] | None:
+        if not detail or not detail.get("id"):
+            return None
+
+        relation_id = int(detail["id"])
+        relation_node_id = f"relation:{relation_id}"
+        nodes = [
+            self._graph_node(
+                relation_node_id,
+                "relation",
+                detail.get("layer_label") or detail.get("layer") or "Связь",
+                detail.get("relation_label") or detail.get("relation_type") or f"Relation #{relation_id}",
+                " · ".join(
+                    value
+                    for value in [
+                        detail.get("strength"),
+                        detail.get("detected_label") or detail.get("detected_by"),
+                    ]
+                    if value
+                ),
+                description=detail.get("summary")
+                or detail.get("relation_label")
+                or detail.get("relation_type")
+                or f"Relation #{relation_id}",
+            )
+        ]
+        edges: list[dict[str, Any]] = []
+
+        from_entity_id = detail.get("from_entity_id")
+        if from_entity_id:
+            from_node_id = f"entity:{int(from_entity_id)}"
+            nodes.append(
+                self._graph_node(
+                    from_node_id,
+                    "entity_from",
+                    detail.get("from_type") or "from",
+                    detail.get("from_name") or f"Entity #{from_entity_id}",
+                    detail.get("from_description") or "",
+                    description=detail.get("from_description")
+                    or detail.get("from_name")
+                    or f"Entity #{from_entity_id}",
+                    jump_screen="entities",
+                    jump_id=int(from_entity_id),
+                )
+            )
+            edges.append(
+                {
+                    "from": from_node_id,
+                    "to": relation_node_id,
+                    "label": "источник связи",
+                    "kind": "entity",
+                }
+            )
+
+        to_entity_id = detail.get("to_entity_id")
+        if to_entity_id:
+            to_node_id = f"entity:{int(to_entity_id)}"
+            nodes.append(
+                self._graph_node(
+                    to_node_id,
+                    "entity_to",
+                    detail.get("to_type") or "to",
+                    detail.get("to_name") or f"Entity #{to_entity_id}",
+                    detail.get("to_description") or "",
+                    description=detail.get("to_description")
+                    or detail.get("to_name")
+                    or f"Entity #{to_entity_id}",
+                    jump_screen="entities",
+                    jump_id=int(to_entity_id),
+                )
+            )
+            edges.append(
+                {
+                    "from": relation_node_id,
+                    "to": to_node_id,
+                    "label": detail.get("relation_label") or detail.get("relation_type") or "связь",
+                    "kind": "relation",
+                }
+            )
+
+        if detail.get("context_title"):
+            context_node_id = f"context:{relation_id}"
+            nodes.append(
+                self._graph_node(
+                    context_node_id,
+                    "context",
+                    detail.get("context_subtitle") or "Контекст",
+                    detail.get("context_title"),
+                    detail.get("context_url") or "",
+                    description=detail.get("context_title"),
+                )
+            )
+            edges.append({"from": context_node_id, "to": relation_node_id, "label": "контекст", "kind": "context"})
+
+        if detail.get("evidence_title"):
+            evidence_node_id = f"evidence:{detail.get('evidence_content_id') or relation_id}"
+            node_kwargs: dict[str, Any] = {}
+            if detail.get("evidence_content_id"):
+                node_kwargs = {
+                    "jump_screen": "content",
+                    "jump_id": int(detail["evidence_content_id"]),
+                }
+            nodes.append(
+                self._graph_node(
+                    evidence_node_id,
+                    "evidence",
+                    "Evidence",
+                    detail.get("evidence_title"),
+                    detail.get("evidence_url") or detail.get("detected_label") or "",
+                    description=detail.get("evidence_title")
+                    or detail.get("evidence_url")
+                    or detail.get("summary")
+                    or "Evidence",
+                    **node_kwargs,
+                )
+            )
+            edges.append({"from": evidence_node_id, "to": relation_node_id, "label": "доказательство", "kind": "evidence"})
+
+        if len(nodes) < 2:
+            return None
+        return {"kind": "relation", "nodes": nodes, "edges": edges}
+
+    def _relation_map_graph(self, relations: list[dict[str, Any]]) -> dict[str, Any] | None:
+        if not relations:
+            return None
+
+        node_map: dict[str, dict[str, Any]] = {}
+        degree_map: defaultdict[str, int] = defaultdict(int)
+        edges: list[dict[str, Any]] = []
+        edge_keys: set[tuple[Any, ...]] = set()
+
+        for item in relations[:480]:
+            from_entity_id = item.get("from_entity_id")
+            to_entity_id = item.get("to_entity_id")
+            if not from_entity_id or not to_entity_id:
+                continue
+
+            from_node_id = f"entity:{int(from_entity_id)}"
+            to_node_id = f"entity:{int(to_entity_id)}"
+
+            degree_map[from_node_id] += 1
+            degree_map[to_node_id] += 1
+
+            if from_node_id not in node_map:
+                node_map[from_node_id] = self._graph_node(
+                    from_node_id,
+                    "map_entity",
+                    item.get("from_type") or "entity",
+                    item.get("from_name") or f"Entity #{from_entity_id}",
+                    "",
+                    description=item.get("from_description")
+                    or item.get("from_name")
+                    or f"Entity #{from_entity_id}",
+                    jump_screen="entities",
+                    jump_id=int(from_entity_id),
+                )
+            if to_node_id not in node_map:
+                node_map[to_node_id] = self._graph_node(
+                    to_node_id,
+                    "map_entity",
+                    item.get("to_type") or "entity",
+                    item.get("to_name") or f"Entity #{to_entity_id}",
+                    "",
+                    description=item.get("to_description")
+                    or item.get("to_name")
+                    or f"Entity #{to_entity_id}",
+                    jump_screen="entities",
+                    jump_id=int(to_entity_id),
+                )
+
+            edge_payload = {
+                "from": from_node_id,
+                "to": to_node_id,
+                "label": item.get("relation_label") or item.get("relation_type") or "связь",
+                "kind": item.get("layer") or "relation",
+                "strength": item.get("strength") or "",
+                "detected_label": item.get("detected_label") or item.get("detected_by") or "",
+                "summary": item.get("summary") or "",
+            }
+            relation_id = item.get("id")
+            if relation_id not in (None, ""):
+                edge_payload["id"] = int(relation_id)
+            edge_key = (
+                edge_payload["from"],
+                edge_payload["to"],
+                edge_payload["label"],
+                edge_payload["kind"],
+                edge_payload.get("id"),
+            )
+            if edge_key not in edge_keys:
+                edge_keys.add(edge_key)
+                edges.append(edge_payload)
+
+        if len(node_map) < 2 or not edges:
+            return None
+
+        sorted_entity_ids = [
+            int(node_id.split(":", 1)[1])
+            for node_id, _node in sorted(degree_map.items(), key=lambda item: (-item[1], item[0]))[:72]
+            if node_id.startswith("entity:")
+        ]
+        scoped_entity_ids = {entity_id for entity_id in sorted_entity_ids if entity_id}
+        if scoped_entity_ids:
+            self._relation_map_append_claim_bridges(scoped_entity_ids, node_map, degree_map, edges, edge_keys)
+            self._relation_map_append_bill_bridges(scoped_entity_ids, node_map, degree_map, edges, edge_keys)
+            self._relation_map_append_contract_bridges(scoped_entity_ids, node_map, degree_map, edges, edge_keys)
+
+        for node_id, node in node_map.items():
+            degree = degree_map.get(node_id, 0)
+            meta = [f"связей {degree}"]
+            if node.get("meta"):
+                meta.append(str(node["meta"]))
+            node["meta"] = self._compact_text(" · ".join(value for value in meta if value), 84)
+
+        return {
+            "kind": "relation_map",
+            "nodes": list(node_map.values()),
+            "edges": edges,
+            "stats": {
+                "nodes": len(node_map),
+                "edges": len(edges),
+                "entity_nodes": sum(1 for node in node_map.values() if node.get("role") == "map_entity"),
+                "bridge_nodes": sum(1 for node in node_map.values() if str(node.get("role", "")).startswith("bridge_")),
+            },
+        }
+
+    def _relation_map_append_claim_bridges(
+        self,
+        entity_ids: set[int],
+        node_map: dict[str, dict[str, Any]],
+        degree_map: defaultdict[str, int],
+        edges: list[dict[str, Any]],
+        edge_keys: set[tuple[Any, ...]],
+    ) -> None:
+        if not entity_ids or not self._table_exists("claims") or not self._table_exists("entity_mentions"):
+            return
+        placeholders = ",".join("?" for _ in entity_ids)
+        claim_rows = self.db.execute(
+            f"""
+            SELECT cl.id, cl.claim_text, cl.status, cl.content_item_id,
+                   COUNT(DISTINCT em.entity_id) AS matched_entities
+            FROM claims cl
+            JOIN entity_mentions em ON em.content_item_id = cl.content_item_id
+            WHERE em.entity_id IN ({placeholders})
+            GROUP BY cl.id
+            HAVING COUNT(DISTINCT em.entity_id) >= 2
+            ORDER BY matched_entities DESC, cl.id DESC
+            LIMIT 36
+            """,
+            tuple(entity_ids),
+        ).fetchall()
+        for row in claim_rows:
+            claim = self._row_to_dict(row)
+            claim_id = int(claim["id"])
+            claim_node_id = f"claim:{claim_id}"
+            self._map_ensure_node(
+                node_map,
+                claim_node_id,
+                "bridge_claim",
+                "Claim",
+                claim.get("claim_text") or f"Claim #{claim_id}",
+                claim.get("status") or "",
+                description=claim.get("claim_text") or f"Claim #{claim_id}",
+                jump_screen="claims",
+                jump_id=claim_id,
+            )
+
+            mention_rows = self.db.execute(
+                f"""
+                SELECT DISTINCT e.id, e.canonical_name, e.entity_type, e.description, em.mention_type
+                FROM entity_mentions em
+                JOIN entities e ON e.id = em.entity_id
+                WHERE em.content_item_id=? AND em.entity_id IN ({placeholders})
+                ORDER BY
+                    CASE em.mention_type
+                        WHEN 'subject' THEN 0
+                        WHEN 'organization' THEN 1
+                        ELSE 2
+                    END,
+                    e.canonical_name
+                LIMIT 5
+                """,
+                (claim.get("content_item_id"), *tuple(entity_ids)),
+            ).fetchall()
+            for mention_row in mention_rows:
+                entity = self._row_to_dict(mention_row)
+                entity_id = int(entity["id"])
+                entity_node_id = f"entity:{entity_id}"
+                self._map_ensure_node(
+                    node_map,
+                    entity_node_id,
+                    "map_entity",
+                    entity.get("entity_type") or "entity",
+                    entity.get("canonical_name") or f"Entity #{entity_id}",
+                    "",
+                    description=entity.get("description") or entity.get("canonical_name") or f"Entity #{entity_id}",
+                    jump_screen="entities",
+                    jump_id=entity_id,
+                )
+                self._map_add_edge(
+                    edges,
+                    edge_keys,
+                    degree_map,
+                    entity_node_id,
+                    claim_node_id,
+                    entity.get("mention_type") or "упоминание",
+                    "claim",
+                    summary=f"{entity.get('canonical_name') or 'Сущность'} фигурирует в claim.",
+                )
+
+            if claim.get("content_item_id") and self._table_exists("content_items"):
+                content_row = self.db.execute(
+                    """
+                    SELECT ci.id, ci.title, ci.body_text, ci.published_at, ci.content_type, s.name AS source_name
+                    FROM content_items ci
+                    LEFT JOIN sources s ON s.id = ci.source_id
+                    WHERE ci.id=?
+                    """,
+                    (claim["content_item_id"],),
+                ).fetchone()
+                if content_row:
+                    content = self._row_to_dict(content_row)
+                    content_id = int(content["id"])
+                    content_node_id = f"content:{content_id}"
+                    self._map_ensure_node(
+                        node_map,
+                        content_node_id,
+                        "bridge_content",
+                        "Контент",
+                        content.get("title") or f"Content #{content_id}",
+                        " · ".join(
+                            value for value in [content.get("source_name"), content.get("published_at"), content.get("content_type")] if value
+                        ),
+                        description=content.get("body_text") or content.get("title") or f"Content #{content_id}",
+                        jump_screen="content",
+                        jump_id=content_id,
+                    )
+                    self._map_add_edge(
+                        edges,
+                        edge_keys,
+                        degree_map,
+                        content_node_id,
+                        claim_node_id,
+                        "источник",
+                        "origin",
+                        summary="Контент является источником claim.",
+                    )
+
+            if self._table_exists("case_claims") and self._table_exists("cases"):
+                for case_row in self.db.execute(
+                    """
+                    SELECT c.id, c.title, c.case_type, c.status
+                    FROM case_claims cc
+                    JOIN cases c ON c.id = cc.case_id
+                    WHERE cc.claim_id=?
+                    ORDER BY c.id DESC
+                    LIMIT 3
+                    """,
+                    (claim_id,),
+                ).fetchall():
+                    case_item = self._row_to_dict(case_row)
+                    case_id = int(case_item["id"])
+                    case_node_id = f"case:{case_id}"
+                    self._map_ensure_node(
+                        node_map,
+                        case_node_id,
+                        "bridge_case",
+                        "Дело",
+                        case_item.get("title") or f"Case #{case_id}",
+                        " · ".join(value for value in [case_item.get("case_type"), case_item.get("status")] if value),
+                        description=case_item.get("title") or f"Case #{case_id}",
+                        jump_screen="cases",
+                        jump_id=case_id,
+                    )
+                    self._map_add_edge(
+                        edges,
+                        edge_keys,
+                        degree_map,
+                        case_node_id,
+                        claim_node_id,
+                        "в деле",
+                        "case",
+                        summary="Claim входит в состав дела.",
+                    )
+
+            if self._table_exists("evidence_links"):
+                for evidence_row in self.db.execute(
+                    """
+                    SELECT el.id, el.evidence_type, el.strength, el.notes,
+                           ci.id AS evidence_item_id, ci.title AS evidence_title,
+                           ci.published_at AS evidence_published_at,
+                           s.name AS evidence_source_name
+                    FROM evidence_links el
+                    LEFT JOIN content_items ci ON ci.id = el.evidence_item_id
+                    LEFT JOIN sources s ON s.id = ci.source_id
+                    WHERE el.claim_id=?
+                    ORDER BY el.id DESC
+                    LIMIT 3
+                    """,
+                    (claim_id,),
+                ).fetchall():
+                    evidence = self._row_to_dict(evidence_row)
+                    evidence_key = evidence.get("evidence_item_id") or evidence.get("id")
+                    if not evidence_key:
+                        continue
+                    evidence_node_id = f"evidence:{int(evidence_key)}"
+                    evidence_title = (
+                        evidence.get("evidence_title")
+                        or evidence.get("notes")
+                        or evidence.get("evidence_type")
+                        or f"Evidence #{evidence.get('id')}"
+                    )
+                    self._map_ensure_node(
+                        node_map,
+                        evidence_node_id,
+                        "bridge_evidence",
+                        "Evidence",
+                        evidence_title,
+                        " · ".join(
+                            value
+                            for value in [
+                                evidence.get("evidence_type"),
+                                evidence.get("evidence_source_name"),
+                                evidence.get("evidence_published_at"),
+                                evidence.get("strength"),
+                            ]
+                            if value
+                        ),
+                        description=evidence.get("notes") or evidence_title,
+                        jump_screen="content" if evidence.get("evidence_item_id") else None,
+                        jump_id=int(evidence["evidence_item_id"]) if evidence.get("evidence_item_id") else None,
+                    )
+                    self._map_add_edge(
+                        edges,
+                        edge_keys,
+                        degree_map,
+                        evidence_node_id,
+                        claim_node_id,
+                        evidence.get("evidence_type") or "подтверждает",
+                        "evidence",
+                        summary="Evidence поддерживает claim.",
+                    )
+
+    def _relation_map_append_bill_bridges(
+        self,
+        entity_ids: set[int],
+        node_map: dict[str, dict[str, Any]],
+        degree_map: defaultdict[str, int],
+        edges: list[dict[str, Any]],
+        edge_keys: set[tuple[Any, ...]],
+    ) -> None:
+        if not entity_ids or not self._table_exists("bill_sponsors") or not self._table_exists("bills"):
+            return
+        placeholders = ",".join("?" for _ in entity_ids)
+        rows = self.db.execute(
+            f"""
+            SELECT b.id, b.number, b.title, b.status, b.registration_date,
+                   COUNT(DISTINCT bs.entity_id) AS matched_entities
+            FROM bill_sponsors bs
+            JOIN bills b ON b.id = bs.bill_id
+            WHERE bs.entity_id IN ({placeholders})
+            GROUP BY b.id
+            HAVING COUNT(DISTINCT bs.entity_id) >= 2
+            ORDER BY matched_entities DESC, b.id DESC
+            LIMIT 24
+            """,
+            tuple(entity_ids),
+        ).fetchall()
+        for row in rows:
+            bill = self._row_to_dict(row)
+            bill_id = int(bill["id"])
+            bill_node_id = f"bill:{bill_id}"
+            bill_title = " · ".join(value for value in [bill.get("number"), bill.get("title")] if value) or f"Bill #{bill_id}"
+            self._map_ensure_node(
+                node_map,
+                bill_node_id,
+                "bridge_bill",
+                "Законопроект",
+                bill_title,
+                " · ".join(value for value in [bill.get("status"), bill.get("registration_date")] if value),
+                description=bill.get("title") or bill.get("number") or f"Bill #{bill_id}",
+            )
+            sponsor_rows = self.db.execute(
+                f"""
+                SELECT DISTINCT e.id, e.canonical_name, e.entity_type, e.description
+                FROM bill_sponsors bs
+                JOIN entities e ON e.id = bs.entity_id
+                WHERE bs.bill_id=? AND bs.entity_id IN ({placeholders})
+                ORDER BY e.canonical_name
+                LIMIT 6
+                """,
+                (bill_id, *tuple(entity_ids)),
+            ).fetchall()
+            for sponsor_row in sponsor_rows:
+                entity = self._row_to_dict(sponsor_row)
+                entity_id = int(entity["id"])
+                entity_node_id = f"entity:{entity_id}"
+                self._map_ensure_node(
+                    node_map,
+                    entity_node_id,
+                    "map_entity",
+                    entity.get("entity_type") or "entity",
+                    entity.get("canonical_name") or f"Entity #{entity_id}",
+                    "",
+                    description=entity.get("description") or entity.get("canonical_name") or f"Entity #{entity_id}",
+                    jump_screen="entities",
+                    jump_id=entity_id,
+                )
+                self._map_add_edge(
+                    edges,
+                    edge_keys,
+                    degree_map,
+                    entity_node_id,
+                    bill_node_id,
+                    "соавтор",
+                    "bill",
+                    summary=f"{entity.get('canonical_name') or 'Сущность'} указан(а) в списке авторов законопроекта.",
+                )
+
+    def _relation_map_append_contract_bridges(
+        self,
+        entity_ids: set[int],
+        node_map: dict[str, dict[str, Any]],
+        degree_map: defaultdict[str, int],
+        edges: list[dict[str, Any]],
+        edge_keys: set[tuple[Any, ...]],
+    ) -> None:
+        if not entity_ids or not self._table_exists("contract_parties") or not self._table_exists("contracts"):
+            return
+        placeholders = ",".join("?" for _ in entity_ids)
+        rows = self.db.execute(
+            f"""
+            SELECT c.id, c.contract_number, c.title, c.publication_date,
+                   COUNT(DISTINCT cp.entity_id) AS matched_entities
+            FROM contract_parties cp
+            JOIN contracts c ON c.id = cp.contract_id
+            WHERE cp.entity_id IN ({placeholders})
+            GROUP BY c.id
+            HAVING COUNT(DISTINCT cp.entity_id) >= 2
+            ORDER BY matched_entities DESC, c.id DESC
+            LIMIT 24
+            """,
+            tuple(entity_ids),
+        ).fetchall()
+        for row in rows:
+            contract = self._row_to_dict(row)
+            contract_id = int(contract["id"])
+            contract_node_id = f"contract:{contract_id}"
+            contract_title = " · ".join(
+                value for value in [contract.get("contract_number"), contract.get("title")] if value
+            ) or f"Contract #{contract_id}"
+            self._map_ensure_node(
+                node_map,
+                contract_node_id,
+                "bridge_contract",
+                "Контракт",
+                contract_title,
+                contract.get("publication_date") or "",
+                description=contract.get("title") or contract.get("contract_number") or f"Contract #{contract_id}",
+            )
+            party_rows = self.db.execute(
+                f"""
+                SELECT DISTINCT e.id, e.canonical_name, e.entity_type, e.description, cp.party_role
+                FROM contract_parties cp
+                JOIN entities e ON e.id = cp.entity_id
+                WHERE cp.contract_id=? AND cp.entity_id IN ({placeholders})
+                ORDER BY cp.party_role, e.canonical_name
+                LIMIT 6
+                """,
+                (contract_id, *tuple(entity_ids)),
+            ).fetchall()
+            for party_row in party_rows:
+                entity = self._row_to_dict(party_row)
+                entity_id = int(entity["id"])
+                entity_node_id = f"entity:{entity_id}"
+                self._map_ensure_node(
+                    node_map,
+                    entity_node_id,
+                    "map_entity",
+                    entity.get("entity_type") or "entity",
+                    entity.get("canonical_name") or f"Entity #{entity_id}",
+                    "",
+                    description=entity.get("description") or entity.get("canonical_name") or f"Entity #{entity_id}",
+                    jump_screen="entities",
+                    jump_id=entity_id,
+                )
+                self._map_add_edge(
+                    edges,
+                    edge_keys,
+                    degree_map,
+                    entity_node_id,
+                    contract_node_id,
+                    entity.get("party_role") or "сторона",
+                    "contract",
+                    summary=f"{entity.get('canonical_name') or 'Сущность'} выступает стороной контракта.",
+                )
+
+    def _map_ensure_node(
+        self,
+        node_map: dict[str, dict[str, Any]],
+        node_id: str,
+        role: str,
+        label: str,
+        title: Any,
+        meta: Any = "",
+        *,
+        description: Any = "",
+        jump_screen: str | None = None,
+        jump_id: int | None = None,
+    ) -> dict[str, Any]:
+        if node_id not in node_map:
+            node_map[node_id] = self._graph_node(
+                node_id,
+                role,
+                label,
+                title,
+                meta,
+                description=description,
+                jump_screen=jump_screen,
+                jump_id=jump_id,
+            )
+        return node_map[node_id]
+
+    def _map_add_edge(
+        self,
+        edges: list[dict[str, Any]],
+        edge_keys: set[tuple[Any, ...]],
+        degree_map: defaultdict[str, int],
+        from_node_id: str,
+        to_node_id: str,
+        label: str,
+        kind: str,
+        *,
+        summary: str = "",
+        strength: str = "",
+        detected_label: str = "",
+        edge_id: Any = None,
+    ) -> None:
+        edge_key = (from_node_id, to_node_id, label, kind, edge_id)
+        if edge_key in edge_keys:
+            return
+        edge_keys.add(edge_key)
+        degree_map[from_node_id] += 1
+        degree_map[to_node_id] += 1
+        payload = {
+            "from": from_node_id,
+            "to": to_node_id,
+            "label": label,
+            "kind": kind,
+            "summary": summary,
+            "strength": strength,
+            "detected_label": detected_label,
+        }
+        if edge_id not in (None, ""):
+            payload["id"] = edge_id
+        edges.append(payload)
+
+    def _relation_map_paths(
+        self,
+        graph: dict[str, Any] | None,
+        from_entity_id: int | None,
+        to_entity_id: int | None,
+        *,
+        limit: int = 4,
+        max_depth: int = 6,
+    ) -> list[dict[str, Any]]:
+        if not graph or not from_entity_id or not to_entity_id:
+            return []
+        node_lookup = {str(node.get("id")): node for node in graph.get("nodes") or []}
+        start_id = f"entity:{int(from_entity_id)}"
+        end_id = f"entity:{int(to_entity_id)}"
+        if start_id not in node_lookup or end_id not in node_lookup:
+            return []
+
+        adjacency: defaultdict[str, list[str]] = defaultdict(list)
+        direct_pair = frozenset({start_id, end_id})
+        for edge in graph.get("edges") or []:
+            from_id = str(edge.get("from") or "")
+            to_id = str(edge.get("to") or "")
+            if not from_id or not to_id:
+                continue
+            if frozenset({from_id, to_id}) == direct_pair and str(edge.get("kind") or "") in {
+                "structural",
+                "weak_similarity",
+                "relation",
+                "evidence",
+            }:
+                continue
+            adjacency[from_id].append(to_id)
+            adjacency[to_id].append(from_id)
+
+        def node_priority(node_id: str) -> tuple[int, int, str]:
+            node = node_lookup.get(node_id) or {}
+            role = str(node.get("role") or "")
+            return (0 if role.startswith("bridge_") else 1, -len(str(node.get("title") or "")), node_id)
+
+        queue: list[list[str]] = [[start_id]]
+        seen_paths: set[tuple[str, ...]] = set()
+        found: list[list[str]] = []
+        shortest: int | None = None
+        while queue and len(found) < limit:
+            path = queue.pop(0)
+            current = path[-1]
+            if shortest is not None and len(path) > shortest + 2:
+                continue
+            if len(path) - 1 > max_depth:
+                continue
+            neighbours = sorted(set(adjacency.get(current, [])), key=node_priority)
+            for next_node in neighbours:
+                if next_node in path:
+                    continue
+                candidate = path + [next_node]
+                candidate_key = tuple(candidate)
+                if candidate_key in seen_paths:
+                    continue
+                seen_paths.add(candidate_key)
+                if next_node == end_id:
+                    shortest = len(candidate) if shortest is None else min(shortest, len(candidate))
+                    found.append(candidate)
+                    if len(found) >= limit:
+                        break
+                else:
+                    queue.append(candidate)
+
+        scored_paths = []
+        for path in found:
+            bridge_count = sum(
+                1 for node_id in path[1:-1] if str((node_lookup.get(node_id) or {}).get("role", "")).startswith("bridge_")
+            )
+            entity_mid_count = sum(
+                1 for node_id in path[1:-1] if str((node_lookup.get(node_id) or {}).get("role", "")) == "map_entity"
+            )
+            scored_paths.append((path, bridge_count, entity_mid_count))
+
+        bridge_first = [item for item in scored_paths if item[1] > 0]
+        chosen_paths = bridge_first
+        if not chosen_paths:
+            return []
+        chosen_paths.sort(key=lambda item: (-item[1], item[2], len(item[0]), tuple(item[0])))
+
+        result: list[dict[str, Any]] = []
+        for path, _bridge_count, _entity_mid_count in chosen_paths[:limit]:
+            nodes = []
+            for node_id in path:
+                node = node_lookup.get(node_id) or {}
+                role = str(node.get("role") or "")
+                title = str(node.get("title") or node_id)
+                if role == "bridge_case":
+                    display = f"Дело: {title}"
+                elif role == "bridge_claim":
+                    display = f"Claim: {title}"
+                elif role == "bridge_content":
+                    display = f"Контент: {title}"
+                elif role == "bridge_evidence":
+                    display = f"Evidence: {title}"
+                elif role == "bridge_bill":
+                    display = f"Законопроект: {title}"
+                elif role == "bridge_contract":
+                    display = f"Контракт: {title}"
+                else:
+                    display = title
+                nodes.append(
+                    {
+                        "id": node_id,
+                        "role": role,
+                        "title": title,
+                        "label": display,
+                        "jump_screen": node.get("jump_screen"),
+                        "jump_id": node.get("jump_id"),
+                    }
+                )
+            result.append(
+                {
+                    "hops": len(path) - 1,
+                    "label": " → ".join(node["label"] for node in nodes),
+                    "nodes": nodes,
+                }
+            )
+        return result
+
+    def _relation_candidate_map_items(self, query: str, layer: str) -> list[dict[str, Any]]:
+        if layer and layer != "weak_similarity":
+            return []
+        if not self._table_exists("relation_candidates"):
+            return []
+
+        rows = self.db.execute(
+            """
+            SELECT rc.id, rc.entity_a_id AS from_entity_id, rc.entity_b_id AS to_entity_id,
+                   rc.candidate_type AS relation_type, rc.origin, rc.score, rc.support_items,
+                   rc.support_sources, rc.support_domains, rc.metadata_json,
+                   ea.canonical_name AS from_name, ea.entity_type AS from_type, ea.description AS from_description,
+                   eb.canonical_name AS to_name, eb.entity_type AS to_type, eb.description AS to_description
+            FROM relation_candidates rc
+            JOIN entities ea ON ea.id = rc.entity_a_id
+            JOIN entities eb ON eb.id = rc.entity_b_id
+            WHERE rc.promotion_state='review'
+            ORDER BY rc.score DESC, rc.id DESC
+            LIMIT 180
+            """
+        ).fetchall()
+
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            item = self._row_to_dict(row)
+            if query and query not in (
+                f"{item.get('from_name', '')} {item.get('to_name', '')} {item.get('relation_type', '')}"
+            ).casefold():
+                continue
+            metadata = self._json_object(item.get("metadata_json"))
+            hints = []
+            if metadata.get("bill_overlap"):
+                hints.append(f"общие законопроекты {metadata['bill_overlap']}")
+            if metadata.get("case_overlap"):
+                hints.append(f"общие дела {metadata['case_overlap']}")
+            if metadata.get("contract_overlap"):
+                hints.append(f"общие контракты {metadata['contract_overlap']}")
+            if metadata.get("risk_overlap"):
+                hints.append(f"общие risk-patterns {metadata['risk_overlap']}")
+            if metadata.get("same_vote_ratio"):
+                hints.append(f"совпадение голосований {metadata['same_vote_ratio']}")
+            if item.get("support_items"):
+                hints.append(f"материалов {item['support_items']}")
+            if item.get("support_sources"):
+                hints.append(f"источников {item['support_sources']}")
+            summary = self.relation_summary(
+                item.get("relation_type", ""),
+                item.get("from_name", ""),
+                item.get("to_name", ""),
+            )
+            if hints:
+                summary = f"{summary} Основания: {', '.join(map(str, hints[:4]))}."
+            items.append(
+                {
+                    "id": None,
+                    "from_entity_id": item.get("from_entity_id"),
+                    "to_entity_id": item.get("to_entity_id"),
+                    "from_name": item.get("from_name"),
+                    "to_name": item.get("to_name"),
+                    "from_type": item.get("from_type"),
+                    "to_type": item.get("to_type"),
+                    "from_description": item.get("from_description"),
+                    "to_description": item.get("to_description"),
+                    "relation_type": item.get("relation_type"),
+                    "relation_label": self.relation_label(item.get("relation_type", "")),
+                    "layer": "weak_similarity",
+                    "strength": f"review · score {item.get('score')}",
+                    "detected_by": item.get("origin") or "relation_candidates",
+                    "detected_label": "review-кандидат",
+                    "summary": summary,
+                }
+            )
+        return items
+
     def _enrich_relation_item(self, item: dict[str, Any]) -> dict[str, Any]:
         item = dict(item)
         item["relation_label"] = self.relation_label(item.get("relation_type", ""))
@@ -797,9 +1866,14 @@ class DashboardDataService:
             row = self.db.execute(
                 """
                 SELECT cl.id, cl.claim_text, cl.status, cl.claim_type, cl.confidence_final, cl.needs_review,
-                       ci.id AS content_id, ci.title AS content_title, ci.url AS content_url
+                       ci.id AS content_id, ci.title AS content_title, ci.url AS content_url,
+                       ci.published_at, ci.content_type, s.name AS source_name,
+                       (SELECT c.id FROM case_claims cc JOIN cases c ON c.id = cc.case_id WHERE cc.claim_id = cl.id LIMIT 1) AS case_id,
+                       (SELECT c.title FROM case_claims cc JOIN cases c ON c.id = cc.case_id WHERE cc.claim_id = cl.id LIMIT 1) AS case_title,
+                       (SELECT c.case_type FROM case_claims cc JOIN cases c ON c.id = cc.case_id WHERE cc.claim_id = cl.id LIMIT 1) AS case_type
                 FROM claims cl
                 JOIN content_items ci ON ci.id = cl.content_item_id
+                LEFT JOIN sources s ON s.id = ci.source_id
                 WHERE cl.id=?
                 """,
                 (selected_id,),
@@ -810,15 +1884,21 @@ class DashboardDataService:
                     self._row_to_dict(item)
                     for item in self.db.execute(
                         """
-                        SELECT el.id, el.evidence_type, el.strength, el.notes, ci.id AS evidence_item_id, ci.title AS evidence_title
+                        SELECT el.id, el.evidence_type, el.strength, el.notes,
+                               ci.id AS evidence_item_id, ci.title AS evidence_title,
+                               ci.published_at AS evidence_published_at,
+                               ci.content_type AS evidence_content_type,
+                               s.name AS evidence_source_name
                         FROM evidence_links el
                         LEFT JOIN content_items ci ON ci.id = el.evidence_item_id
+                        LEFT JOIN sources s ON s.id = ci.source_id
                         WHERE el.claim_id=?
                         ORDER BY el.id DESC
                         """,
                         (selected_id,),
                     ).fetchall()
                 ] if self._table_exists("evidence_links") else []
+                detail["evidence_graph"] = self._claim_evidence_graph(detail)
         return {"items": rows, "detail": detail}
 
     def _cases_screen(self, filters: dict[str, Any]) -> dict[str, Any]:
@@ -957,9 +2037,25 @@ class DashboardDataService:
             all_rows = [item for item in all_rows if item["layer"] == layer]
         all_rows.sort(key=self.relation_sort_key)
 
+        visible_rows = all_rows[:120]
+        map_rows = list(all_rows)
+        map_rows.extend(self._relation_candidate_map_items(query, layer))
+        map_graph = self._relation_map_graph(map_rows)
         selected_id = filters.get("selected_id") or (all_rows[0]["id"] if all_rows else None)
         detail = next((item for item in all_rows if item["id"] == selected_id), None)
-        return {"items": all_rows[:120], "detail": detail}
+        if detail:
+            detail = dict(detail)
+            detail["evidence_graph"] = self._relation_evidence_graph(detail)
+            detail["bridge_paths"] = self._relation_map_paths(
+                map_graph,
+                detail.get("from_entity_id"),
+                detail.get("to_entity_id"),
+            )
+        return {
+            "items": visible_rows,
+            "detail": detail,
+            "map_graph": map_graph,
+        }
 
     def _officials_screen(self, filters: dict[str, Any]) -> dict[str, Any]:
         raw_query = self._query(filters.get("query") or "")
