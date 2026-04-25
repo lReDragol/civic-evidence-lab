@@ -41,20 +41,32 @@ def create_db(db_path: Path):
                 10, 1, 'exec:1', 'profile', 'Иванов Иван Иванович — Министр тестирования',
                 'Министр тестирования Российской Федерации',
                 '2026-04-25', 'raw_signal', 'https://example.test/minfin/person/1'
+            ),
+            (
+                11, 2, 'exec:2', 'post', 'Повторное сообщение об Иванове',
+                'Иванов Иван Иванович занимает должность министра',
+                '2026-04-26', 'raw_signal', 'https://example.test/post/11'
             );
 
             INSERT INTO entity_mentions(entity_id, content_item_id, mention_type, confidence)
             VALUES
                 (1, 10, 'subject', 1.0),
-                (2, 10, 'organization', 1.0);
+                (2, 10, 'organization', 1.0),
+                (1, 11, 'subject', 1.0);
 
             INSERT INTO claims(id, content_item_id, claim_text, status, needs_review)
-            VALUES(21, 10, 'Иванов Иван Иванович занимает должность министра', 'verified', 0);
+            VALUES
+                (21, 10, 'Иванов Иван Иванович занимает должность министра', 'verified', 0),
+                (22, 11, 'Иванов Иван Иванович занимает должность министра', 'verified', 0),
+                (23, 11, 'заявил', 'unverified', 1);
 
             INSERT INTO cases(id, title, case_type, status, started_at)
             VALUES(31, 'Кейс по назначению', 'oversight', 'open', '2026-04-24');
 
-            INSERT INTO case_claims(case_id, claim_id, role) VALUES(31, 21, 'central');
+            INSERT INTO case_claims(case_id, claim_id, role) VALUES
+                (31, 21, 'central'),
+                (31, 22, 'central'),
+                (31, 23, 'central');
 
             INSERT INTO entity_relations(
                 id, from_entity_id, to_entity_id, relation_type, evidence_item_id, strength, detected_by
@@ -85,8 +97,8 @@ class DashboardDataServiceTests(unittest.TestCase):
             finally:
                 conn.close()
 
-            self.assertEqual(payload["summary"]["counts"]["content"], 1)
-            self.assertEqual(payload["summary"]["counts"]["claims"], 1)
+            self.assertEqual(payload["summary"]["counts"]["content"], 2)
+            self.assertEqual(payload["summary"]["counts"]["claims"], 3)
             self.assertEqual(payload["summary"]["counts"]["officials"], 1)
             self.assertIn("secondary_counts", payload["summary"])
             self.assertIn("graph_health", payload["summary"])
@@ -118,7 +130,7 @@ class DashboardDataServiceTests(unittest.TestCase):
                 payload["detail"]["positions"][0]["position_title"],
                 "Министр тестирования Российской Федерации",
             )
-            self.assertEqual(payload["detail"]["content"][0]["id"], 10)
+            self.assertEqual(payload["detail"]["content"][0]["id"], 11)
 
     def test_screen_payload_for_relations_supports_layer_filter(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -139,6 +151,8 @@ class DashboardDataServiceTests(unittest.TestCase):
             self.assertEqual(len(payload["items"]), 1)
             self.assertEqual(payload["items"][0]["relation_type"], "works_at")
             self.assertEqual(payload["items"][0]["layer"], "evidence")
+            self.assertEqual(payload["items"][0]["relation_label"], "Работает в")
+            self.assertEqual(payload["items"][0]["detected_label"], "официальные должности")
             self.assertEqual(payload["detail"]["id"], 41)
 
     def test_relation_layer_treats_evidence_backed_structural_edge_as_evidence(self):
@@ -154,6 +168,28 @@ class DashboardDataServiceTests(unittest.TestCase):
                 self.assertEqual(service.relation_layer("works_at", "official_positions", None), "structural")
             finally:
                 conn.close()
+
+    def test_cases_screen_deduplicates_low_signal_claims(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "bridge.db"
+            create_db(db_path)
+
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            try:
+                service = DashboardDataService(conn, {})
+                payload = service.screen_payload("cases", {"selected_id": 31})
+            finally:
+                conn.close()
+
+            self.assertEqual(payload["detail"]["claims_total"], 3)
+            self.assertEqual(len(payload["detail"]["claims"]), 1)
+            self.assertEqual(payload["detail"]["claims_hidden_count"], 2)
+            self.assertEqual(payload["detail"]["claims"][0]["support_count"], 2)
+            self.assertEqual(
+                payload["detail"]["claims"][0]["claim_text"],
+                "Иванов Иван Иванович занимает должность министра",
+            )
 
 
 if __name__ == "__main__":

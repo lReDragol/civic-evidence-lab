@@ -316,6 +316,20 @@ def recover_abandoned_runs(conn: sqlite3.Connection, *, stale_seconds: int = 180
     return {"abandoned_runs": abandoned, "released_leases": released}
 
 
+def force_recover_job(conn: sqlite3.Connection, job_id: str, *, reason: str = "Force recovered") -> dict[str, int]:
+    abandoned = conn.execute(
+        """
+        UPDATE job_runs
+        SET status='abandoned', finished_at=?, error_summary=COALESCE(error_summary, ?)
+        WHERE job_id=? AND status='running' AND finished_at IS NULL
+        """,
+        (now_iso(), reason, job_id),
+    ).rowcount
+    released = conn.execute("DELETE FROM job_leases WHERE job_id=?", (job_id,)).rowcount
+    conn.commit()
+    return {"abandoned_runs": int(abandoned or 0), "released_leases": int(released or 0)}
+
+
 def start_pipeline_run(
     conn: sqlite3.Connection,
     *,

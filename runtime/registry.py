@@ -84,8 +84,85 @@ def _votes(settings: dict[str, Any]):
     return __import__("collectors.vote_scraper", fromlist=["collect_votes"]).collect_votes(pages=3, fetch_details=True)
 
 
+def _deputies(settings: dict[str, Any]):
+    results: dict[str, Any] = {}
+    html_module = __import__("collectors.deputy_profiles_scraper", fromlist=["collect_deputies"])
+    page_limit = max(1, int(settings.get("deputies_html_pages", 3) or 3))
+    fetch_details = bool(settings.get("deputies_fetch_details", False))
+    used_primary = 0
+    try:
+        if settings.get("duma_api_token"):
+            results["collect_deputies_api"] = html_module.collect_deputies_api(settings) or 0
+            used_primary = int(results["collect_deputies_api"] or 0)
+        else:
+            results["collect_deputies_html"] = html_module.collect_deputies_html(
+                settings,
+                fetch_details=fetch_details,
+                max_pages=page_limit,
+            ) or 0
+            used_primary = int(results["collect_deputies_html"] or 0)
+    except Exception as error:
+        results["collect_deputies_error"] = str(error)
+
+    if not used_primary and bool(settings.get("deputies_playwright_fallback")):
+        try:
+            results["playwright_fallback"] = __import__(
+                "collectors.playwright_scraper_v2",
+                fromlist=["collect_deputies_playwright"],
+            ).collect_deputies_playwright(settings=settings, headless=True, max_pages=min(page_limit, 3)) or 0
+        except Exception as error:
+            results["playwright_fallback_error"] = str(error)
+            results["playwright_fallback"] = 0
+
+    try:
+        results["import_sponsors"] = __import__(
+            "tools.import_deputies_from_sponsors",
+            fromlist=["import_sponsors_as_deputies"],
+        ).import_sponsors_as_deputies(settings) or 0
+    except Exception as error:
+        results["import_sponsors_error"] = str(error)
+
+    conn = get_db(settings)
+    try:
+        backfill = __import__("tools.backfill_vote_entities", fromlist=["backfill_vote_entities"])
+        matched, created = backfill.backfill_vote_entities(conn)
+        results["vote_entity_backfill"] = {"matched": matched, "created": created}
+    finally:
+        conn.close()
+    items_new = int(
+        results.get("collect_deputies_api")
+        or results.get("collect_deputies_html")
+        or results.get("playwright_fallback")
+        or 0
+    ) + int(results.get("import_sponsors") or 0) + int((results.get("vote_entity_backfill") or {}).get("created") or 0)
+    items_updated = int((results.get("vote_entity_backfill") or {}).get("matched") or 0)
+    if items_new <= 0 and items_updated <= 0:
+        return {
+            "ok": False,
+            "retriable_errors": ["deputies_collected_zero"],
+            "artifacts": results,
+        }
+    return {
+        "ok": True,
+        "items_new": items_new,
+        "items_updated": items_updated,
+        "artifacts": results,
+    }
+
+
 def _senators(settings: dict[str, Any]):
-    return __import__("collectors.senators_scraper", fromlist=["collect_senators"]).collect_senators(fetch_profiles=True)
+    result = __import__("collectors.senators_scraper", fromlist=["collect_senators"]).collect_senators(fetch_profiles=True)
+    if int(result or 0) <= 0:
+        return {
+            "ok": False,
+            "retriable_errors": ["senators_collected_zero"],
+            "artifacts": {"result": int(result or 0)},
+        }
+    return {
+        "ok": True,
+        "items_new": int(result or 0),
+        "artifacts": {"result": int(result or 0)},
+    }
 
 
 def _fas_ach_sk(settings: dict[str, Any]):
@@ -263,6 +340,7 @@ JOB_SPECS = [
     JobSpec("zakupki", "Госзакупки", "Сбор", 86400, "zakupki_interval_seconds", "collect", timeout_seconds=3600, source_keys=("zakupki",), runner=_zakupki),
     JobSpec("gov", "Кремль/Правительство", "Сбор", 86400, "gov_interval_seconds", "collect", timeout_seconds=3600, source_keys=("kremlin", "government"), runner=_gov),
     JobSpec("votes", "Голосования Думы", "Сбор", 86400, "votes_interval_seconds", "collect", timeout_seconds=3600, source_keys=("votes",), runner=_votes),
+    JobSpec("deputies", "Депутаты ГД", "Сбор", 604800, "deputies_interval_seconds", "collect", timeout_seconds=5400, source_keys=("deputies",), runner=_deputies),
     JobSpec("senators", "Сенаторы", "Сбор", 604800, "senators_interval_seconds", "collect", timeout_seconds=3600, source_keys=("senators",), runner=_senators),
     JobSpec("fas_ach_sk", "ФАС/Счётная/СК", "Сбор", 86400, "fas_ach_sk_interval_seconds", "collect", timeout_seconds=3600, source_keys=("fas", "ach", "sk"), runner=_fas_ach_sk),
     JobSpec("executive_directory", "Руководство органов", "Сбор", 604800, "executive_directory_interval_seconds", "collect", timeout_seconds=3600, source_keys=("executive_directory",), runner=_executive_directory),
@@ -326,6 +404,7 @@ PIPELINE_JOB_IDS = {
         "zakupki",
         "gov",
         "votes",
+        "deputies",
         "fas_ach_sk",
         "executive_directory",
         "asr",

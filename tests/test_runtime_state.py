@@ -5,10 +5,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from runtime.runner import run_job_once
+from runtime.runner import _heartbeat_loop, run_job_once
 from runtime.state import (
     acquire_job_lease,
     active_job_lease,
+    force_recover_job,
     finish_job_run,
     now_iso,
     parse_iso,
@@ -139,6 +140,38 @@ class RuntimeStateTests(unittest.TestCase):
             self.assertEqual(version, "nightly-20260425")
             self.assertTrue(stop_flag)
 
+    def test_force_recover_job_abandons_running_run_and_releases_lease(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "runtime.db"
+            create_db(db_path)
+
+            conn = sqlite3.connect(db_path)
+            try:
+                run_id = start_job_run(
+                    conn,
+                    job_id="telegram",
+                    trigger_mode="manual",
+                    requested_by="test",
+                    owner="owner-a",
+                )
+                acquire_job_lease(conn, "telegram", "owner-a", ttl_seconds=600)
+                stats = force_recover_job(conn, "telegram", reason="manual cleanup")
+                row = conn.execute(
+                    "SELECT status, error_summary FROM job_runs WHERE id=?",
+                    (run_id,),
+                ).fetchone()
+                remaining = conn.execute(
+                    "SELECT COUNT(*) FROM job_leases WHERE job_id='telegram'"
+                ).fetchone()[0]
+            finally:
+                conn.close()
+
+            self.assertEqual(stats["abandoned_runs"], 1)
+            self.assertEqual(stats["released_leases"], 1)
+            self.assertEqual(row[0], "abandoned")
+            self.assertIn("manual cleanup", row[1])
+            self.assertEqual(remaining, 0)
+
     def test_run_job_once_returns_active_lease_failure_without_crash(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "runtime.db"
@@ -158,6 +191,28 @@ class RuntimeStateTests(unittest.TestCase):
             self.assertFalse(result["ok"])
             self.assertEqual(result["job_id"], "dummy")
             self.assertIn("active_lease:dummy", result["retriable_errors"])
+
+    def test_heartbeat_loop_ignores_retriable_database_lock(self):
+        class FakeConn:
+            def close(self):
+                return None
+
+        class FakeStopEvent:
+            def __init__(self):
+                self.calls = 0
+
+            def wait(self, _interval):
+                self.calls += 1
+                return self.calls > 1
+
+        fake_event = FakeStopEvent()
+        with patch("runtime.runner.get_db", return_value=FakeConn()), patch(
+            "runtime.runner.heartbeat_job_lease",
+            side_effect=sqlite3.OperationalError("database is locked"),
+        ) as heartbeat_mock:
+            _heartbeat_loop(fake_event, {}, "telegram", "owner-a", 60)
+
+        heartbeat_mock.assert_called_once()
 
 
 if __name__ == "__main__":

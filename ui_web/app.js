@@ -56,6 +56,8 @@
     ui.toastStack = document.getElementById("toast-stack");
     ui.toggleTasksBtn = document.getElementById("toggle-tasks-btn");
     ui.schedulerToggleBtn = document.getElementById("scheduler-toggle-btn");
+    ui.tasksPanel = document.getElementById("tasks-panel");
+    ui.tasksBackdrop = document.getElementById("tasks-backdrop");
   }
 
   async function initBridge() {
@@ -142,6 +144,13 @@
       renderShell();
     });
 
+    if (ui.tasksBackdrop) {
+      ui.tasksBackdrop.addEventListener("click", () => {
+        state.tasksCollapsed = true;
+        renderShell();
+      });
+    }
+
     ui.schedulerToggleBtn.addEventListener("click", () => {
       bridgeVoid("toggleScheduler");
       setTimeout(manualRefresh, 200);
@@ -164,6 +173,13 @@
 
     setupResize(document.getElementById("sidebar-resize"), "--sidebar-width", 240, 420);
     setupResize(document.getElementById("tasks-resize"), "--tasks-width", 300, 480);
+
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && !state.tasksCollapsed) {
+        state.tasksCollapsed = true;
+        renderShell();
+      }
+    });
   }
 
   function setupResize(handle, variableName, min, max) {
@@ -200,10 +216,11 @@
     renderSources(state.bootstrap.sources);
     renderJobs(state.bootstrap.jobs);
 
+    ui.appShell.classList.toggle("tasks-open", !state.tasksCollapsed);
     ui.appShell.classList.toggle("tasks-collapsed", state.tasksCollapsed);
     ui.appShell.dataset.group = state.group;
     ui.appShell.dataset.section = state.section;
-    ui.toggleTasksBtn.textContent = state.tasksCollapsed ? "Показать панель" : "Панель";
+    ui.toggleTasksBtn.textContent = state.tasksCollapsed ? "Открыть панель" : "Скрыть панель";
     ui.schedulerToggleBtn.textContent = state.bootstrap.jobs.scheduler_running
       ? "Стоп план"
       : "Планировщик";
@@ -265,6 +282,15 @@
     const currentGroup = state.bootstrap.navigation.find((group) => group.key === state.group);
     const currentSection = currentGroup.sections.find((section) => section.key === state.section);
     ui.breadcrumbLine.textContent = `${currentSourceName()} / ${currentGroup.label} / ${currentSection.label}`;
+  }
+
+  function groupKeyForSection(section) {
+    for (const group of state.bootstrap?.navigation || []) {
+      if ((group.sections || []).some((item) => item.key === section)) {
+        return group.key;
+      }
+    }
+    return state.group;
   }
 
   function renderSummary() {
@@ -469,7 +495,7 @@
     ui.jobDetailCard.innerHTML = `
       <div class="job-detail-head">
         <div>
-          <div class="eyebrow">Task Detail</div>
+          <div class="eyebrow">Рабочая задача</div>
           <h3 class="detail-title">${escapeHtml(selected.name)}</h3>
         </div>
         ${renderJobState(selected)}
@@ -515,7 +541,7 @@
     return `
       <span class="job-state ${statusClass} ${compact ? "compact" : ""}" title="${title}">
         <span class="status-dot ${statusClass}"></span>
-        ${compact ? "" : title}
+        ${compact ? "" : `<span class="job-state-label">${title}</span>`}
       </span>
     `;
   }
@@ -558,6 +584,7 @@
       default:
         ui.screenRoot.innerHTML = emptyState("Экран не найден", "Выберите другой раздел.");
     }
+    bindJumpLinks();
   }
 
   function renderOverviewScreen(payload) {
@@ -821,8 +848,18 @@
             <div class="detail-section"><h3>Текст</h3><div class="muted">${escapeHtml(
               payload.detail.body_text || "Нет текста"
             )}</div></div>
-            ${renderLinkSection("Сущности", payload.detail.entities, (entity) => `${escapeHtml(entity.canonical_name)} · ${escapeHtml(entity.mention_type)}`)}
-            ${renderLinkSection("Claims", payload.detail.claims, (claim) => escapeHtml(claim.claim_text))}
+            ${renderLinkSection(
+              "Сущности",
+              payload.detail.entities,
+              (entity) => `${escapeHtml(entity.canonical_name)} · ${escapeHtml(entity.mention_type)}`,
+              { resolveJump: (entity) => ({ screen: "entities", id: entity.id }) }
+            )}
+            ${renderLinkSection(
+              "Claims",
+              payload.detail.claims,
+              (claim) => escapeHtml(claim.claim_text),
+              { resolveJump: (claim) => ({ screen: "claims", id: claim.id }) }
+            )}
           `
         : emptyState("Нет выбранного объекта", "Выберите запись слева."),
     });
@@ -865,7 +902,15 @@
               <div class="detail-kv"><div class="k">Статус</div><div class="v">${escapeHtml(payload.detail.status || "—")}</div></div>
               <div class="detail-kv"><div class="k">Контент</div><div class="v">${escapeHtml(payload.detail.content_title || "—")}</div></div>
             </div>
-            ${renderLinkSection("Evidence", payload.detail.evidence, (item) => `${escapeHtml(item.evidence_type || "evidence")} · ${escapeHtml(item.evidence_title || "—")}`)}
+            ${renderLinkSection(
+              "Evidence",
+              payload.detail.evidence,
+              (item) => `${escapeHtml(item.evidence_type || "evidence")} · ${escapeHtml(item.evidence_title || "—")}`,
+              {
+                resolveJump: (item) =>
+                  item.evidence_item_id ? { screen: "content", id: item.evidence_item_id } : null,
+              }
+            )}
           `
         : emptyState("Нет выбранного claim", "Выберите запись слева."),
     });
@@ -906,8 +951,37 @@
               <div class="detail-kv"><div class="k">Тип</div><div class="v">${escapeHtml(payload.detail.case_type || "—")}</div></div>
               <div class="detail-kv"><div class="k">Статус</div><div class="v">${escapeHtml(payload.detail.status || "—")}</div></div>
             </div>
-            ${renderLinkSection("Claims", payload.detail.claims, (item) => escapeHtml(item.claim_text))}
-            ${renderLinkSection("Events", payload.detail.events, (item) => `${escapeHtml(formatDate(item.event_date))} · ${escapeHtml(item.event_title || "—")}`)}
+            ${renderLinkSection(
+              "Claims",
+              payload.detail.claims,
+              (item) => `${escapeHtml(item.claim_text)}${Number(item.support_count || 0) > 1 ? ` <span class="support-pill">×${escapeHtml(String(item.support_count))}</span>` : ""}`,
+              {
+                resolveJump: (item) => ({ screen: "claims", id: item.id }),
+                secondary: (item) =>
+                  escapeHtml(
+                    [
+                      item.content_title || "",
+                      item.status || "",
+                      Number(item.evidence_count || 0) ? `evidence ${item.evidence_count}` : "",
+                    ]
+                      .filter(Boolean)
+                      .join(" · ")
+                  ),
+                footer:
+                  Number(payload.detail.claims_hidden_count || 0) > 0
+                    ? `Скрыто повторов и низкосигнальных claims: ${escapeHtml(String(payload.detail.claims_hidden_count))}`
+                    : "",
+              }
+            )}
+            ${renderLinkSection(
+              "Events",
+              payload.detail.events,
+              (item) => `${escapeHtml(formatDate(item.event_date))} · ${escapeHtml(item.event_title || "—")}`,
+              {
+                resolveJump: (item) =>
+                  item.content_item_id ? { screen: "content", id: item.content_item_id } : null,
+              }
+            )}
           `
         : emptyState("Нет выбранного дела", "Выберите case слева."),
     });
@@ -965,14 +1039,14 @@
         view === "table"
           ? renderDataTable({
               items: payload.items,
-              columns: ["Откуда", "Тип", "Куда", "Слой", "Сила"],
+              columns: ["Откуда", "Связь", "Куда", "Слой", "Основание"],
               rowId: (item) => item.id,
               rowCells: (item) => [
                 escapeHtml(item.from_name || "—"),
-                escapeHtml(item.relation_type || "—"),
+                escapeHtml(item.relation_label || item.relation_type || "—"),
                 escapeHtml(item.to_name || "—"),
-                `<span class="badge ${item.layer === "structural" ? "emerald" : item.layer === "weak_similarity" ? "amber" : "cyan"}">${escapeHtml(item.layer || "—")}</span>`,
-                escapeHtml(item.strength || "—"),
+                `<span class="badge ${relationLayerBadgeClass(item.layer)}">${escapeHtml(item.layer_label || item.layer || "—")}</span>`,
+                escapeHtml(item.detected_label || item.detected_by || "—"),
               ],
             })
           : renderTableList(
@@ -980,24 +1054,54 @@
               (item) => `
                 <div class="table-row-head">
                   <div class="table-primary">${escapeHtml(item.from_name)} → ${escapeHtml(item.to_name)}</div>
-                  <span class="badge ${item.layer === "structural" ? "emerald" : item.layer === "weak_similarity" ? "amber" : "cyan"}">
-                    ${escapeHtml(item.layer)}
+                  <span class="badge ${relationLayerBadgeClass(item.layer)}">
+                    ${escapeHtml(item.layer_label || item.layer)}
                   </span>
                 </div>
-                <div class="table-secondary">${escapeHtml(item.relation_type)} · ${escapeHtml(item.detected_by || "—")}</div>
+                <div class="table-secondary">${escapeHtml(item.relation_label || item.relation_type)} · ${escapeHtml(item.detected_label || item.detected_by || "—")}</div>
               `
             ),
       detail: payload.detail
         ? `
             <h3 class="detail-title">${escapeHtml(payload.detail.from_name)} → ${escapeHtml(payload.detail.to_name)}</h3>
             <div class="detail-grid">
-              <div class="detail-kv"><div class="k">Тип</div><div class="v">${escapeHtml(payload.detail.relation_type)}</div></div>
-              <div class="detail-kv"><div class="k">Layer</div><div class="v">${escapeHtml(payload.detail.layer)}</div></div>
-              <div class="detail-kv"><div class="k">Strength</div><div class="v">${escapeHtml(payload.detail.strength || "—")}</div></div>
-              <div class="detail-kv"><div class="k">Detected by</div><div class="v">${escapeHtml(payload.detail.detected_by || "—")}</div></div>
+              <div class="detail-kv"><div class="k">Тип связи</div><div class="v">${escapeHtml(payload.detail.relation_label || payload.detail.relation_type)}</div></div>
+              <div class="detail-kv"><div class="k">Слой</div><div class="v">${escapeHtml(payload.detail.layer_label || payload.detail.layer)}</div></div>
+              <div class="detail-kv"><div class="k">Сила</div><div class="v">${escapeHtml(payload.detail.strength || "—")}</div></div>
+              <div class="detail-kv"><div class="k">Основание</div><div class="v">${escapeHtml(payload.detail.detected_label || payload.detail.detected_by || "—")}</div></div>
             </div>
+            <div class="detail-section">
+              <h3>Почему связаны</h3>
+              <div class="muted">${escapeHtml(payload.detail.summary || "Причина связи не указана.")}</div>
+            </div>
+            <div class="detail-grid">
+              <div class="detail-kv">
+                <div class="k">Откуда</div>
+                <div class="v">${renderActionLink(payload.detail.from_name || "—", "entities", payload.detail.from_entity_id)}</div>
+              </div>
+              <div class="detail-kv">
+                <div class="k">Куда</div>
+                <div class="v">${renderActionLink(payload.detail.to_name || "—", "entities", payload.detail.to_entity_id)}</div>
+              </div>
+            </div>
+            ${
+              payload.detail.context_title
+                ? `<div class="detail-section"><h3>Контекст</h3><div class="muted">${escapeHtml(payload.detail.context_title)}</div></div>`
+                : ""
+            }
+            ${
+              payload.detail.evidence_title
+                ? `<div class="detail-section"><h3>Evidence</h3><div class="muted">${renderActionLink(payload.detail.evidence_title, "content", payload.detail.evidence_content_id)}</div></div>`
+                : ""
+            }
           `
         : emptyState("Нет выбранной связи", "Выберите relation слева."),
+      selectionBanner: payload.detail
+        ? renderSelectionBanner(
+            `${payload.detail.from_name || "—"} → ${payload.detail.to_name || "—"}`,
+            payload.detail.relation_label || payload.detail.relation_type || "Связь"
+          )
+        : "",
     });
     bindTextFilter("relations");
     ui.screenRoot.querySelectorAll("[data-relation-layer]").forEach((button) => {
@@ -1046,6 +1150,12 @@
               `
             ),
       detail: payload.detail ? renderEntityDetail(payload.detail) : emptyState("Нет выбранного профиля", "Выберите чиновника слева."),
+      selectionBanner: payload.detail
+        ? renderSelectionBanner(
+            payload.detail.canonical_name || payload.detail.full_name || "Профиль",
+            payload.detail.positions?.[0]?.organization || payload.detail.description || "Руководство"
+          )
+        : "",
     });
     bindTextFilter("officials");
     bindViewSwitch("officials");
@@ -1075,6 +1185,7 @@
   }
 
   function renderEntityDetail(detail) {
+    const entityId = detail.entity_id || detail.id;
     return `
       <h3 class="detail-title">${escapeHtml(detail.canonical_name || detail.full_name || "Entity")}</h3>
       <div class="detail-grid">
@@ -1087,21 +1198,66 @@
           : ""
       }
       ${renderLinkSection("Должности", detail.positions, (item) => `${escapeHtml(item.position_title || "—")} · ${escapeHtml(item.organization || "—")}`)}
-      ${renderLinkSection("Связанный контент", detail.content, (item) => `${escapeHtml(formatDate(item.published_at))} · ${escapeHtml(item.title || "—")}`)}
-      ${renderLinkSection("Claims", detail.claims, (item) => escapeHtml(item.claim_text || "—"))}
-      ${renderLinkSection("Cases", detail.cases, (item) => escapeHtml(item.title || "—"))}
-      ${renderLinkSection("Связи", detail.relations, (item) => `${escapeHtml(item.relation_type || "—")} · ${escapeHtml(
-        item.from_name || ""
-      )} → ${escapeHtml(item.to_name || "")}`)}
+      ${renderLinkSection(
+        "Связанный контент",
+        detail.content,
+        (item) => `${escapeHtml(formatDate(item.published_at))} · ${escapeHtml(item.title || "—")}`,
+        { resolveJump: (item) => ({ screen: "content", id: item.id }) }
+      )}
+      ${renderLinkSection(
+        "Claims",
+        detail.claims,
+        (item) => `${escapeHtml(item.claim_text || "—")}${Number(item.support_count || 0) > 1 ? ` <span class="support-pill">×${escapeHtml(String(item.support_count))}</span>` : ""}`,
+        {
+          resolveJump: (item) => ({ screen: "claims", id: item.id }),
+          secondary: (item) =>
+            escapeHtml(
+              [
+                item.content_title || "",
+                item.status || "",
+                Number(item.evidence_count || 0) ? `evidence ${item.evidence_count}` : "",
+              ]
+                .filter(Boolean)
+                .join(" · ")
+            ),
+        }
+      )}
+      ${renderLinkSection(
+        "Cases",
+        detail.cases,
+        (item) => escapeHtml(item.title || "—"),
+        { resolveJump: (item) => ({ screen: "cases", id: item.id }) }
+      )}
+      ${renderLinkSection(
+        "Связи",
+        detail.relations,
+        (item) => `${escapeHtml(item.relation_label || item.relation_type || "—")} · ${escapeHtml(relationPeerName(item, entityId))}`,
+        {
+          resolveJump: (item) => ({ screen: "relations", id: item.id }),
+          secondary: (item) =>
+            escapeHtml(
+              [
+                item.layer_label || item.layer || "",
+                item.detected_label || item.detected_by || "",
+                item.context_title || "",
+              ]
+                .filter(Boolean)
+                .join(" · ")
+            ),
+        }
+      )}
     `;
   }
 
-  function renderMasterDetailLayout({ filters, list, detail }) {
+  function renderMasterDetailLayout({ filters, list, detail, selectionBanner = "" }) {
     return `
       <div class="master-detail">
         <section class="master-pane">
           ${filters || ""}
-          <div class="table-list">${list}</div>
+          <div class="master-list-wrap ${selectionBanner ? "has-banner" : ""}">
+            ${selectionBanner || ""}
+            <div class="table-list">${list}</div>
+          </div>
         </section>
         <section class="detail-pane">${detail}</section>
       </div>
@@ -1115,6 +1271,49 @@
         <button class="view-switch-btn ${currentView === "table" ? "active" : ""}" data-screen-view="${escapeHtml(section)}:table" type="button">Таблица</button>
       </div>
     `;
+  }
+
+  function renderSelectionBanner(title, subtitle) {
+    return `
+      <div class="selection-banner">
+        <div class="selection-banner-title">${escapeHtml(title || "Выбран объект")}</div>
+        <div class="selection-banner-subtitle">${escapeHtml(subtitle || "")}</div>
+      </div>
+    `;
+  }
+
+  function renderActionLink(label, screen, id) {
+    if (!id) {
+      return escapeHtml(label || "—");
+    }
+    return `<button class="inline-link compact" data-jump-screen="${escapeHtml(screen)}" data-jump-id="${escapeHtml(
+      String(id)
+    )}" type="button">${escapeHtml(label || "—")}</button>`;
+  }
+
+  function relationLayerBadgeClass(layer) {
+    if (layer === "structural") {
+      return "emerald";
+    }
+    if (layer === "weak_similarity") {
+      return "amber";
+    }
+    return "cyan";
+  }
+
+  function relationPeerName(item, currentEntityId) {
+    if (!item) {
+      return "—";
+    }
+    const fromId = Number(item.from_entity_id || 0);
+    const toId = Number(item.to_entity_id || 0);
+    if (currentEntityId && fromId === Number(currentEntityId)) {
+      return item.to_name || item.context_title || "—";
+    }
+    if (currentEntityId && toId === Number(currentEntityId)) {
+      return item.from_name || "—";
+    }
+    return item.to_name || item.from_name || "—";
   }
 
   function renderTableList(items, rowRenderer) {
@@ -1170,16 +1369,32 @@
     `;
   }
 
-  function renderLinkSection(title, items, formatter) {
+  function renderLinkSection(title, items, formatter, options = {}) {
     if (!items || !items.length) {
       return "";
     }
     return `
       <div class="detail-section">
         <h3>${escapeHtml(title)}</h3>
-        <ul>
-          ${items.map((item) => `<li>${formatter(item)}</li>`).join("")}
+        <ul class="detail-link-list">
+          ${items
+            .map((item) => {
+              const jump = options.resolveJump ? options.resolveJump(item) : null;
+              const secondary = options.secondary ? options.secondary(item) : "";
+              const content = formatter(item);
+              const body = jump?.screen && jump?.id
+                ? `<button class="inline-link" data-jump-screen="${escapeHtml(jump.screen)}" data-jump-id="${escapeHtml(String(jump.id))}" type="button">${content}</button>`
+                : `<div class="inline-link static">${content}</div>`;
+              return `
+                <li>
+                  ${body}
+                  ${secondary ? `<div class="link-secondary">${secondary}</div>` : ""}
+                </li>
+              `;
+            })
+            .join("")}
         </ul>
+        ${options.footer ? `<div class="link-footer">${options.footer}</div>` : ""}
       </div>
     `;
   }
@@ -1220,6 +1435,16 @@
     });
   }
 
+  function bindJumpLinks() {
+    ui.screenRoot.querySelectorAll("[data-jump-screen][data-jump-id]").forEach((node) => {
+      node.addEventListener("click", async (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        await navigateTo(node.dataset.jumpScreen, Number(node.dataset.jumpId));
+      });
+    });
+  }
+
   async function requestSources() {
     const payload = await bridgeCall(
       "getSources",
@@ -1245,6 +1470,17 @@
 
   async function manualRefresh() {
     await loadBootstrap();
+  }
+
+  async function navigateTo(screen, id) {
+    if (!screen || !id) {
+      return;
+    }
+    state.group = groupKeyForSection(screen);
+    state.section = screen;
+    state.selectedRows[screen] = Number(id);
+    renderShell();
+    await loadCurrentScreen();
   }
 
   function currentSourceName() {

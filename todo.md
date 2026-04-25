@@ -1974,3 +1974,24 @@ tass.ru (иногда)
 - [x] Добавить `tools/export_obsidian.py` для выгрузки БД в Obsidian
 - [x] Скопировать медиа/файлы из `raw_blobs` в `Attachments`
 - [x] Проверить полный экспорт: `F:\новости\obsidian_export`
+
+---
+
+## 21) Закрыто в последнем проходе
+
+- [x] Убрать дубли и низкосигнальный шум в карточках `Дела`: однословные claims вроде `заявил`, `сказал`, `допрос`, `задержан` теперь скрываются в UI и больше не проходят в новые auto-cases через `cases.builder`.
+- [x] Сделать связи человекочитаемыми в web UI: `works_at`, `party_member`, `sponsored_bill` и т.п. теперь отдаются с human label, пояснением `почему связаны`, readable layer/detected-by и контекстом законопроекта/evidence.
+- [x] Сделать связи и связанные сущности кликабельными: из detail-pane можно перейти в `Сущности`, `Claims`, `Cases`, `Контент`, `Связи`.
+- [x] Починить web-shell layout: скролл для источников, master/detail и рабочей панели; `Рабочая панель` стала overlay drawer поверх интерфейса; `WORKSPACE` выровнен; `+ / -` укрупнены.
+- [x] Добавить selection banner для `Аналитика -> Связи` и `Аналитика -> Руководство`.
+- [x] Приоритизировать executive-layer в `Руководство`: сначала идут `executive_directory:*`, а не случайные депутатские записи из `bill_votes`.
+- [x] Добавить runtime job `deputies` с fallback-цепочкой `HTML/API -> playwright -> sponsors import -> vote entity backfill`.
+- [x] Закрыть runtime bug `database is locked` в heartbeat lease loop: heartbeat больше не падает при retriable SQLite lock.
+- [x] Добавить `runtime.recover --force-job <job_id>` для ручного снятия зависшего job до истечения lease TTL.
+- [x] Прогнать live `executive_directory`, `import_deputies_from_sponsors`, `backfill_vote_entities` и полный `nightly` pipeline.
+
+## 22) Осталось внешнее / операционное
+
+- [ ] Живой scrape `duma.gov.ru/deputies` из этой среды нестабилен: сейчас HTML collector уходит в `ConnectTimeout`, поэтому депутаты добиваются через sponsors/votes fallback.
+- [ ] `council.gov.ru` для `senators` тоже даёт сетевой timeout из текущей среды.
+- [ ] Для полноценного end-to-end smoke Telegram/watch-folder/ASR по-прежнему нужны живые пользовательские session, входные файлы и внешняя сеть без блокировок.

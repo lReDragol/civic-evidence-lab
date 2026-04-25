@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from collections import defaultdict
 from pathlib import Path
@@ -24,8 +25,121 @@ STRUCTURAL_RELATION_TYPES = {
     "voted_abstained",
     "voted_absent",
 }
-WEAK_RELATION_TYPES = {"mentioned_together"}
+WEAK_RELATION_TYPES = {
+    "mentioned_together",
+    "same_contract_cluster",
+    "same_bill_cluster",
+    "same_case_cluster",
+    "same_vote_pattern",
+    "likely_association",
+}
 STRENGTH_ORDER = {"strong": 0, "moderate": 1, "weak": 2}
+CLAIM_STATUS_PRIORITY = {
+    "verified": 4,
+    "confirmed": 4,
+    "partially_confirmed": 3,
+    "open": 2,
+    "unverified": 1,
+    "draft": 0,
+}
+LOW_SIGNAL_CLAIMS = {
+    "заявил",
+    "сказал",
+    "сообщил",
+    "пообещал",
+    "обещал",
+    "допрос",
+    "допроса",
+    "задержан",
+    "задержали",
+    "арестован",
+    "арестовали",
+    "владеет",
+    "пригрозил",
+}
+LOW_SIGNAL_CLAIM_RE = re.compile(
+    r"^(?:был\s+)?(?:заявил|сказал|сообщил|пообещал|обещал|допрос(?:а)?|задержан(?:а|ы|о)?|арестован(?:а|ы|о)?|владеет|пригрозил)$",
+    re.IGNORECASE,
+)
+RELATION_TYPE_META = {
+    "works_at": {
+        "label": "Работает в",
+        "summary": "{from_name} занимает должность в {to_name}.",
+    },
+    "head_of": {
+        "label": "Возглавляет",
+        "summary": "{from_name} возглавляет {to_name}.",
+    },
+    "party_member": {
+        "label": "Состоит в партии",
+        "summary": "{from_name} относится к партии или фракции {to_name}.",
+    },
+    "member_of": {
+        "label": "Состоит в",
+        "summary": "{from_name} состоит в {to_name}.",
+    },
+    "member_of_committee": {
+        "label": "Член комитета",
+        "summary": "{from_name} состоит в комитете {to_name}.",
+    },
+    "represents_region": {
+        "label": "Представляет регион",
+        "summary": "{from_name} представляет регион {to_name}.",
+    },
+    "sponsored_bill": {
+        "label": "Соавтор законопроекта",
+        "summary": "{from_name} указан автором или соавтором законопроекта {to_name}.",
+    },
+    "voted_for": {
+        "label": "Голосовал за",
+        "summary": "{from_name} голосовал за {to_name}.",
+    },
+    "voted_against": {
+        "label": "Голосовал против",
+        "summary": "{from_name} голосовал против {to_name}.",
+    },
+    "voted_abstained": {
+        "label": "Воздержался",
+        "summary": "{from_name} воздержался при голосовании по {to_name}.",
+    },
+    "voted_absent": {
+        "label": "Не голосовал",
+        "summary": "{from_name} отсутствовал при голосовании по {to_name}.",
+    },
+    "mentioned_together": {
+        "label": "Упоминаются вместе",
+        "summary": "{from_name} и {to_name} встречаются в одних и тех же материалах.",
+    },
+    "same_contract_cluster": {
+        "label": "Связаны по контрактам",
+        "summary": "{from_name} и {to_name} попали в один контрактный кластер.",
+    },
+    "same_bill_cluster": {
+        "label": "Связаны по законопроектам",
+        "summary": "{from_name} и {to_name} попали в один законопроектный кластер.",
+    },
+    "same_case_cluster": {
+        "label": "Связаны по делам",
+        "summary": "{from_name} и {to_name} попали в один case-кластер.",
+    },
+    "same_vote_pattern": {
+        "label": "Похожий паттерн голосований",
+        "summary": "{from_name} и {to_name} показывают похожий паттерн голосований.",
+    },
+}
+DETECTED_BY_LABELS = {
+    "official_positions": "официальные должности",
+    "party_memberships": "партийные принадлежности",
+    "bill_sponsors": "список авторов законопроекта",
+    "bill_votes": "записи голосований Госдумы",
+    "investigation_case": "материал расследования",
+    "risk_patterns": "детектор риск-паттернов",
+}
+LAYER_LABELS = {
+    "structural": "структурная",
+    "evidence": "доказательная",
+    "weak_similarity": "слабая similarity",
+}
 
 NAVIGATION = [
     {
@@ -321,6 +435,155 @@ class DashboardDataService:
             -int(item.get("id") or 0),
         )
 
+    @staticmethod
+    def _normalize_claim_text(text: Any) -> str:
+        value = str(text or "")
+        value = re.sub(r"^[^\wА-Яа-яЁё]+", "", value.strip(), flags=re.UNICODE)
+        value = re.sub(r"\s+", " ", value)
+        return value.strip(" \t\r\n.,;:!?-–—\"'«»()[]")
+
+    def _is_low_signal_claim(self, text: Any) -> bool:
+        cleaned = self._normalize_claim_text(text)
+        if not cleaned:
+            return True
+        normalized = cleaned.casefold()
+        if normalized in LOW_SIGNAL_CLAIMS or LOW_SIGNAL_CLAIM_RE.fullmatch(normalized):
+            return True
+        words = re.findall(r"[A-Za-zА-Яа-яЁё0-9]+", cleaned)
+        alpha_words = [word for word in words if re.search(r"[A-Za-zА-Яа-яЁё]", word)]
+        if len(alpha_words) <= 1 and len(cleaned) <= 18:
+            return True
+        if len(alpha_words) <= 2 and len(cleaned) <= 22 and not any(ch.isdigit() for ch in cleaned):
+            return True
+        return False
+
+    def _claim_priority(self, item: dict[str, Any]) -> tuple:
+        return (
+            int(item.get("evidence_count") or 0),
+            CLAIM_STATUS_PRIORITY.get(str(item.get("status") or "").strip().lower(), 0),
+            float(item.get("confidence_final") or 0.0),
+            len(self._normalize_claim_text(item.get("claim_text"))),
+            int(item.get("id") or 0),
+        )
+
+    def _deduplicate_claim_items(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        grouped: dict[str, dict[str, Any]] = {}
+        for item in items:
+            cleaned = self._normalize_claim_text(item.get("claim_text"))
+            if self._is_low_signal_claim(cleaned):
+                continue
+            if not cleaned:
+                continue
+            key = cleaned.casefold()
+            candidate = dict(item)
+            candidate["claim_text"] = cleaned
+            bucket = grouped.get(key)
+            if not bucket:
+                candidate["support_count"] = 1
+                candidate["duplicate_claim_ids"] = [candidate.get("id")]
+                candidate["support_content_ids"] = {candidate.get("content_id")}
+                grouped[key] = candidate
+                continue
+            bucket["support_count"] = int(bucket.get("support_count") or 1) + 1
+            bucket.setdefault("duplicate_claim_ids", []).append(candidate.get("id"))
+            bucket.setdefault("support_content_ids", set()).add(candidate.get("content_id"))
+            bucket["evidence_count"] = max(int(bucket.get("evidence_count") or 0), int(candidate.get("evidence_count") or 0))
+            if self._claim_priority(candidate) > self._claim_priority(bucket):
+                preserved = {
+                    "support_count": bucket["support_count"],
+                    "duplicate_claim_ids": bucket.get("duplicate_claim_ids", []),
+                    "support_content_ids": bucket.get("support_content_ids", set()),
+                }
+                grouped[key] = candidate
+                grouped[key].update(preserved)
+
+        result = list(grouped.values())
+        for item in result:
+            item["support_content_count"] = len({value for value in item.get("support_content_ids", set()) if value})
+            item["support_content_ids"] = sorted(
+                int(value) for value in item.get("support_content_ids", set()) if value is not None
+            )
+            item["duplicate_claim_ids"] = [int(value) for value in item.get("duplicate_claim_ids", []) if value is not None]
+        result.sort(
+            key=lambda item: (
+                -int(item.get("support_count") or 1),
+                -int(item.get("evidence_count") or 0),
+                -len(item.get("claim_text") or ""),
+                -int(item.get("id") or 0),
+            )
+        )
+        return result
+
+    def relation_label(self, relation_type: str) -> str:
+        meta = RELATION_TYPE_META.get(relation_type or "", {})
+        return str(meta.get("label") or (relation_type or "связь").replace("_", " "))
+
+    def relation_summary(self, relation_type: str, from_name: str, to_name: str) -> str:
+        meta = RELATION_TYPE_META.get(relation_type or "", {})
+        template = str(meta.get("summary") or "{from_name} связан с {to_name}.")
+        return template.format(from_name=from_name or "—", to_name=to_name or "—")
+
+    def relation_detected_label(self, detected_by: str | None) -> str:
+        text = str(detected_by or "").strip()
+        if not text:
+            return "источник не указан"
+        if text.startswith("executive_directory:"):
+            return "официальный каталог руководства"
+        if text.startswith("co_occurrence:"):
+            support_items, support_sources = self._co_occurrence_support(text)
+            return f"совместные упоминания ({support_items} материалов, {support_sources} источников)"
+        return DETECTED_BY_LABELS.get(text, text.replace("_", " "))
+
+    def relation_layer_label(self, layer: str | None) -> str:
+        return LAYER_LABELS.get(str(layer or ""), str(layer or "—"))
+
+    def _bill_context(self, entity_name: str | None) -> dict[str, Any] | None:
+        if not entity_name or not self._table_exists("bills"):
+            return None
+        row = self.db.execute(
+            """
+            SELECT id, number, title, status, registration_date, duma_url
+            FROM bills
+            WHERE number=?
+            LIMIT 1
+            """,
+            (entity_name,),
+        ).fetchone()
+        return self._row_to_dict(row) if row else None
+
+    def _evidence_context(self, evidence_item_id: int | None) -> dict[str, Any] | None:
+        if not evidence_item_id or not self._table_exists("content_items"):
+            return None
+        row = self.db.execute(
+            "SELECT id, title, url, published_at, content_type FROM content_items WHERE id=?",
+            (evidence_item_id,),
+        ).fetchone()
+        return self._row_to_dict(row) if row else None
+
+    def _enrich_relation_item(self, item: dict[str, Any]) -> dict[str, Any]:
+        item = dict(item)
+        item["relation_label"] = self.relation_label(item.get("relation_type", ""))
+        item["layer_label"] = self.relation_layer_label(item.get("layer"))
+        item["detected_label"] = self.relation_detected_label(item.get("detected_by"))
+        item["summary"] = self.relation_summary(
+            item.get("relation_type", ""),
+            item.get("from_name", ""),
+            item.get("to_name", ""),
+        )
+        bill = self._bill_context(item.get("to_name"))
+        if bill:
+            item["context_title"] = bill.get("title")
+            item["context_subtitle"] = "законопроект"
+            item["context_url"] = bill.get("duma_url")
+        elif item.get("to_description"):
+            item["context_title"] = item.get("to_description")
+        evidence = self._evidence_context(item.get("evidence_item_id"))
+        if evidence:
+            item["evidence_title"] = evidence.get("title")
+            item["evidence_url"] = evidence.get("url")
+            item["evidence_content_id"] = evidence.get("id")
+        return item
+
     def entity_detail(self, entity_id: int | None) -> dict[str, Any] | None:
         if not entity_id:
             return None
@@ -359,11 +622,13 @@ class DashboardDataService:
             ).fetchall()
         ] if self._table_exists("entity_mentions") else []
 
-        claims = [
+        raw_claims = [
             self._row_to_dict(item)
             for item in self.db.execute(
                 """
-                SELECT DISTINCT cl.id, cl.claim_text, cl.status, ci.id AS content_id, ci.title AS content_title
+                SELECT DISTINCT cl.id, cl.claim_text, cl.status, cl.confidence_final,
+                       ci.id AS content_id, ci.title AS content_title,
+                       (SELECT COUNT(*) FROM evidence_links el WHERE el.claim_id = cl.id) AS evidence_count
                 FROM entity_mentions em
                 JOIN claims cl ON cl.content_item_id = em.content_item_id
                 JOIN content_items ci ON ci.id = cl.content_item_id
@@ -374,6 +639,7 @@ class DashboardDataService:
                 (entity_id,),
             ).fetchall()
         ] if self._table_exists("claims") and self._table_exists("entity_mentions") else []
+        claims = self._deduplicate_claim_items(raw_claims)[:20]
 
         cases = [
             self._row_to_dict(item)
@@ -397,7 +663,8 @@ class DashboardDataService:
             relation_rows = self.db.execute(
                 """
                 SELECT er.id, er.from_entity_id, er.to_entity_id, er.relation_type, er.strength, er.detected_by, er.evidence_item_id,
-                       ef.canonical_name AS from_name, et.canonical_name AS to_name
+                       ef.canonical_name AS from_name, ef.entity_type AS from_type, ef.description AS from_description,
+                       et.canonical_name AS to_name, et.entity_type AS to_type, et.description AS to_description
                 FROM entity_relations er
                 JOIN entities ef ON ef.id = er.from_entity_id
                 JOIN entities et ON et.id = er.to_entity_id
@@ -413,7 +680,7 @@ class DashboardDataService:
                     item.get("detected_by"),
                     item.get("evidence_item_id"),
                 )
-                relations.append(item)
+                relations.append(self._enrich_relation_item(item))
             relations.sort(key=self.relation_sort_key)
             relations = relations[:30]
 
@@ -587,19 +854,25 @@ class DashboardDataService:
             ).fetchone()
             if row:
                 detail = self._row_to_dict(row)
-                detail["claims"] = [
+                raw_claims = [
                     self._row_to_dict(item)
                     for item in self.db.execute(
                         """
-                        SELECT cl.id, cl.claim_text, cl.status
+                        SELECT cl.id, cl.claim_text, cl.status, cl.confidence_final,
+                               cl.content_item_id AS content_id, ci.title AS content_title,
+                               (SELECT COUNT(*) FROM evidence_links el WHERE el.claim_id = cl.id) AS evidence_count
                         FROM case_claims cc
                         JOIN claims cl ON cl.id = cc.claim_id
+                        LEFT JOIN content_items ci ON ci.id = cl.content_item_id
                         WHERE cc.case_id=?
                         ORDER BY cl.id DESC
                         """,
                         (selected_id,),
                     ).fetchall()
                 ] if self._table_exists("case_claims") else []
+                detail["claims_total"] = len(raw_claims)
+                detail["claims"] = self._deduplicate_claim_items(raw_claims)
+                detail["claims_hidden_count"] = max(0, detail["claims_total"] - len(detail["claims"]))
                 detail["events"] = [
                     self._row_to_dict(item)
                     for item in self.db.execute(
@@ -657,7 +930,8 @@ class DashboardDataService:
             for row in self.db.execute(
                 """
                 SELECT er.id, er.from_entity_id, er.to_entity_id, er.relation_type, er.strength, er.detected_by, er.evidence_item_id,
-                       ef.canonical_name AS from_name, et.canonical_name AS to_name
+                       ef.canonical_name AS from_name, ef.entity_type AS from_type, ef.description AS from_description,
+                       et.canonical_name AS to_name, et.entity_type AS to_type, et.description AS to_description
                 FROM entity_relations er
                 JOIN entities ef ON ef.id = er.from_entity_id
                 JOIN entities et ON et.id = er.to_entity_id
@@ -671,7 +945,7 @@ class DashboardDataService:
                     item.get("detected_by"),
                     item.get("evidence_item_id"),
                 )
-                all_rows.append(item)
+                all_rows.append(self._enrich_relation_item(item))
 
         if query:
             all_rows = [
@@ -697,12 +971,23 @@ class DashboardDataService:
         rows = self.db.execute(
             f"""
             SELECT e.id AS entity_id, e.canonical_name AS full_name, e.entity_type,
-                   op.position_title, op.organization, op.source_url, op.is_active
+                   op.position_title, op.organization, op.source_url, op.is_active, op.source_type,
+                   CASE
+                       WHEN op.source_type LIKE 'executive_directory:%' THEN 0
+                       WHEN op.organization LIKE '%Правительство%' THEN 1
+                       WHEN op.organization LIKE '%Министерство%' THEN 1
+                       WHEN op.organization LIKE '%служба%' THEN 1
+                       WHEN op.organization LIKE '%казначейство%' THEN 1
+                       WHEN op.organization LIKE '%антимонополь%' THEN 1
+                       WHEN op.organization LIKE '%Совет Федерации%' THEN 2
+                       WHEN op.organization LIKE '%Дума%' THEN 3
+                       ELSE 4
+                   END AS sort_priority
             FROM official_positions op
             JOIN entities e ON e.id = op.entity_id
             WHERE {' AND '.join(where)}
-            ORDER BY op.is_active DESC, e.canonical_name, op.id DESC
-            LIMIT 200
+            ORDER BY sort_priority ASC, op.is_active DESC, op.organization, e.canonical_name, op.id DESC
+            LIMIT 400
             """,
             params,
         ).fetchall() if self._table_exists("official_positions") else []
@@ -737,6 +1022,7 @@ class DashboardDataService:
             "obsidian_export_dir",
             "watch_folder_interval_seconds",
             "telegram_collect_interval_seconds",
+            "deputies_interval_seconds",
             "executive_directory_interval_seconds",
         ]
         items = [{"key": key, "value": self.settings.get(key)} for key in keys if key in self.settings]

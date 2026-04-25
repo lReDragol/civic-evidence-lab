@@ -17,6 +17,22 @@ from config.db_utils import get_db, load_settings
 
 log = logging.getLogger(__name__)
 
+LOW_SIGNAL_CLAIMS = {
+    "заявил",
+    "сказал",
+    "сообщил",
+    "пообещал",
+    "обещал",
+    "допрос",
+    "допроса",
+    "задержан",
+    "задержали",
+    "арестован",
+    "арестовали",
+    "владеет",
+    "пригрозил",
+}
+
 
 def _get_entity_name(conn: sqlite3.Connection, entity_id: int) -> str:
     row = conn.execute("SELECT canonical_name FROM entities WHERE id=?", (entity_id,)).fetchone()
@@ -83,6 +99,65 @@ def _find_related_entities(conn: sqlite3.Connection, claim_ids: List[int]) -> Li
     return [r[0] for r in rows]
 
 
+def _normalize_claim_text(text: str) -> str:
+    value = re.sub(r"^[^\wА-Яа-яЁё]+", "", str(text or "").strip(), flags=re.UNICODE)
+    value = re.sub(r"\s+", " ", value)
+    return value.strip(" \t\r\n.,;:!?-–—\"'«»()[]")
+
+
+def _is_low_signal_claim(text: str) -> bool:
+    cleaned = _normalize_claim_text(text)
+    if not cleaned:
+        return True
+    normalized = cleaned.casefold()
+    if normalized in LOW_SIGNAL_CLAIMS:
+        return True
+    words = re.findall(r"[A-Za-zА-Яа-яЁё0-9]+", cleaned)
+    alpha_words = [word for word in words if re.search(r"[A-Za-zА-Яа-яЁё]", word)]
+    if len(alpha_words) <= 1 and len(cleaned) <= 18:
+        return True
+    if len(alpha_words) <= 2 and len(cleaned) <= 22 and not any(ch.isdigit() for ch in cleaned):
+        return True
+    return False
+
+
+def _claim_rank(row: sqlite3.Row) -> Tuple[int, int, int, int]:
+    status = str(row["status"] or "").strip().lower()
+    status_score = {"verified": 4, "confirmed": 4, "partially_confirmed": 3, "open": 2, "unverified": 1}.get(status, 0)
+    return (
+        int(row["evidence_count"] or 0),
+        status_score,
+        len(_normalize_claim_text(row["claim_text"])),
+        int(row["id"] or 0),
+    )
+
+
+def _filter_claim_ids(conn: sqlite3.Connection, claim_ids: List[int]) -> List[int]:
+    if not claim_ids:
+        return []
+    placeholders = ",".join("?" * len(claim_ids))
+    rows = conn.execute(
+        f"""
+        SELECT cl.id, cl.claim_text, cl.status,
+               (SELECT COUNT(*) FROM evidence_links el WHERE el.claim_id = cl.id) AS evidence_count
+        FROM claims cl
+        WHERE cl.id IN ({placeholders})
+        ORDER BY cl.id DESC
+        """,
+        claim_ids,
+    ).fetchall()
+    best_by_text: Dict[str, sqlite3.Row] = {}
+    for row in rows:
+        cleaned = _normalize_claim_text(row["claim_text"])
+        if _is_low_signal_claim(cleaned):
+            continue
+        key = cleaned.casefold()
+        current = best_by_text.get(key)
+        if current is None or _claim_rank(row) > _claim_rank(current):
+            best_by_text[key] = row
+    return [int(row["id"]) for row in best_by_text.values()]
+
+
 def _has_evidence(conn: sqlite3.Connection, claim_ids: List[int]) -> bool:
     if not claim_ids:
         return False
@@ -114,6 +189,7 @@ def build_cases_from_entities(settings: dict = None, min_claims: int = 3) -> int
     cases_created = 0
 
     for entity_id, claim_ids in person_claims.items():
+        claim_ids = _filter_claim_ids(conn, list(claim_ids))
         if len(claim_ids) < min_claims:
             continue
 
@@ -191,7 +267,7 @@ def build_cases_from_entities(settings: dict = None, min_claims: int = 3) -> int
     topic_cases = 0
 
     for cluster in topic_clusters:
-        claim_ids = list(cluster["claim_ids"])
+        claim_ids = _filter_claim_ids(conn, list(cluster["claim_ids"]))
         if len(claim_ids) < 5:
             continue
 

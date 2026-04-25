@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import logging
 import os
+import sqlite3
 import threading
 import traceback
 from typing import Any
@@ -19,6 +21,8 @@ from runtime.state import (
     update_source_sync_state,
 )
 
+
+log = logging.getLogger(__name__)
 
 RETRIABLE_TOKENS = (
     "timeout",
@@ -49,7 +53,18 @@ def _heartbeat_loop(stop_event: threading.Event, settings: dict[str, Any], job_i
     while not stop_event.wait(interval):
         conn = get_db(settings)
         try:
-            heartbeat_job_lease(conn, job_id, owner, ttl_seconds=ttl_seconds)
+            try:
+                heartbeat_job_lease(conn, job_id, owner, ttl_seconds=ttl_seconds)
+            except sqlite3.OperationalError as error:
+                if _is_retriable_exception(error):
+                    log.warning("Heartbeat retry skipped for %s: %s", job_id, error)
+                    continue
+                raise
+            except Exception as error:
+                if _is_retriable_exception(error):
+                    log.warning("Heartbeat transient error for %s: %s", job_id, error)
+                    continue
+                raise
         finally:
             conn.close()
 
