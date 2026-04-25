@@ -387,15 +387,18 @@ class IngestRuntimeStateTests(unittest.TestCase):
 
         fake_module = SimpleNamespace(PaddleOCR=FakePaddleOCR)
         previous_engine = ocr._ocr_engine
-        previous_failed = getattr(ocr, "_ocr_engine_failed", False)
+        previous_backend = getattr(ocr, "_ocr_backend", None)
+        previous_failed = set(getattr(ocr, "_ocr_failed_backends", set()))
         ocr._ocr_engine = None
-        ocr._ocr_engine_failed = False
+        ocr._ocr_backend = None
+        ocr._ocr_failed_backends = set()
         try:
             with patch.dict(sys.modules, {"paddleocr": fake_module}):
-                engine = ocr.get_ocr_engine({})
+                engine = ocr.get_ocr_engine({"ocr_allow_fallback": False})
         finally:
             ocr._ocr_engine = previous_engine
-            ocr._ocr_engine_failed = previous_failed
+            ocr._ocr_backend = previous_backend
+            ocr._ocr_failed_backends = previous_failed
             sys.modules.pop("paddleocr", None)
 
         self.assertIsNotNone(engine)
@@ -413,16 +416,19 @@ class IngestRuntimeStateTests(unittest.TestCase):
 
         fake_module = SimpleNamespace(PaddleOCR=AlwaysFailOCR)
         previous_engine = ocr._ocr_engine
-        previous_failed = getattr(ocr, "_ocr_engine_failed", False)
+        previous_backend = getattr(ocr, "_ocr_backend", None)
+        previous_failed = set(getattr(ocr, "_ocr_failed_backends", set()))
         ocr._ocr_engine = None
-        ocr._ocr_engine_failed = False
+        ocr._ocr_backend = None
+        ocr._ocr_failed_backends = set()
         try:
             with patch.dict(sys.modules, {"paddleocr": fake_module}):
-                self.assertIsNone(ocr.get_ocr_engine({}))
-                self.assertIsNone(ocr.get_ocr_engine({}))
+                self.assertIsNone(ocr.get_ocr_engine({"ocr_allow_fallback": False}))
+                self.assertIsNone(ocr.get_ocr_engine({"ocr_allow_fallback": False}))
         finally:
             ocr._ocr_engine = previous_engine
-            ocr._ocr_engine_failed = previous_failed
+            ocr._ocr_backend = previous_backend
+            ocr._ocr_failed_backends = previous_failed
             sys.modules.pop("paddleocr", None)
 
         self.assertEqual(AlwaysFailOCR.calls, 1)
@@ -446,6 +452,64 @@ class IngestRuntimeStateTests(unittest.TestCase):
         self.assertEqual(len(fake_engine.calls), 2)
         self.assertTrue(fake_engine.calls[0]["cls"])
         self.assertNotIn("cls", fake_engine.calls[1])
+
+    def test_ocr_image_switches_to_rapidocr_after_paddle_runtime_failure(self):
+        class BrokenPaddle:
+            def ocr(self, image_path, **kwargs):
+                raise NotImplementedError("ConvertPirAttribute2RuntimeAttribute")
+
+        class FakeRapidOCR:
+            def __call__(self, image_path, **kwargs):
+                return ([[[], "fallback text", 0.99]], [0.1, 0.1, 0.1])
+
+        previous_engine = ocr._ocr_engine
+        previous_backend = getattr(ocr, "_ocr_backend", None)
+        previous_failed = set(getattr(ocr, "_ocr_failed_backends", set()))
+        ocr._ocr_engine = BrokenPaddle()
+        ocr._ocr_backend = "paddleocr"
+        ocr._ocr_failed_backends = set()
+        try:
+            with patch("media_pipeline.ocr._load_rapidocr_engine", return_value=FakeRapidOCR()):
+                text = ocr.ocr_image("dummy-path.jpg", {})
+        finally:
+            ocr._ocr_engine = previous_engine
+            ocr._ocr_backend = previous_backend
+            ocr._ocr_failed_backends = previous_failed
+
+        self.assertEqual(text, "fallback text")
+
+    def test_effective_ocr_settings_prefers_rapidocr_after_successful_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "news.db"
+            create_db(db_path)
+            settings = {
+                "db_path": str(db_path),
+                "ensure_schema_on_connect": True,
+                "ocr_engine": "auto",
+            }
+            conn = get_db(settings)
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO sources(id, name, category, url, is_active)
+                    VALUES(1, 'Uploads', 'user_upload', 'watch://documents', 1)
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO source_sync_state(
+                        source_key, source_id, state, last_success_at, last_attempt_at,
+                        transport_mode, metadata_json
+                    ) VALUES('ocr:1', 1, 'ok', '2026-04-25T12:00:00', '2026-04-25T12:00:00', 'ocr', ?)
+                    """,
+                    (json.dumps({"backend": "rapidocr"}),),
+                )
+                conn.commit()
+                effective = ocr._effective_ocr_settings(conn, settings)
+            finally:
+                conn.close()
+
+        self.assertEqual(effective["ocr_engine"], "rapidocr")
 
 
 if __name__ == "__main__":

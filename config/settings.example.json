@@ -27,7 +27,8 @@
     "whisper_device": "cuda",
     "whisper_compute_type": "float16",
 
-    "ocr_engine": "paddleocr",
+    "ocr_engine": "auto",
+    "ocr_allow_fallback": true,
     "ocr_lang": "ru",
 
     "telegram_api_id": null,
@@ -109,6 +110,15 @@
     "classifier_audit": {
         "gold_claims_target": 300,
         "gold_relations_target": 300,
-        "gold_tags_target": 300
+        "gold_tags_target": 300,
+        "min_reviewed_per_kind": 30,
+        "claims_precision_threshold": 0.85,
+        "relations_precision_threshold": 0.80,
+        "tags_precision_threshold": 0.85,
+        "claim_status_drift_threshold": 0.20,
+        "relation_drift_threshold": 0.30,
+        "tag_drift_threshold": 0.35,
+        "strict_gate": true,
+        "report_path": "reports/classifier_audit_latest.json"
     }
 }

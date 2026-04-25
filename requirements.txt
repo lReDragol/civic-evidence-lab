@@ -15,4 +15,5 @@ ollama
 faster-whisper
 torch
 paddleocr
+rapidocr_onnxruntime
 PyMuPDF

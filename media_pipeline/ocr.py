@@ -15,43 +15,123 @@ from runtime.state import record_dead_letter, update_source_sync_state
 log = logging.getLogger(__name__)
 
 _ocr_engine = None
-_ocr_engine_failed = False
+_ocr_backend = None
+_ocr_failed_backends: set[str] = set()
 
 
 def _ocr_source_key(source_id: int | None) -> str:
     return f"ocr:{int(source_id or 0)}"
 
 
-def get_ocr_engine(settings: dict = None):
-    global _ocr_engine, _ocr_engine_failed
-    if _ocr_engine is not None:
-        return _ocr_engine
-    if _ocr_engine_failed:
-        return None
+def _ocr_preferences(settings: dict | None = None) -> tuple[str, bool]:
+    settings = settings or {}
+    preferred = str(settings.get("ocr_engine", "auto") or "auto").strip().lower()
+    allow_fallback = bool(settings.get("ocr_allow_fallback", True))
+    return preferred, allow_fallback
+
+
+def _effective_ocr_settings(conn: sqlite3.Connection, settings: dict | None = None) -> dict:
+    effective = dict(settings or {})
+    preferred, _ = _ocr_preferences(effective)
+    if preferred not in {"auto", "", "none"}:
+        return effective
+
+    rows = conn.execute(
+        """
+        SELECT state, last_error, metadata_json
+        FROM source_sync_state
+        WHERE source_key LIKE 'ocr:%'
+        ORDER BY COALESCE(last_success_at, last_attempt_at, '') DESC, id DESC
+        LIMIT 5
+        """
+    ).fetchall()
+    for row in rows:
+        metadata = {}
+        try:
+            import json
+
+            metadata = json.loads(row["metadata_json"] or "{}")
+        except Exception:
+            metadata = {}
+        if str(metadata.get("backend") or "").strip().lower() == "rapidocr" and str(row["state"] or "").lower() == "ok":
+            effective["ocr_engine"] = "rapidocr"
+            return effective
+        last_error = str(row["last_error"] or "")
+        if "ConvertPirAttribute2RuntimeAttribute" in last_error or "oneDNN" in last_error:
+            effective["ocr_engine"] = "rapidocr"
+            return effective
+    return effective
+
+
+def _backend_order(settings: dict | None = None) -> list[str]:
+    preferred, allow_fallback = _ocr_preferences(settings)
+    if preferred == "rapidocr":
+        return ["rapidocr", "paddleocr"] if allow_fallback else ["rapidocr"]
+    if preferred == "paddleocr":
+        return ["paddleocr", "rapidocr"] if allow_fallback else ["paddleocr"]
+    return ["paddleocr", "rapidocr"] if allow_fallback else ["paddleocr"]
+
+
+def _load_paddle_engine():
+    from paddleocr import PaddleOCR
 
     try:
-        from paddleocr import PaddleOCR
-        try:
-            _ocr_engine = PaddleOCR(use_angle_cls=True, lang="ru", show_log=False)
-        except TypeError as exc:
-            if "show_log" not in str(exc):
-                raise
-            _ocr_engine = PaddleOCR(use_angle_cls=True, lang="ru")
-        except Exception as exc:
-            if "show_log" not in str(exc):
-                raise
-            _ocr_engine = PaddleOCR(use_angle_cls=True, lang="ru")
-        log.info("PaddleOCR loaded (lang=ru)")
-        _ocr_engine_failed = False
+        return PaddleOCR(use_angle_cls=True, lang="ru", show_log=False)
+    except TypeError as exc:
+        if "show_log" not in str(exc):
+            raise
+        return PaddleOCR(use_angle_cls=True, lang="ru")
+    except Exception as exc:
+        if "show_log" not in str(exc):
+            raise
+        return PaddleOCR(use_angle_cls=True, lang="ru")
+
+
+def _load_rapidocr_engine():
+    from rapidocr_onnxruntime import RapidOCR
+
+    return RapidOCR()
+
+
+def _remember_engine(engine, backend: str):
+    global _ocr_engine, _ocr_backend
+    _ocr_engine = engine
+    _ocr_backend = backend
+    return engine
+
+
+def _clear_engine_cache(*, failed_backend: str | None = None):
+    global _ocr_engine, _ocr_backend
+    _ocr_engine = None
+    _ocr_backend = None
+    if failed_backend:
+        _ocr_failed_backends.add(failed_backend)
+
+
+def get_ocr_engine(settings: dict = None):
+    if _ocr_engine is not None:
         return _ocr_engine
-    except ImportError:
-        log.error("paddleocr not installed. Run: pip install paddleocr")
-        _ocr_engine_failed = True
-        return None
-    except Exception as e:
-        log.error("Failed to load PaddleOCR: %s", e)
-        _ocr_engine_failed = True
-        return None
+
+    for backend in _backend_order(settings):
+        if backend in _ocr_failed_backends:
+            continue
+        try:
+            if backend == "paddleocr":
+                engine = _load_paddle_engine()
+                log.info("PaddleOCR loaded (lang=ru)")
+            elif backend == "rapidocr":
+                engine = _load_rapidocr_engine()
+                log.info("RapidOCR loaded (onnxruntime backend)")
+            else:
+                continue
+            return _remember_engine(engine, backend)
+        except ImportError:
+            log.error("%s backend not installed", backend)
+            _ocr_failed_backends.add(backend)
+        except Exception as e:
+            log.error("Failed to load %s: %s", backend, e)
+            _ocr_failed_backends.add(backend)
+    return None
 
 
 def ocr_image(image_path: str, settings: dict = None) -> str:
@@ -65,6 +145,64 @@ def _ocr_image_with_error(image_path: str, settings: dict = None) -> tuple[str, 
         return "", "OCR engine unavailable"
 
     try:
+        text, error_message = _run_backend_ocr(engine, _ocr_backend or "unknown", image_path)
+        if error_message and (_ocr_backend or "") == "paddleocr" and "rapidocr" not in _ocr_failed_backends:
+            fallback_engine = _switch_to_backend("rapidocr")
+            if fallback_engine is not None:
+                text, fallback_error = _run_backend_ocr(fallback_engine, "rapidocr", image_path)
+                if fallback_error is None:
+                    return text, None
+                return "", fallback_error
+        return text, error_message
+    except Exception as e:
+        log.warning("OCR failed for %s: %s", image_path, e)
+        return "", f"{type(e).__name__}: {e}"
+
+
+def _switch_to_backend(backend: str):
+    if backend in _ocr_failed_backends:
+        return None
+    _clear_engine_cache()
+    try:
+        if backend == "rapidocr":
+            return _remember_engine(_load_rapidocr_engine(), backend)
+        if backend == "paddleocr":
+            return _remember_engine(_load_paddle_engine(), backend)
+    except ImportError:
+        _ocr_failed_backends.add(backend)
+    except Exception as exc:
+        log.error("Failed to switch OCR backend to %s: %s", backend, exc)
+        _ocr_failed_backends.add(backend)
+    return None
+
+
+def _extract_rapidocr_text(result) -> str:
+    texts = []
+    for line in result or []:
+        if not line or len(line) < 2:
+            continue
+        text = line[1]
+        if isinstance(text, (list, tuple)):
+            text = text[0] if text else ""
+        texts.append(str(text).strip())
+    return "\n".join(item for item in texts if item)
+
+
+def _extract_paddle_text(result) -> str:
+    texts = []
+    if result and result[0]:
+        for line in result[0]:
+            if line and len(line) >= 2:
+                text = line[1][0] if isinstance(line[1], (list, tuple)) else str(line[1])
+                texts.append(text.strip())
+    return "\n".join(item for item in texts if item)
+
+
+def _run_backend_ocr(engine, backend: str, image_path: str) -> tuple[str, str | None]:
+    try:
+        if backend == "rapidocr":
+            result, _ = engine(image_path)
+            return _extract_rapidocr_text(result), None
         try:
             result = engine.ocr(image_path, cls=True)
         except TypeError as exc:
@@ -75,16 +213,10 @@ def _ocr_image_with_error(image_path: str, settings: dict = None) -> tuple[str, 
             if "cls" not in str(exc):
                 raise
             result = engine.ocr(image_path)
-        texts = []
-        if result and result[0]:
-            for line in result[0]:
-                if line and len(line) >= 2:
-                    text = line[1][0] if isinstance(line[1], (list, tuple)) else str(line[1])
-                    texts.append(text.strip())
-        return "\n".join(texts), None
-    except Exception as e:
-        log.warning("OCR failed for %s: %s", image_path, e)
-        return "", f"{type(e).__name__}: {e}"
+        return _extract_paddle_text(result), None
+    except Exception as exc:
+        log.warning("%s OCR failed for %s: %s", backend, image_path, exc)
+        return "", f"{type(exc).__name__}: {exc}"
 
 
 def ocr_pdf(pdf_path: str, settings: dict = None) -> str:
@@ -123,6 +255,7 @@ def process_unprocessed_ocr(settings: dict = None):
         settings = load_settings()
 
     conn = get_db(settings)
+    ocr_settings = _effective_ocr_settings(conn, settings)
 
     rows = conn.execute(
         """
@@ -199,13 +332,13 @@ def process_unprocessed_ocr(settings: dict = None):
         text = ""
 
         if att_type == "pdf":
-            text = ocr_pdf(file_path, settings)
+            text = ocr_pdf(file_path, ocr_settings)
             if text:
                 conn.execute("UPDATE content_items SET body_text=? WHERE id=?", (text, content_id))
                 conn.execute("UPDATE attachments SET ocr_text=? WHERE id=?", (text, att_id))
                 text_updates += 1
         elif att_type in ("keyframe", "scan", "photo"):
-            text, error_message = _ocr_image_with_error(file_path, settings)
+            text, error_message = _ocr_image_with_error(file_path, ocr_settings)
             if error_message:
                 dead_letters += 1
                 record_dead_letter(
@@ -236,6 +369,7 @@ def process_unprocessed_ocr(settings: dict = None):
                         "attachment_type": att_type,
                         "file_path": file_path,
                         "status": "runtime_failed",
+                        "backend": _ocr_backend,
                     },
                 )
                 continue
@@ -258,6 +392,7 @@ def process_unprocessed_ocr(settings: dict = None):
                 "file_path": file_path,
                 "status": "processed",
                 "text_updated": bool(text),
+                "backend": _ocr_backend,
             },
         )
 

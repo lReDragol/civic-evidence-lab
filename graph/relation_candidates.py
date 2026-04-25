@@ -321,6 +321,10 @@ def _apply_structural_seed_floor(
         metrics["source_independence"] = round(max(float(metrics["source_independence"]), 0.45), 4)
         metrics["evidence_overlap"] = round(max(float(metrics["evidence_overlap"]), 0.45), 4)
         metrics["temporal_proximity"] = round(max(float(metrics["temporal_proximity"]), 0.50), 4)
+    elif structural_seed_kind == "case" and candidate_type == "same_case_cluster":
+        metrics["source_independence"] = round(max(float(metrics["source_independence"]), 0.40), 4)
+        metrics["evidence_overlap"] = round(max(float(metrics["evidence_overlap"]), 0.50), 4)
+        metrics["temporal_proximity"] = round(max(float(metrics["temporal_proximity"]), 0.55), 4)
 
     metrics["score"] = round(
         _score_value(
@@ -344,12 +348,16 @@ def _candidate_type(
     risk_overlap: int,
     vote_overlap_count: int,
     vote_overlap_ratio: float,
+    structural_seed_kind: str | None,
+    shared_claims: int,
 ) -> str:
     if vote_overlap_count >= 20 and vote_overlap_ratio >= 0.75:
         return "same_vote_pattern"
     if contract_overlap >= 1:
         return "same_contract_cluster"
-    if case_overlap >= 1 or risk_overlap >= 1:
+    if structural_seed_kind == "case" and (case_overlap >= 1 or risk_overlap >= 1):
+        return "same_case_cluster"
+    if case_overlap >= 2 or risk_overlap >= 2 or (case_overlap >= 1 and shared_claims >= 3):
         return "same_case_cluster"
     if bill_overlap >= 3:
         return "same_bill_cluster"
@@ -467,6 +475,8 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
             pair_rows[(record["entity_a"], record["entity_b"])].append(record)
         structural_seed_pairs = _pairs_from_membership_map(contract_map, max_group_size=6)
         bill_seed_pairs = _pairs_from_membership_map(bill_map, max_group_size=24, min_shared=3)
+        case_seed_pairs = _pairs_from_membership_map(case_map, max_group_size=16, min_shared=1)
+        risk_seed_pairs = _pairs_from_membership_map(risk_map, max_group_size=12, min_shared=1)
         vote_seed_pairs = _vote_seed_pairs(
             vote_map,
             eligible_entities={entity_id for entity_id, entity_type in entity_types.items() if entity_type == "person"},
@@ -474,6 +484,8 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
         pair_keys = set(pair_rows)
         pair_keys.update(structural_seed_pairs)
         pair_keys.update(bill_seed_pairs)
+        pair_keys.update(case_seed_pairs)
+        pair_keys.update(risk_seed_pairs)
         pair_keys.update(vote_seed_pairs)
 
         created = 0
@@ -491,6 +503,8 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
                 structural_seed_kind = "vote"
             elif (entity_a, entity_b) in bill_seed_pairs:
                 structural_seed_kind = "bill"
+            elif (entity_a, entity_b) in case_seed_pairs or (entity_a, entity_b) in risk_seed_pairs:
+                structural_seed_kind = "case"
             elif (entity_a, entity_b) in structural_seed_pairs:
                 structural_seed_kind = "contract"
 
@@ -505,7 +519,9 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
             bill_overlap = len(bill_map.get(entity_a, set()) & bill_map.get(entity_b, set()))
             contract_overlap = len(contract_map.get(entity_a, set()) & contract_map.get(entity_b, set()))
             risk_overlap = len(risk_map.get(entity_a, set()) & risk_map.get(entity_b, set()))
-            has_structural_signal = structural_seed_kind is not None
+            has_structural_signal = structural_seed_kind in {"vote", "bill", "contract"} or (
+                structural_seed_kind == "case" and not shared_rows
+            )
             if support_items < MIN_SUPPORT_ITEMS or support_sources < MIN_SUPPORT_SOURCES or support_domains < MIN_SUPPORT_DOMAINS:
                 if not has_structural_signal:
                     skipped_low_support += 1
@@ -556,6 +572,8 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
                 risk_overlap=risk_overlap,
                 vote_overlap_count=same_votes,
                 vote_overlap_ratio=vote_overlap_ratio,
+                structural_seed_kind=structural_seed_kind,
+                shared_claims=shared_claims,
             )
             metrics = _apply_structural_seed_floor(
                 metrics,
@@ -669,6 +687,36 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
                             candidate_id,
                             "bill",
                             json.dumps({"bill_id": bill_id}, ensure_ascii=False),
+                        ),
+                    )
+                    support_rows_created += 1
+
+            if case_overlap:
+                for case_id in sorted(case_map.get(entity_a, set()) & case_map.get(entity_b, set()))[:10]:
+                    conn.execute(
+                        """
+                        INSERT INTO relation_support(candidate_id, support_kind, metadata_json)
+                        VALUES(?,?,?)
+                        """,
+                        (
+                            candidate_id,
+                            "case",
+                            json.dumps({"case_id": case_id}, ensure_ascii=False),
+                        ),
+                    )
+                    support_rows_created += 1
+
+            if risk_overlap:
+                for risk_id in sorted(risk_map.get(entity_a, set()) & risk_map.get(entity_b, set()))[:10]:
+                    conn.execute(
+                        """
+                        INSERT INTO relation_support(candidate_id, support_kind, metadata_json)
+                        VALUES(?,?,?)
+                        """,
+                        (
+                            candidate_id,
+                            "risk",
+                            json.dumps({"risk_id": risk_id}, ensure_ascii=False),
                         ),
                     )
                     support_rows_created += 1

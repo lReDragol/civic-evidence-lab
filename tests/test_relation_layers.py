@@ -141,6 +141,45 @@ def create_bill_cluster_db(db_path: Path):
         conn.close()
 
 
+def create_case_cluster_db(db_path: Path):
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+        conn.executescript(
+            """
+            INSERT INTO sources(id, name, category, url, is_active) VALUES
+                (1, 'Case Source A', 'media', 'https://case-a.example.test', 1),
+                (2, 'Case Source B', 'media', 'https://case-b.example.test', 1);
+
+            INSERT INTO entities(id, entity_type, canonical_name) VALUES
+                (40, 'person', 'Фигурант А'),
+                (41, 'organization', 'Компания Б');
+
+            INSERT INTO content_items(id, source_id, content_type, title, body_text, status) VALUES
+                (301, 1, 'article', 'Case A', 'Case A body', 'raw_signal'),
+                (302, 2, 'article', 'Case B', 'Case B body', 'raw_signal');
+
+            INSERT INTO claims(id, content_item_id, claim_text, status) VALUES
+                (701, 301, 'Claim A', 'pending'),
+                (702, 302, 'Claim B', 'pending');
+
+            INSERT INTO cases(id, title, description, case_type, status) VALUES
+                (801, 'Кейс 801', 'Расследование', 'investigation', 'open');
+
+            INSERT INTO case_claims(case_id, claim_id, role) VALUES
+                (801, 701, 'central'),
+                (801, 702, 'supporting');
+
+            INSERT INTO entity_mentions(entity_id, content_item_id, mention_type, confidence) VALUES
+                (40, 301, 'subject', 1.0),
+                (41, 302, 'organization', 1.0);
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 class RelationLayerTests(unittest.TestCase):
     def test_relation_extractor_requires_independent_sources_and_cleans_old_rows(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -288,6 +327,41 @@ class RelationLayerTests(unittest.TestCase):
             self.assertEqual(result["relation_candidates_created"], 1)
             self.assertEqual(result["promoted_relations"], 0)
             self.assertEqual(rows, [(30, 31, "same_bill_cluster", "review")])
+            self.assertEqual(promoted, 0)
+
+    def test_relation_candidate_builder_reviews_structural_case_cluster(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "relations.db"
+            create_case_cluster_db(db_path)
+
+            result = rebuild_relation_candidates({"db_path": str(db_path)})
+
+            conn = sqlite3.connect(db_path)
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT entity_a_id, entity_b_id, candidate_type, promotion_state
+                    FROM relation_candidates
+                    ORDER BY id
+                    """
+                ).fetchall()
+                support = conn.execute(
+                    """
+                    SELECT support_kind, metadata_json
+                    FROM relation_support
+                    ORDER BY id
+                    """
+                ).fetchall()
+                promoted = conn.execute(
+                    "SELECT COUNT(*) FROM entity_relations WHERE COALESCE(detected_by, '') LIKE 'relation_candidate:%'"
+                ).fetchone()[0]
+            finally:
+                conn.close()
+
+            self.assertEqual(result["relation_candidates_created"], 1)
+            self.assertEqual(result["promoted_relations"], 0)
+            self.assertEqual(rows, [(40, 41, "same_case_cluster", "review")])
+            self.assertTrue(any(kind == "case" and '"case_id": 801' in metadata for kind, metadata in support))
             self.assertEqual(promoted, 0)
 
 

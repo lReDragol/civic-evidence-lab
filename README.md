@@ -25,18 +25,30 @@ Desktop dashboard только показывает состояние и вру
 ```powershell
 python -m runtime.healthcheck
 python -m runtime.run_job --job relations
+python -m runtime.run_job --job classifier_audit
 python -m runtime.run_pipeline --mode nightly
 python -m runtime.daemon
 python -m runtime.recover --request-daemon-stop
+python -m runtime.task_scheduler
 ```
 
 Runtime пишет состояние прямо в `db/news_unified.db`:
 - `job_runs`, `job_leases`, `pipeline_runs`
 - `source_health_checks`, `source_sync_state`, `dead_letter_items`
-- `relation_candidates`, `relation_support`, `runtime_metadata`
+- `relation_candidates`, `relation_support`, `classifier_audit_samples`, `runtime_metadata`
 
-Nightly pipeline собирает `pipeline_version`, пересобирает `db/news_analysis.db` и затем запускает Obsidian export.
+Nightly pipeline собирает `pipeline_version`, прогоняет `classifier_audit`/drift gate, пересобирает `db/news_analysis.db` и затем запускает Obsidian export.
 Локальный путь выгрузки берётся из `config/settings.json` через `obsidian_export_dir`; шаблон в `config/settings.example.json` по умолчанию указывает на `obsidian_export_graph`.
+
+Для автозапуска daemon при логоне есть bootstrap:
+
+```powershell
+python -m runtime.task_scheduler
+python -m runtime.task_scheduler --query
+python -m runtime.task_scheduler --remove
+```
+
+Скрипт сначала пытается зарегистрировать задачу в Windows Task Scheduler. Если текущая сессия не имеет прав на `schtasks /Create`, он автоматически пишет launcher в user Startup folder и сообщает это в результате (`install_mode=startup_folder`).
 
 ## UI
 
@@ -84,9 +96,14 @@ python tools\export_obsidian.py --db .\db\news_analysis.db --vault .\obsidian_ex
 
 Экспорт создаёт разделы `Sources`, `Content`, `Claims`, `Cases`, `Entities`, `Bills`, `VoteSessions`, `Contracts`, `Risks`, `WeakLinks`, `Tags`, `Files` и копирует медиа в `Attachments`. В `graph`-режиме index note также хранит `built_from_pipeline_version`.
 
+## OCR fallback
+
+`media_pipeline/ocr.py` теперь работает в режиме `auto`: сначала пробует `PaddleOCR`, но при несовместимостях вида `oneDNN/PIR` автоматически переключается на `RapidOCR + ONNXRuntime`.
+После первого успешного fallback backend фиксируется в `source_sync_state.metadata_json`, и следующий batch с `ocr_engine=auto` стартует уже с `rapidocr`, не прогревая снова сломанный Paddle runtime.
+
 ## Проверка
 
 ```powershell
 python -m unittest discover -s tests -v
-python -m py_compile main.py ui\web_window.py ui\web_bridge.py runtime\daemon.py runtime\runner.py runtime\state.py graph\relation_candidates.py tools\build_analysis_snapshot.py tools\export_obsidian.py tools\export_obsidian_graph.py
+python -m py_compile main.py ui\web_window.py ui\web_bridge.py runtime\daemon.py runtime\runner.py runtime\state.py runtime\task_scheduler.py graph\relation_candidates.py classifier\audit.py media_pipeline\ocr.py tools\build_analysis_snapshot.py tools\export_obsidian.py tools\export_obsidian_graph.py
 ```

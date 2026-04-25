@@ -208,6 +208,10 @@ def _relations(settings: dict[str, Any]):
     }
 
 
+def _classifier_audit(settings: dict[str, Any]):
+    return __import__("classifier.audit", fromlist=["build_classifier_audit"]).build_classifier_audit(settings)
+
+
 def _backup(settings: dict[str, Any]):
     return __import__("db.backup", fromlist=["backup_database"]).backup_database()
 
@@ -283,6 +287,7 @@ JOB_SPECS = [
     JobSpec("accountability", "Индекс подотчётности", "Дела", 86400, "accountability_interval_seconds", "cases", timeout_seconds=3600, runner=_accountability),
     JobSpec("risk_patterns", "Детекция рисков", "Дела", 86400, "risk_interval_seconds", "cases", timeout_seconds=3600, runner=_risk_patterns),
     JobSpec("relations", "Связи сущностей", "Анализ", 86400, "relations_interval_seconds", "graph", timeout_seconds=3600, runner=_relations),
+    JobSpec("classifier_audit", "Classifier audit / drift gate", "Система", 86400, "classifier_audit_interval_seconds", "quality", timeout_seconds=3600, scheduled=False, runner=_classifier_audit),
     JobSpec("analysis_snapshot", "Analysis snapshot", "Система", 86400, "analysis_snapshot_interval_seconds", "snapshot", timeout_seconds=10800, scheduled=False, runner=_build_analysis_snapshot),
     JobSpec("obsidian_export", "Obsidian graph export", "Система", 86400, "obsidian_export_interval_seconds", "export", timeout_seconds=10800, scheduled=False, runner=_obsidian_export),
     JobSpec("backup", "Бэкап БД", "Система", 86400, "backup_interval_seconds", "maintenance", timeout_seconds=3600, runner=_backup),
@@ -345,6 +350,7 @@ PIPELINE_JOB_IDS = {
         "cases",
         "accountability",
         "risk_patterns",
+        "classifier_audit",
         "analysis_snapshot",
         "obsidian_export",
     ],

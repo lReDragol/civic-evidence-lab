@@ -16,6 +16,8 @@ __pycache__/
 .venv/
 venv/
 app.log
+logs/
+runtime/generated/
 _tmp_rels.txt
 inbox/
 processed/
