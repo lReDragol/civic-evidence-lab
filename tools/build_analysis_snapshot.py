@@ -86,11 +86,8 @@ def table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
 
 def copy_database(source_db: Path, target_db: Path):
     ensure_dir(target_db.parent)
-    if target_db.exists():
-        target_db.unlink()
-
-    source_conn = sqlite3.connect(str(source_db))
-    target_conn = sqlite3.connect(str(target_db))
+    source_conn = sqlite3.connect(str(source_db), timeout=60)
+    target_conn = sqlite3.connect(str(target_db), timeout=60)
     try:
         source_conn.backup(target_conn)
     finally:

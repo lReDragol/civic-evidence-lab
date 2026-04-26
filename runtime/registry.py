@@ -181,6 +181,76 @@ def _executive_directory(settings: dict[str, Any]):
     ).collect_executive_directories(settings)
 
 
+def _profiles_enrichment(settings: dict[str, Any]):
+    return __import__("enrichment.profiles_enrichment", fromlist=["run_profiles_enrichment"]).run_profiles_enrichment(settings)
+
+
+def _photo_backfill(settings: dict[str, Any]):
+    module = __import__("enrichment.photo_backfill", fromlist=["run_photo_backfill"])
+    limit = int(settings.get("photo_backfill_limit", 400) or 400)
+    return module.run_photo_backfill(settings, limit=limit)
+
+
+def _anticorruption_disclosures(settings: dict[str, Any]):
+    return __import__(
+        "enrichment.anticorruption_scraper",
+        fromlist=["run_anticorruption_disclosures"],
+    ).run_anticorruption_disclosures(settings)
+
+
+def _company_registry_enrichment(settings: dict[str, Any]):
+    module = __import__(
+        "enrichment.company_registry_enrichment",
+        fromlist=["run_company_registry_enrichment"],
+    )
+    limit = int(settings.get("company_registry_enrichment_limit", 250) or 250)
+    return module.run_company_registry_enrichment(settings, limit=limit)
+
+
+def _state_company_reports(settings: dict[str, Any]):
+    return __import__("enrichment.state_company_reports", fromlist=["run_state_company_reports"]).run_state_company_reports(settings)
+
+
+def _restriction_corpus(settings: dict[str, Any]):
+    return __import__("enrichment.restriction_corpus", fromlist=["build_restriction_corpus"]).build_restriction_corpus(settings)
+
+
+def _content_dedupe(settings: dict[str, Any]):
+    return __import__("enrichment.content_dedupe", fromlist=["run_content_dedupe"]).run_content_dedupe(settings)
+
+
+def _review_pack_export(settings: dict[str, Any]):
+    module = __import__("enrichment.review_packs", fromlist=["export_review_pack"])
+    export_dir = Path(settings.get("review_export_dir", str(PROJECT_ROOT / "reports" / "review_packs")))
+    export_dir.mkdir(parents=True, exist_ok=True)
+    queues = settings.get(
+        "review_export_queues",
+        ["content_duplicates", "entity_duplicates", "assets_affiliations", "restrictions_justifications"],
+    )
+    results: dict[str, Any] = {}
+    total = 0
+    for queue_key in queues:
+        csv_path = export_dir / f"{queue_key}.csv"
+        result = module.export_review_pack(settings, queue_key=queue_key, csv_path=csv_path)
+        results[queue_key] = result
+        total += int(result.get("items_new") or 0)
+    return {"ok": True, "items_new": total, "artifacts": results}
+
+
+def _review_pack_import(settings: dict[str, Any]):
+    module = __import__("enrichment.review_packs", fromlist=["import_review_pack"])
+    import_dir = Path(settings.get("review_import_dir", str(PROJECT_ROOT / "reports" / "review_packs")))
+    if not import_dir.exists():
+        return {"ok": True, "items_seen": 0, "items_updated": 0, "warnings": [f"missing:{import_dir}"]}
+    results: dict[str, Any] = {}
+    updated = 0
+    for csv_path in sorted(import_dir.glob("*.csv")):
+        result = module.import_review_pack(settings, csv_path=csv_path)
+        results[csv_path.name] = result
+        updated += int(result.get("items_updated") or 0)
+    return {"ok": True, "items_updated": updated, "artifacts": results}
+
+
 def _tagger(settings: dict[str, Any]):
     return __import__("classifier.tagger_v3", fromlist=["classify_content_items"]).classify_content_items(settings)
 
@@ -294,6 +364,10 @@ def _relations(settings: dict[str, Any]):
     }
 
 
+def _relation_rebuild_enriched(settings: dict[str, Any]):
+    return __import__("enrichment.relation_rebuild", fromlist=["run_relation_rebuild_enriched"]).run_relation_rebuild_enriched(settings)
+
+
 def _classifier_audit(settings: dict[str, Any]):
     return __import__("classifier.audit", fromlist=["build_classifier_audit"]).build_classifier_audit(settings)
 
@@ -353,6 +427,15 @@ JOB_SPECS = [
     JobSpec("senators", "Сенаторы", "Сбор", 604800, "senators_interval_seconds", "collect", timeout_seconds=3600, source_keys=("senators",), runner=_senators),
     JobSpec("fas_ach_sk", "ФАС/Счётная/СК", "Сбор", 86400, "fas_ach_sk_interval_seconds", "collect", timeout_seconds=3600, source_keys=("fas", "ach", "sk"), runner=_fas_ach_sk),
     JobSpec("executive_directory", "Руководство органов", "Сбор", 604800, "executive_directory_interval_seconds", "collect", timeout_seconds=3600, source_keys=("executive_directory",), runner=_executive_directory),
+    JobSpec("profiles_enrichment", "Profiles enrichment", "Обогащение", 604800, "profiles_enrichment_interval_seconds", "enrichment", timeout_seconds=7200, runner=_profiles_enrichment),
+    JobSpec("photo_backfill", "Photo backfill", "Обогащение", 86400, "photo_backfill_interval_seconds", "enrichment", timeout_seconds=7200, runner=_photo_backfill),
+    JobSpec("anticorruption_disclosures", "Декларации/доходы", "Обогащение", 86400, "anticorruption_disclosures_interval_seconds", "enrichment", timeout_seconds=10800, runner=_anticorruption_disclosures),
+    JobSpec("company_registry_enrichment", "Бизнес/аффилиации", "Обогащение", 86400, "company_registry_enrichment_interval_seconds", "enrichment", timeout_seconds=10800, runner=_company_registry_enrichment),
+    JobSpec("state_company_reports", "Госкомпании/отчёты", "Обогащение", 604800, "state_company_reports_interval_seconds", "enrichment", timeout_seconds=10800, runner=_state_company_reports),
+    JobSpec("restriction_corpus", "Ограничения/оправдания", "Обогащение", 86400, "restriction_corpus_interval_seconds", "enrichment", timeout_seconds=7200, runner=_restriction_corpus),
+    JobSpec("content_dedupe", "Контент dedupe", "Обогащение", 43200, "content_dedupe_interval_seconds", "enrichment", timeout_seconds=7200, runner=_content_dedupe),
+    JobSpec("review_pack_export", "Review pack export", "Обогащение", 86400, "review_pack_export_interval_seconds", "enrichment", timeout_seconds=3600, scheduled=False, runner=_review_pack_export),
+    JobSpec("review_pack_import", "Review pack import", "Обогащение", 86400, "review_pack_import_interval_seconds", "enrichment", timeout_seconds=3600, scheduled=False, runner=_review_pack_import),
     JobSpec("source_health", "Source health", "Система", 1800, "source_health_interval_seconds", "health", timeout_seconds=600, source_keys=("source_health",), runner=_source_health),
     JobSpec("tagger", "Classifier v3", "Анализ", 21600, "classification_interval_seconds", "analysis", timeout_seconds=3600, runner=_tagger),
     JobSpec("llm", "LLM-классификатор", "Анализ", 43200, "llm_interval_seconds", "analysis", timeout_seconds=7200, scheduled=False, visible=False, runner=_llm),
@@ -376,6 +459,7 @@ JOB_SPECS = [
     JobSpec("accountability", "Индекс подотчётности", "Дела", 86400, "accountability_interval_seconds", "cases", timeout_seconds=3600, runner=_accountability),
     JobSpec("risk_patterns", "Детекция рисков", "Дела", 86400, "risk_interval_seconds", "cases", timeout_seconds=3600, runner=_risk_patterns),
     JobSpec("relations", "Связи сущностей", "Анализ", 86400, "relations_interval_seconds", "graph", timeout_seconds=3600, runner=_relations),
+    JobSpec("relation_rebuild_enriched", "Enriched relation rebuild", "Обогащение", 86400, "relation_rebuild_enriched_interval_seconds", "graph", timeout_seconds=7200, runner=_relation_rebuild_enriched),
     JobSpec("classifier_audit", "Classifier audit / drift gate", "Система", 86400, "classifier_audit_interval_seconds", "quality", timeout_seconds=3600, scheduled=False, runner=_classifier_audit),
     JobSpec("analysis_snapshot", "Analysis snapshot", "Система", 86400, "analysis_snapshot_interval_seconds", "snapshot", timeout_seconds=10800, scheduled=False, runner=_build_analysis_snapshot),
     JobSpec("obsidian_export", "Obsidian graph export", "Система", 86400, "obsidian_export_interval_seconds", "export", timeout_seconds=10800, scheduled=False, runner=_obsidian_export),
@@ -416,8 +500,11 @@ PIPELINE_JOB_IDS = {
         "gov",
         "votes",
         "deputies",
+        "profiles_enrichment",
+        "photo_backfill",
         "fas_ach_sk",
         "executive_directory",
+        "content_dedupe",
         "asr",
         "ocr",
         "tagger",
@@ -435,10 +522,18 @@ PIPELINE_JOB_IDS = {
     ],
     "nightly": [
         "source_health",
+        "profiles_enrichment",
+        "photo_backfill",
+        "anticorruption_disclosures",
+        "company_registry_enrichment",
+        "state_company_reports",
+        "restriction_corpus",
+        "content_dedupe",
         "semantic_index",
         "structural_links",
         "entity_relation_builder",
         "relations",
+        "relation_rebuild_enriched",
         "cases",
         "accountability",
         "risk_patterns",
@@ -446,6 +541,7 @@ PIPELINE_JOB_IDS = {
         "classifier_audit",
         "analysis_snapshot",
         "obsidian_export",
+        "review_pack_export",
     ],
     "weekly_maintenance": [
         "source_health",

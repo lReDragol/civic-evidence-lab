@@ -15,6 +15,54 @@ from config.db_utils import get_db, load_settings
 
 log = logging.getLogger(__name__)
 
+CASE_TYPE_TITLE_LABELS = {
+    "legislative_corruption": "коррупционный контур",
+    "legislative_impact": "общественное влияние",
+    "public_opposition": "публичное противодействие",
+}
+
+
+def _title_suffix_for_case_type(case_type: str | None) -> str:
+    return CASE_TYPE_TITLE_LABELS.get((case_type or "").strip(), "")
+
+
+def _format_case_title(number: str, title: str | None, case_type: str, conn) -> str:
+    base_title = f"Закон {number}: {title or ''}".strip()
+    duplicate = conn.execute(
+        "SELECT 1 FROM cases WHERE title=? AND case_type<>? LIMIT 1",
+        (base_title, case_type),
+    ).fetchone()
+    suffix = _title_suffix_for_case_type(case_type)
+    if duplicate and suffix:
+        return f"{base_title} · {suffix}"
+    return base_title
+
+
+def dedupe_duplicate_case_titles(conn) -> int:
+    updated = 0
+    duplicate_titles = conn.execute(
+        "SELECT title FROM cases GROUP BY title HAVING COUNT(*) > 1"
+    ).fetchall()
+    for (title,) in duplicate_titles:
+        rows = conn.execute(
+            "SELECT id, case_type FROM cases WHERE title=? ORDER BY id",
+            (title,),
+        ).fetchall()
+        distinct_types = {str(case_type).strip() for _, case_type in rows if str(case_type).strip()}
+        if len(distinct_types) < 2:
+            continue
+        for case_id, case_type in rows:
+            suffix = _title_suffix_for_case_type(case_type)
+            if not suffix:
+                continue
+            new_title = title if title.endswith(f" · {suffix}") else f"{title} · {suffix}"
+            conn.execute(
+                "UPDATE cases SET title=?, updated_at=datetime('now') WHERE id=?",
+                (new_title, case_id),
+            )
+            updated += int(conn.execute("SELECT changes()").fetchone()[0])
+    return updated
+
 
 def populate_entity_relations_from_votes(conn) -> int:
     created = 0
@@ -196,9 +244,10 @@ def link_bills_to_cases(conn) -> int:
             if existing_case:
                 case_id = existing_case[0]
             else:
+                case_title = _format_case_title(number, title, case_type, conn)
                 cur = conn.execute(
                     "INSERT INTO cases(title, description, case_type, status, started_at) VALUES(?,?,?,?,?)",
-                    (f"Закон {number}: {title or ''}",
+                    (case_title,
                      f"Кейс связан с законопроектом {number}",
                      case_type, "open", datetime.now().isoformat()[:10]),
                 )
@@ -326,6 +375,8 @@ def run_all_structural_links(settings=None):
     log.info("Linking bills to cases...")
     case_links = link_bills_to_cases(conn)
     log.info("Bill→case links: %d new cases", case_links)
+    case_title_updates = dedupe_duplicate_case_titles(conn)
+    log.info("Case title dedupe updates: %d", case_title_updates)
 
     conn.commit()
     conn.close()
@@ -336,6 +387,7 @@ def run_all_structural_links(settings=None):
         "sponsor_relations": sp_rels,
         "vote_relations": vt_rels,
         "bill_case_links": case_links,
+        "case_title_updates": case_title_updates,
     }
 
 

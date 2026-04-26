@@ -101,6 +101,59 @@ def create_db(db_path: Path):
             VALUES
                 (81, 2, 'Министерство тестирования', 'customer', '1002003004'),
                 (81, 3, 'Петров Пётр Петрович', 'supplier', '5006007008');
+
+            INSERT INTO raw_source_items(id, source_id, external_id, raw_payload, hash_sha256)
+            VALUES(90, 1, 'blob:ivanov-photo', '{}', 'hash-raw-ivanov-photo');
+
+            INSERT INTO raw_blobs(id, raw_item_id, blob_type, file_path, original_filename, mime_type, hash_sha256)
+            VALUES(91, 90, 'entity_media', 'processed/documents/entity_media/photos/ivanov.jpg', 'ivanov.jpg', 'image/jpeg', 'hash-ivanov-photo');
+
+            INSERT INTO attachments(id, content_item_id, blob_id, file_path, attachment_type, hash_sha256, mime_type)
+            VALUES(91, 10, 91, 'processed/documents/entity_media/photos/ivanov.jpg', 'image', 'hash-ivanov-photo', 'image/jpeg');
+
+            INSERT INTO entity_media(entity_id, attachment_id, media_kind, source_url, is_primary)
+            VALUES(1, 91, 'photo', 'https://example.test/minfin/person/1/photo.jpg', 1);
+
+            INSERT INTO person_disclosures(
+                id, entity_id, disclosure_year, income_amount, raw_income_text, source_url, source_content_id
+            ) VALUES(
+                101, 1, 2024, 1234567.89, '1 234 567,89 руб.', 'https://example.test/disclosure/101', 12
+            );
+
+            INSERT INTO declared_assets(
+                id, disclosure_id, owner_role, asset_type, ownership_type, area_text, country, usage_type
+            ) VALUES(
+                102, 101, 'self', 'apartment', 'shared', '67.8', 'Россия', 'residential'
+            );
+
+            INSERT INTO company_affiliations(
+                id, entity_id, company_entity_id, company_name, role_type, source_url, evidence_class
+            ) VALUES(
+                103, 1, 2, 'Министерство тестирования', 'board_member', 'https://example.test/egrul/103', 'support'
+            );
+
+            INSERT INTO restriction_events(
+                id, issuer_entity_id, target_entity_id, target_name, restriction_type,
+                right_category, stated_justification, source_content_id, evidence_class
+            ) VALUES(
+                104, 1, 2, 'Министерство тестирования', 'internet_block', 'internet',
+                'по соображениям безопасности', 12, 'hard'
+            );
+
+            INSERT INTO review_tasks(
+                id, task_key, queue_key, subject_type, subject_id, related_id,
+                suggested_action, confidence, machine_reason, candidate_payload,
+                source_links_json, status, review_pack_id
+            ) VALUES(
+                201, 'dup:11:12', 'content_duplicates', 'content_cluster', 301, NULL,
+                'merge', 0.91, 'Normalized duplicate title',
+                '{"items":[11,12],"canonical_title":"Повторное сообщение об Иванове"}',
+                '["https://example.test/post/11","https://example.test/minfin/order/12"]',
+                'open', 'pack-1'
+            );
+
+            INSERT INTO content_clusters(id, cluster_key, cluster_type, canonical_content_id, canonical_title, item_count, similarity_score)
+            VALUES(301, 'cluster:ivanov', 'document_dedupe', 11, 'Повторное сообщение об Иванове', 2, 0.98);
             """
         )
         conn.commit()
@@ -159,6 +212,45 @@ class DashboardDataServiceTests(unittest.TestCase):
                 "Министр тестирования Российской Федерации",
             )
             self.assertEqual(payload["detail"]["content"][0]["id"], 11)
+
+    def test_entity_detail_exposes_enrichment_sections(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "bridge.db"
+            create_db(db_path)
+
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            try:
+                service = DashboardDataService(conn, {})
+                payload = service.screen_payload("entities", {"selected_id": 1})
+            finally:
+                conn.close()
+
+            detail = payload["detail"]
+            self.assertEqual(detail["media"][0]["media_kind"], "photo")
+            self.assertEqual(detail["disclosures"][0]["disclosure_year"], 2024)
+            self.assertEqual(detail["affiliations"][0]["role_type"], "board_member")
+            self.assertEqual(detail["restrictions"][0]["restriction_type"], "internet_block")
+
+    def test_review_ops_screen_returns_queue_detail_and_links(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "bridge.db"
+            create_db(db_path)
+
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            try:
+                service = DashboardDataService(conn, {})
+                payload = service.screen_payload("review_ops", {"selected_id": 201})
+            finally:
+                conn.close()
+
+            self.assertEqual(len(payload["items"]), 1)
+            self.assertEqual(payload["queues"][0]["queue_key"], "content_duplicates")
+            self.assertEqual(payload["detail"]["suggested_action"], "merge")
+            self.assertIn("Повторное сообщение", payload["detail"]["subject_summary"])
+            self.assertEqual(len(payload["detail"]["source_links"]), 2)
+            self.assertIn('"items"', payload["detail"]["candidate_payload_pretty"])
 
     def test_screen_payload_for_relations_supports_layer_filter(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -325,11 +417,41 @@ class DashboardDataServiceTests(unittest.TestCase):
             self.assertIn("bridge_evidence", node_roles)
             self.assertIn("bridge_bill", node_roles)
             self.assertIn("bridge_contract", node_roles)
+            self.assertIn("bridge_affiliation", node_roles)
+            self.assertIn("bridge_restriction", node_roles)
 
             bridge_paths = payload["detail"].get("bridge_paths") or []
             self.assertTrue(bridge_paths)
             self.assertTrue(any("Claim" in path["label"] for path in bridge_paths))
             self.assertTrue(any("Законопроект" in path["label"] or "Контракт" in path["label"] for path in bridge_paths))
+
+    def test_relation_map_contains_affiliation_bridge_for_enriched_relation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "bridge.db"
+            create_db(db_path)
+
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO entity_relations(
+                        id, from_entity_id, to_entity_id, relation_type, evidence_item_id, strength, detected_by
+                    ) VALUES(
+                        43, 1, 2, 'member_of', 10, 'strong', 'company_affiliations'
+                    )
+                    """
+                )
+                conn.commit()
+                service = DashboardDataService(conn, {})
+                payload = service.screen_payload("relations", {"selected_id": 43})
+            finally:
+                conn.close()
+
+            node_roles = {node["role"] for node in payload["map_graph"]["nodes"]}
+            self.assertIn("bridge_affiliation", node_roles)
+            bridge_paths = payload["detail"].get("bridge_paths") or []
+            self.assertTrue(any("Аффилиация" in path["label"] for path in bridge_paths))
 
     def test_settings_screen_contains_workspace_detail(self):
         with tempfile.TemporaryDirectory() as tmp:

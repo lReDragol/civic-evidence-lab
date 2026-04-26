@@ -806,6 +806,20 @@ button:disabled {
   margin-top: 6px;
 }
 
+.json-block {
+  margin: 0;
+  padding: 14px 16px;
+  border-radius: 18px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.03);
+  color: rgba(255, 255, 255, 0.84);
+  font-size: 12px;
+  line-height: 1.5;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 .bridge-path-list {
   display: grid;
   gap: 10px;
@@ -2446,6 +2460,20 @@ button:disabled {
     linear-gradient(180deg, rgba(45, 30, 25, 0.98), rgba(31, 20, 17, 0.98));
 }
 
+.node-graph-node.role-bridge_affiliation {
+  border-color: rgba(190, 154, 255, 0.30);
+  background:
+    linear-gradient(180deg, rgba(190, 154, 255, 0.12), rgba(190, 154, 255, 0.03)),
+    linear-gradient(180deg, rgba(37, 31, 49, 0.98), rgba(24, 18, 34, 0.98));
+}
+
+.node-graph-node.role-bridge_restriction {
+  border-color: rgba(255, 126, 170, 0.30);
+  background:
+    linear-gradient(180deg, rgba(255, 126, 170, 0.12), rgba(255, 126, 170, 0.03)),
+    linear-gradient(180deg, rgba(47, 26, 34, 0.98), rgba(31, 17, 24, 0.98));
+}
+
 .node-graph-node.role-bridge_content,
 .node-graph-node.role-bridge_evidence {
   border-color: rgba(78, 242, 178, 0.30);
@@ -2514,6 +2542,12 @@ button:disabled {
   fill: rgba(255, 151, 122, 0.88);
 }
 
+.node-graph-edge.kind-affiliation,
+.node-graph-port-dot.kind-affiliation {
+  stroke: rgba(190, 154, 255, 0.90);
+  fill: rgba(190, 154, 255, 0.90);
+}
+
 .node-graph-edge.kind-origin,
 .node-graph-port-dot.kind-origin {
   stroke: rgba(108, 207, 246, 0.88);
@@ -2524,6 +2558,12 @@ button:disabled {
 .node-graph-port-dot.kind-case {
   stroke: rgba(255, 203, 108, 0.90);
   fill: rgba(255, 203, 108, 0.90);
+}
+
+.node-graph-edge.kind-restriction,
+.node-graph-port-dot.kind-restriction {
+  stroke: rgba(255, 126, 170, 0.90);
+  fill: rgba(255, 126, 170, 0.90);
 }
 
 .node-graph-edge.kind-context,

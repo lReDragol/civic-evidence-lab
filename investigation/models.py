@@ -181,6 +181,7 @@ RELATION_LABELS = {
     "same_bill_cluster": "Кластер законопроектов",
     "same_contract_cluster": "Кластер контрактов",
     "same_case_cluster": "Кластер дел/рисков",
+    "restricted": "Ограничивает",
 }
 
 RELATION_INVERSE_LABELS = {
@@ -213,6 +214,7 @@ RELATION_INVERSE_LABELS = {
     "same_bill_cluster": "Связан общим кластером законопроектов",
     "same_contract_cluster": "Связан общим контрактным кластером",
     "same_case_cluster": "Связан общим кластером дел/рисков",
+    "restricted": "Подвергается ограничению со стороны",
 }
 
 RELATION_CONFIDENCE = {

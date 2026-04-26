@@ -858,6 +858,237 @@ CREATE TABLE IF NOT EXISTS claim_occurrences (
 CREATE INDEX IF NOT EXISTS idx_claim_occurrences_cluster ON claim_occurrences(claim_cluster_id);
 CREATE INDEX IF NOT EXISTS idx_claim_occurrences_claim ON claim_occurrences(claim_id);
 
+CREATE TABLE IF NOT EXISTS content_clusters (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    cluster_key     TEXT NOT NULL UNIQUE,
+    cluster_type    TEXT NOT NULL DEFAULT 'document_dedupe',
+    canonical_content_id INTEGER,
+    canonical_title TEXT,
+    method          TEXT DEFAULT 'title_signature',
+    similarity_score REAL DEFAULT 0,
+    item_count      INTEGER DEFAULT 0,
+    first_seen_at   TEXT,
+    last_seen_at    TEXT,
+    status          TEXT DEFAULT 'active',
+    metadata_json   TEXT,
+    created_at      TEXT DEFAULT (datetime('now')),
+    updated_at      TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (canonical_content_id) REFERENCES content_items(id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_content_clusters_type ON content_clusters(cluster_type);
+CREATE INDEX IF NOT EXISTS idx_content_clusters_status ON content_clusters(status);
+
+CREATE TABLE IF NOT EXISTS content_cluster_items (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    cluster_id      INTEGER NOT NULL,
+    content_item_id INTEGER NOT NULL,
+    similarity_score REAL DEFAULT 0,
+    reason          TEXT,
+    is_canonical    INTEGER DEFAULT 0,
+    metadata_json   TEXT,
+    created_at      TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (cluster_id) REFERENCES content_clusters(id) ON DELETE CASCADE,
+    FOREIGN KEY (content_item_id) REFERENCES content_items(id) ON DELETE CASCADE,
+    UNIQUE(cluster_id, content_item_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_content_cluster_items_cluster ON content_cluster_items(cluster_id);
+CREATE INDEX IF NOT EXISTS idx_content_cluster_items_content ON content_cluster_items(content_item_id);
+
+CREATE TABLE IF NOT EXISTS entity_merge_candidates (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    entity_a_id     INTEGER NOT NULL,
+    entity_b_id     INTEGER NOT NULL,
+    candidate_type  TEXT NOT NULL DEFAULT 'entity_merge',
+    score           REAL DEFAULT 0,
+    support_count   INTEGER DEFAULT 0,
+    suggested_action TEXT DEFAULT 'merge',
+    reason          TEXT,
+    status          TEXT DEFAULT 'open',
+    metadata_json   TEXT,
+    created_at      TEXT DEFAULT (datetime('now')),
+    updated_at      TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (entity_a_id) REFERENCES entities(id) ON DELETE CASCADE,
+    FOREIGN KEY (entity_b_id) REFERENCES entities(id) ON DELETE CASCADE,
+    UNIQUE(entity_a_id, entity_b_id, candidate_type)
+);
+
+CREATE INDEX IF NOT EXISTS idx_entity_merge_candidates_status ON entity_merge_candidates(status);
+CREATE INDEX IF NOT EXISTS idx_entity_merge_candidates_pair ON entity_merge_candidates(entity_a_id, entity_b_id);
+
+CREATE TABLE IF NOT EXISTS person_disclosures (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    entity_id       INTEGER NOT NULL,
+    disclosure_year INTEGER NOT NULL,
+    source_content_id INTEGER,
+    source_url      TEXT,
+    source_type     TEXT,
+    income_amount   REAL,
+    income_currency TEXT DEFAULT 'RUB',
+    raw_income_text TEXT,
+    spouse_income_text TEXT,
+    source_scope    TEXT,
+    evidence_class  TEXT DEFAULT 'support',
+    document_attachment_id INTEGER,
+    metadata_json   TEXT,
+    created_at      TEXT DEFAULT (datetime('now')),
+    updated_at      TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (entity_id) REFERENCES entities(id) ON DELETE CASCADE,
+    FOREIGN KEY (source_content_id) REFERENCES content_items(id) ON DELETE SET NULL,
+    FOREIGN KEY (document_attachment_id) REFERENCES attachments(id) ON DELETE SET NULL,
+    UNIQUE(entity_id, disclosure_year, source_url)
+);
+
+CREATE INDEX IF NOT EXISTS idx_person_disclosures_entity ON person_disclosures(entity_id);
+CREATE INDEX IF NOT EXISTS idx_person_disclosures_year ON person_disclosures(disclosure_year);
+
+CREATE TABLE IF NOT EXISTS declared_assets (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    disclosure_id   INTEGER NOT NULL,
+    entity_id       INTEGER,
+    owner_role      TEXT DEFAULT 'self',
+    asset_type      TEXT NOT NULL,
+    asset_name      TEXT,
+    asset_value_text TEXT,
+    ownership_type  TEXT,
+    area_text       TEXT,
+    area_value      REAL,
+    country         TEXT,
+    usage_type      TEXT,
+    source_url      TEXT,
+    metadata_json   TEXT,
+    created_at      TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (disclosure_id) REFERENCES person_disclosures(id) ON DELETE CASCADE,
+    FOREIGN KEY (entity_id) REFERENCES entities(id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_declared_assets_disclosure ON declared_assets(disclosure_id);
+CREATE INDEX IF NOT EXISTS idx_declared_assets_entity ON declared_assets(entity_id);
+CREATE INDEX IF NOT EXISTS idx_declared_assets_type ON declared_assets(asset_type);
+
+CREATE TABLE IF NOT EXISTS company_affiliations (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    entity_id       INTEGER NOT NULL,
+    company_entity_id INTEGER,
+    company_name    TEXT NOT NULL,
+    role_type       TEXT NOT NULL,
+    role_title      TEXT,
+    period_start    TEXT,
+    period_end      TEXT,
+    source_content_id INTEGER,
+    source_url      TEXT,
+    evidence_class  TEXT DEFAULT 'support',
+    metadata_json   TEXT,
+    created_at      TEXT DEFAULT (datetime('now')),
+    updated_at      TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (entity_id) REFERENCES entities(id) ON DELETE CASCADE,
+    FOREIGN KEY (company_entity_id) REFERENCES entities(id) ON DELETE SET NULL,
+    FOREIGN KEY (source_content_id) REFERENCES content_items(id) ON DELETE SET NULL,
+    UNIQUE(entity_id, company_name, role_type, source_url)
+);
+
+CREATE INDEX IF NOT EXISTS idx_company_affiliations_entity ON company_affiliations(entity_id);
+CREATE INDEX IF NOT EXISTS idx_company_affiliations_company ON company_affiliations(company_entity_id);
+CREATE INDEX IF NOT EXISTS idx_company_affiliations_role ON company_affiliations(role_type);
+
+CREATE TABLE IF NOT EXISTS compensation_facts (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    entity_id       INTEGER NOT NULL,
+    employer_entity_id INTEGER,
+    compensation_year INTEGER NOT NULL,
+    amount          REAL,
+    amount_text     TEXT,
+    currency        TEXT DEFAULT 'RUB',
+    role_title      TEXT,
+    fact_type       TEXT DEFAULT 'income',
+    source_content_id INTEGER,
+    source_url      TEXT,
+    evidence_class  TEXT DEFAULT 'support',
+    metadata_json   TEXT,
+    created_at      TEXT DEFAULT (datetime('now')),
+    updated_at      TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (entity_id) REFERENCES entities(id) ON DELETE CASCADE,
+    FOREIGN KEY (employer_entity_id) REFERENCES entities(id) ON DELETE SET NULL,
+    FOREIGN KEY (source_content_id) REFERENCES content_items(id) ON DELETE SET NULL,
+    UNIQUE(entity_id, compensation_year, fact_type, source_url)
+);
+
+CREATE INDEX IF NOT EXISTS idx_compensation_facts_entity ON compensation_facts(entity_id);
+CREATE INDEX IF NOT EXISTS idx_compensation_facts_year ON compensation_facts(compensation_year);
+
+CREATE TABLE IF NOT EXISTS restriction_events (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    issuer_entity_id INTEGER,
+    target_entity_id INTEGER,
+    target_name      TEXT,
+    region          TEXT,
+    restriction_type TEXT NOT NULL,
+    right_category  TEXT,
+    legal_basis     TEXT,
+    stated_justification TEXT,
+    event_date      TEXT,
+    source_content_id INTEGER,
+    source_url      TEXT,
+    evidence_class  TEXT DEFAULT 'support',
+    severity        TEXT DEFAULT 'moderate',
+    status          TEXT DEFAULT 'open',
+    metadata_json   TEXT,
+    created_at      TEXT DEFAULT (datetime('now')),
+    updated_at      TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (issuer_entity_id) REFERENCES entities(id) ON DELETE SET NULL,
+    FOREIGN KEY (target_entity_id) REFERENCES entities(id) ON DELETE SET NULL,
+    FOREIGN KEY (source_content_id) REFERENCES content_items(id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_restriction_events_issuer ON restriction_events(issuer_entity_id);
+CREATE INDEX IF NOT EXISTS idx_restriction_events_target ON restriction_events(target_entity_id);
+CREATE INDEX IF NOT EXISTS idx_restriction_events_type ON restriction_events(restriction_type);
+CREATE INDEX IF NOT EXISTS idx_restriction_events_category ON restriction_events(right_category);
+
+CREATE TABLE IF NOT EXISTS entity_media (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    entity_id       INTEGER NOT NULL,
+    attachment_id   INTEGER NOT NULL,
+    media_kind      TEXT NOT NULL DEFAULT 'photo',
+    source_url      TEXT,
+    is_primary      INTEGER DEFAULT 0,
+    caption         TEXT,
+    metadata_json   TEXT,
+    created_at      TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (entity_id) REFERENCES entities(id) ON DELETE CASCADE,
+    FOREIGN KEY (attachment_id) REFERENCES attachments(id) ON DELETE CASCADE,
+    UNIQUE(entity_id, attachment_id, media_kind)
+);
+
+CREATE INDEX IF NOT EXISTS idx_entity_media_entity ON entity_media(entity_id);
+CREATE INDEX IF NOT EXISTS idx_entity_media_kind ON entity_media(media_kind);
+
+CREATE TABLE IF NOT EXISTS review_tasks (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_key        TEXT NOT NULL UNIQUE,
+    queue_key       TEXT NOT NULL,
+    subject_type    TEXT NOT NULL,
+    subject_id      INTEGER,
+    related_id      INTEGER,
+    candidate_payload TEXT,
+    suggested_action TEXT NOT NULL,
+    confidence      REAL DEFAULT 0,
+    machine_reason  TEXT,
+    source_links_json TEXT,
+    status          TEXT DEFAULT 'open',
+    review_pack_id  TEXT,
+    reviewer        TEXT,
+    reviewed_at     TEXT,
+    resolution_notes TEXT,
+    created_at      TEXT DEFAULT (datetime('now')),
+    updated_at      TEXT DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_review_tasks_queue ON review_tasks(queue_key);
+CREATE INDEX IF NOT EXISTS idx_review_tasks_status ON review_tasks(status);
+CREATE INDEX IF NOT EXISTS idx_review_tasks_pack ON review_tasks(review_pack_id);
+
 CREATE TABLE IF NOT EXISTS investigation_leads (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     entity_id       INTEGER NOT NULL,

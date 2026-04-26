@@ -82,8 +82,11 @@ def write_note(vault: Path, rel_path: str, body: str) -> str:
 
 
 def connect(db_path: Path) -> sqlite3.Connection:
+    def dict_factory(cursor: sqlite3.Cursor, row: tuple[Any, ...]) -> dict[str, Any]:
+        return {cursor.description[idx][0]: value for idx, value in enumerate(row)}
+
     conn = sqlite3.connect(str(db_path))
-    conn.row_factory = sqlite3.Row
+    conn.row_factory = dict_factory
     return conn
 
 
@@ -106,7 +109,7 @@ def table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
 
 def copy_attachment(
     vault: Path,
-    row: sqlite3.Row | dict,
+    row: dict[str, Any],
     copy_media: bool = True,
 ) -> tuple[Optional[str], str]:
     file_path = Path(row["file_path"] or "")
@@ -961,6 +964,12 @@ def export_graph_index(vault: Path, ctx: GraphContext, generated_at: str):
         "- [[VoteSessions/index|Vote Sessions]]",
         "- [[Contracts/index|Contracts]]",
         "- [[Risks/index|Risks]]",
+        "- [[Profiles/index|Profiles]]",
+        "- [[Disclosures/index|Disclosures]]",
+        "- [[Assets/index|Assets]]",
+        "- [[Affiliations/index|Affiliations]]",
+        "- [[Restrictions/index|Restrictions]]",
+        "- [[ReviewPacks/index|Review Packs]]",
         "- [[WeakLinks/index|Weak Similarity]]",
         "- [[Tags/index|Tags]]",
         "- [[Files/index|Files]]",
@@ -1779,6 +1788,293 @@ def export_graph_tags(vault: Path, ctx: GraphContext):
     write_note(vault, "Tags/index.md", "\n".join(lines))
 
 
+def export_graph_profiles(vault: Path, conn: sqlite3.Connection, ctx: GraphContext, copy_media: bool):
+    if not table_exists(conn, "deputy_profiles") and not table_exists(conn, "official_positions"):
+        write_note(vault, "Profiles/index.md", "# Profiles\n")
+        return
+
+    profile_rows: list[dict[str, Any]] = []
+    if table_exists(conn, "deputy_profiles"):
+        for row in rows(
+            conn,
+            """
+            SELECT dp.entity_id, dp.full_name, dp.position, dp.faction, dp.region, dp.committee,
+                   dp.biography_url, dp.photo_url, 'deputy_profile' AS profile_kind
+            FROM deputy_profiles dp
+            WHERE dp.is_active=1
+            ORDER BY dp.full_name
+            """,
+        ):
+            profile_rows.append(dict(row))
+    if table_exists(conn, "official_positions"):
+        deputy_entity_ids = {item["entity_id"] for item in profile_rows}
+        for row in rows(
+            conn,
+            """
+            SELECT e.id AS entity_id, e.canonical_name AS full_name, op.position_title AS position,
+                   NULL AS faction, op.region, NULL AS committee,
+                   op.source_url AS biography_url, NULL AS photo_url,
+                   'official_profile' AS profile_kind
+            FROM official_positions op
+            JOIN entities e ON e.id = op.entity_id
+            WHERE op.is_active=1
+            ORDER BY e.canonical_name
+            """,
+        ):
+            record = dict(row)
+            if record["entity_id"] in deputy_entity_ids:
+                continue
+            profile_rows.append(record)
+
+    index_lines = ["# Profiles", "", "| Entity | Kind | Position |", "|---|---|---|"]
+    for row in profile_rows:
+        rel = f"Profiles/{row['entity_id']}-{slugify(row.get('full_name') or 'profile', 'profile')}.md"
+        title = row.get("full_name") or f"Profile {row['entity_id']}"
+        index_lines.append(
+            f"| {note_link(rel, md_escape(title))} | `{row.get('profile_kind') or ''}` | {md_escape(row.get('position'))} |"
+        )
+        body = [
+            frontmatter(
+                {
+                    "type": "profile",
+                    "entity_id": row["entity_id"],
+                    "profile_kind": row.get("profile_kind"),
+                }
+            ),
+            f"# {title}",
+            "",
+            f"- Entity: {note_link(ctx.entity_paths[row['entity_id']], entity_title(ctx.entity_rows_by_id[row['entity_id']])) if row['entity_id'] in ctx.entity_paths else row['entity_id']}",
+            f"- Position: `{row.get('position') or ''}`",
+            f"- Faction: `{row.get('faction') or ''}`",
+            f"- Region: `{row.get('region') or ''}`",
+            f"- Committee: `{row.get('committee') or ''}`",
+            f"- URL: {row.get('biography_url') or ''}",
+        ]
+        if table_exists(conn, "entity_media"):
+            media_rows = rows(
+                conn,
+                """
+                SELECT a.*
+                FROM entity_media em
+                JOIN attachments a ON a.id = em.attachment_id
+                WHERE em.entity_id=?
+                ORDER BY em.is_primary DESC, em.id DESC
+                LIMIT 3
+                """,
+                (row["entity_id"],),
+            )
+            if media_rows:
+                body.extend(["", "## Media", ""])
+                for media in media_rows:
+                    link, status = copy_attachment(vault, media, copy_media=copy_media)
+                    body.append(f"- {link or md_escape(status)}")
+        write_note(vault, rel, "\n".join(body))
+    write_note(vault, "Profiles/index.md", "\n".join(index_lines))
+
+
+def export_graph_disclosures(vault: Path, conn: sqlite3.Connection, ctx: GraphContext):
+    if not table_exists(conn, "person_disclosures"):
+        write_note(vault, "Disclosures/index.md", "# Disclosures\n")
+        return
+    rows_data = rows(
+        conn,
+        """
+        SELECT pd.*, e.canonical_name
+        FROM person_disclosures pd
+        JOIN entities e ON e.id = pd.entity_id
+        ORDER BY pd.disclosure_year DESC, e.canonical_name, pd.id
+        """,
+    )
+    index_lines = ["# Disclosures", "", "| ID | Year | Person | Income |", "|---:|---:|---|---:|"]
+    for row in rows_data:
+        rel = f"Disclosures/{row['id']}-{row['disclosure_year']}-{slugify(row['canonical_name'], 'disclosure')}.md"
+        index_lines.append(
+            f"| {row['id']} | {row['disclosure_year']} | {note_link(rel, md_escape(row['canonical_name']))} | {md_escape(row['income_amount'])} |"
+        )
+        asset_rows = rows(
+            conn,
+            "SELECT id, owner_role, asset_type, ownership_type, area_text, country, usage_type FROM declared_assets WHERE disclosure_id=? ORDER BY id",
+            (row["id"],),
+        ) if table_exists(conn, "declared_assets") else []
+        body = [
+            frontmatter({"type": "person_disclosure", "disclosure_id": row["id"], "entity_id": row["entity_id"], "year": row["disclosure_year"]}),
+            f"# {row['canonical_name']} — {row['disclosure_year']}",
+            "",
+            f"- Person: {note_link(ctx.entity_paths[row['entity_id']], row['canonical_name']) if row['entity_id'] in ctx.entity_paths else row['canonical_name']}",
+            f"- Income: `{row.get('income_amount') or ''}`",
+            f"- Raw income: `{row.get('raw_income_text') or ''}`",
+            f"- Source URL: {row.get('source_url') or ''}",
+        ]
+        if asset_rows:
+            body.extend(["", "## Assets", ""])
+            for asset in asset_rows:
+                asset_rel = f"Assets/{asset['id']}-{slugify(asset.get('asset_type') or 'asset', 'asset')}.md"
+                body.append(f"- {note_link(asset_rel, asset.get('asset_type') or 'Asset')} `{asset.get('owner_role') or ''}` `{asset.get('country') or ''}`")
+        write_note(vault, rel, "\n".join(body))
+    write_note(vault, "Disclosures/index.md", "\n".join(index_lines))
+
+
+def export_graph_assets(vault: Path, conn: sqlite3.Connection, ctx: GraphContext):
+    if not table_exists(conn, "declared_assets"):
+        write_note(vault, "Assets/index.md", "# Assets\n")
+        return
+    rows_data = rows(
+        conn,
+        """
+        SELECT da.*, pd.entity_id, pd.disclosure_year, e.canonical_name
+        FROM declared_assets da
+        JOIN person_disclosures pd ON pd.id = da.disclosure_id
+        LEFT JOIN entities e ON e.id = pd.entity_id
+        ORDER BY da.id
+        """,
+    )
+    index_lines = ["# Assets", "", "| ID | Owner | Type | Country |", "|---:|---|---|---|"]
+    for row in rows_data:
+        rel = f"Assets/{row['id']}-{slugify(row.get('asset_type') or 'asset', 'asset')}.md"
+        index_lines.append(
+            f"| {row['id']} | {note_link(rel, md_escape(row.get('canonical_name') or row.get('owner_role') or 'owner'))} | {md_escape(row.get('asset_type'))} | {md_escape(row.get('country'))} |"
+        )
+        disclosure_rel = f"Disclosures/{row['disclosure_id']}-{row['disclosure_year']}-{slugify(row.get('canonical_name') or 'disclosure', 'disclosure')}.md"
+        body = [
+            frontmatter({"type": "declared_asset", "asset_id": row["id"], "disclosure_id": row["disclosure_id"]}),
+            f"# {row.get('asset_type') or 'Asset'}",
+            "",
+            f"- Owner: {note_link(ctx.entity_paths[row['entity_id']], row.get('canonical_name')) if row.get('entity_id') in ctx.entity_paths else md_escape(row.get('canonical_name') or row.get('owner_role'))}",
+            f"- Disclosure: {note_link(disclosure_rel, str(row.get('disclosure_year') or 'disclosure'))}",
+            f"- Owner role: `{row.get('owner_role') or ''}`",
+            f"- Ownership: `{row.get('ownership_type') or ''}`",
+            f"- Area: `{row.get('area_text') or ''}`",
+            f"- Country: `{row.get('country') or ''}`",
+            f"- Usage: `{row.get('usage_type') or ''}`",
+        ]
+        write_note(vault, rel, "\n".join(body))
+    write_note(vault, "Assets/index.md", "\n".join(index_lines))
+
+
+def export_graph_affiliations(vault: Path, conn: sqlite3.Connection, ctx: GraphContext):
+    if not table_exists(conn, "company_affiliations"):
+        write_note(vault, "Affiliations/index.md", "# Affiliations\n")
+        return
+    rows_data = rows(
+        conn,
+        """
+        SELECT ca.*, ep.canonical_name AS person_name, ec.canonical_name AS company_title
+        FROM company_affiliations ca
+        LEFT JOIN entities ep ON ep.id = ca.entity_id
+        LEFT JOIN entities ec ON ec.id = ca.company_entity_id
+        ORDER BY ca.id DESC
+        """,
+    )
+    index_lines = ["# Affiliations", "", "| ID | Person | Role | Company |", "|---:|---|---|---|"]
+    for row in rows_data:
+        rel = f"Affiliations/{row['id']}-{slugify((row.get('person_name') or '') + '-' + (row.get('company_name') or ''), 'affiliation')}.md"
+        index_lines.append(
+            f"| {row['id']} | {note_link(rel, md_escape(row.get('person_name') or 'person'))} | {md_escape(row.get('role_type'))} | {md_escape(row.get('company_title') or row.get('company_name'))} |"
+        )
+        body = [
+            frontmatter({"type": "company_affiliation", "affiliation_id": row["id"], "entity_id": row["entity_id"]}),
+            f"# {row.get('person_name') or 'Affiliation'}",
+            "",
+            f"- Person: {note_link(ctx.entity_paths[row['entity_id']], row.get('person_name')) if row.get('entity_id') in ctx.entity_paths else md_escape(row.get('person_name'))}",
+            f"- Company: {note_link(ctx.entity_paths[row['company_entity_id']], row.get('company_title') or row.get('company_name')) if row.get('company_entity_id') in ctx.entity_paths else md_escape(row.get('company_title') or row.get('company_name'))}",
+            f"- Role: `{row.get('role_type') or ''}`",
+            f"- Title: `{row.get('role_title') or ''}`",
+            f"- Period: `{row.get('period_start') or ''}` -> `{row.get('period_end') or ''}`",
+            f"- Source URL: {row.get('source_url') or ''}",
+        ]
+        write_note(vault, rel, "\n".join(body))
+    write_note(vault, "Affiliations/index.md", "\n".join(index_lines))
+
+
+def export_graph_restrictions(vault: Path, conn: sqlite3.Connection, ctx: GraphContext):
+    if not table_exists(conn, "restriction_events"):
+        write_note(vault, "Restrictions/index.md", "# Restrictions\n")
+        return
+    rows_data = rows(
+        conn,
+        """
+        SELECT re.*, ei.canonical_name AS issuer_name, et.canonical_name AS target_entity_name
+        FROM restriction_events re
+        LEFT JOIN entities ei ON ei.id = re.issuer_entity_id
+        LEFT JOIN entities et ON et.id = re.target_entity_id
+        ORDER BY re.id DESC
+        """,
+    )
+    index_lines = ["# Restrictions", "", "| ID | Type | Target | Evidence |", "|---:|---|---|---|"]
+    for row in rows_data:
+        rel = f"Restrictions/{row['id']}-{slugify((row.get('restriction_type') or '') + '-' + (row.get('target_name') or ''), 'restriction')}.md"
+        index_lines.append(
+            f"| {row['id']} | {note_link(rel, md_escape(row.get('restriction_type') or 'restriction'))} | {md_escape(row.get('target_entity_name') or row.get('target_name'))} | {md_escape(row.get('evidence_class'))} |"
+        )
+        body = [
+            frontmatter({"type": "restriction_event", "restriction_id": row["id"], "evidence_class": row.get("evidence_class")}),
+            f"# {row.get('restriction_type') or 'Restriction'}",
+            "",
+            f"- Issuer: {note_link(ctx.entity_paths[row['issuer_entity_id']], row.get('issuer_name')) if row.get('issuer_entity_id') in ctx.entity_paths else md_escape(row.get('issuer_name'))}",
+            f"- Target: {note_link(ctx.entity_paths[row['target_entity_id']], row.get('target_entity_name')) if row.get('target_entity_id') in ctx.entity_paths else md_escape(row.get('target_entity_name') or row.get('target_name'))}",
+            f"- Right category: `{row.get('right_category') or ''}`",
+            f"- Justification: {row.get('stated_justification') or ''}",
+            f"- Legal basis: {row.get('legal_basis') or ''}",
+            f"- Source URL: {row.get('source_url') or ''}",
+        ]
+        content_id = row.get("source_content_id")
+        if content_id in ctx.content_paths:
+            body.append(f"- Source content: {note_link(ctx.content_paths[content_id], content_title(ctx.content_rows_by_id[content_id]))}")
+        write_note(vault, rel, "\n".join(body))
+    write_note(vault, "Restrictions/index.md", "\n".join(index_lines))
+
+
+def export_graph_review_packs(vault: Path, conn: sqlite3.Connection):
+    if not table_exists(conn, "review_tasks"):
+        write_note(vault, "ReviewPacks/index.md", "# Review Packs\n")
+        return
+    pack_rows = rows(
+        conn,
+        """
+        SELECT COALESCE(review_pack_id, 'unpacked') AS review_pack_id,
+               queue_key,
+               COUNT(*) AS task_count,
+               SUM(CASE WHEN status='resolved' THEN 1 ELSE 0 END) AS resolved_count
+        FROM review_tasks
+        GROUP BY COALESCE(review_pack_id, 'unpacked'), queue_key
+        ORDER BY review_pack_id, queue_key
+        """,
+    )
+    index_lines = ["# Review Packs", "", "| Pack | Queue | Tasks | Resolved |", "|---|---|---:|---:|"]
+    pack_index: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in pack_rows:
+        pack_index[row["review_pack_id"]].append(dict(row))
+    for pack_id, queue_rows in sorted(pack_index.items()):
+        rel = f"ReviewPacks/{slugify(pack_id, 'review-pack')}.md"
+        total = sum(int(item.get("task_count") or 0) for item in queue_rows)
+        resolved = sum(int(item.get("resolved_count") or 0) for item in queue_rows)
+        index_lines.append(f"| {note_link(rel, pack_id)} | `{', '.join(item['queue_key'] for item in queue_rows)}` | {total} | {resolved} |")
+        body = [
+            frontmatter({"type": "review_pack", "review_pack_id": pack_id}),
+            f"# {pack_id}",
+            "",
+            "| Queue | Tasks | Resolved |",
+            "|---|---:|---:|",
+        ]
+        for item in queue_rows:
+            body.append(f"| {item['queue_key']} | {item['task_count']} | {item['resolved_count'] or 0} |")
+        body.extend(["", "## Tasks", ""])
+        task_rows = rows(
+            conn,
+            """
+            SELECT task_key, queue_key, subject_type, suggested_action, status, confidence
+            FROM review_tasks
+            WHERE COALESCE(review_pack_id, 'unpacked')=?
+            ORDER BY id
+            """,
+            (pack_id,),
+        )
+        for task in task_rows:
+            body.append(f"- `{task['queue_key']}` `{task['status']}` `{task['suggested_action']}` {task['task_key']} ({task['confidence'] or 0:.2f})")
+        write_note(vault, rel, "\n".join(body))
+    write_note(vault, "ReviewPacks/index.md", "\n".join(index_lines))
+
+
 def export_graph_files(vault: Path, conn: sqlite3.Connection, copy_media: bool):
     if not table_exists(conn, "raw_blobs"):
         write_note(vault, "Files/index.md", "# Files\n")
@@ -1823,6 +2119,12 @@ def export_graph_obsidian(
         export_graph_vote_sessions(vault, ctx)
         export_graph_contracts(vault, ctx)
         export_graph_risks(vault, ctx)
+        export_graph_profiles(vault, conn, ctx, copy_media=copy_media)
+        export_graph_disclosures(vault, conn, ctx)
+        export_graph_assets(vault, conn, ctx)
+        export_graph_affiliations(vault, conn, ctx)
+        export_graph_restrictions(vault, conn, ctx)
+        export_graph_review_packs(vault, conn)
         export_graph_weak_links(vault, ctx)
         export_graph_tags(vault, ctx)
         export_graph_files(vault, conn, copy_media=copy_media)

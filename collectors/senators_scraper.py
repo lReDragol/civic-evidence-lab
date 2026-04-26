@@ -259,6 +259,7 @@ def store_senator(conn, senator: Dict, profile: Dict) -> Optional[int]:
     party = profile.get("party", "")
     photo_url = profile.get("photo_url", "") or senator.get("photo_url", "")
     profile_url = senator.get("profile_url", "") or profile.get("url", "")
+    income_latest = profile.get("income_mention", "") or senator.get("income_mention", "")
 
     row = conn.execute(
         "SELECT id, entity_id FROM deputy_profiles WHERE entity_id=?", (entity_id,)
@@ -267,16 +268,16 @@ def store_senator(conn, senator: Dict, profile: Dict) -> Optional[int]:
         dp_id = row[0]
         conn.execute(
             "UPDATE deputy_profiles SET full_name=?, position=?, faction=?, region=?, "
-            "committee=?, biography_url=?, photo_url=?, is_active=1 WHERE id=?",
+            "committee=?, income_latest=?, biography_url=?, photo_url=?, is_active=1 WHERE id=?",
             (full_name, position, party, region, committee,
-             profile_url, photo_url, dp_id),
+             income_latest, profile_url, photo_url, dp_id),
         )
     else:
         cur = conn.execute(
             "INSERT INTO deputy_profiles(entity_id, full_name, position, faction, region, "
-            "committee, biography_url, photo_url, is_active) VALUES(?,?,?,?,?,?,?,?,1)",
+            "committee, income_latest, biography_url, photo_url, is_active) VALUES(?,?,?,?,?,?,?,?,?,1)",
             (entity_id, full_name, position, party, region,
-             committee, profile_url, photo_url),
+             committee, income_latest, profile_url, photo_url),
         )
         dp_id = cur.lastrowid
 

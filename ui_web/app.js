@@ -15,6 +15,7 @@
       search: { query: "" },
       claims: { query: "", status: "" },
       cases: { query: "" },
+      review_ops: { query: "", queue: "", status: "open" },
       entities: { query: "", entity_type: "" },
       relations: { query: "", layer: "", view: "cards" },
       officials: { query: "", active_only: true, view: "cards" },
@@ -141,7 +142,7 @@
   }
 
   function screenUsesDetailDrawer(section) {
-    return ["content", "search", "claims", "cases", "entities", "relations", "officials"].includes(section);
+    return ["content", "search", "claims", "cases", "review_ops", "entities", "relations", "officials"].includes(section);
   }
 
   function relationMapOverlayOpen() {
@@ -685,6 +686,9 @@
       case "cases":
         renderCasesScreen(state.screenData);
         break;
+      case "review_ops":
+        renderReviewOpsScreen(state.screenData);
+        break;
       case "entities":
         renderEntitiesScreen(state.screenData);
         break;
@@ -1146,6 +1150,117 @@
     bindRowSelection("cases");
   }
 
+  function renderReviewOpsScreen(payload) {
+    const query = state.filters.review_ops.query || "";
+    const queue = state.filters.review_ops.queue || "";
+    const status = state.filters.review_ops.status || "open";
+    const drawerOpen = isDetailDrawerOpen("review_ops", payload.detail);
+    const queueButtons = [
+      ["", "Все"],
+      ...((payload.queues || []).map((item) => [item.queue_key, `${item.queue_key} (${item.open_total || item.total || 0})`])),
+    ];
+    ui.screenRoot.innerHTML = renderMasterDetailLayout({
+      filters: `
+        <div class="screen-filters">
+          <input id="screen-query-input" class="glass-input" type="search" placeholder="Поиск по review tasks" value="${escapeHtml(query)}">
+          <div class="status-filter-row">
+            ${queueButtons
+              .map(
+                ([value, label]) => `
+                  <button class="filter-chip ${queue === value ? "active" : ""}" data-review-queue="${escapeHtml(value)}">
+                    ${escapeHtml(label)}
+                  </button>
+                `
+              )
+              .join("")}
+          </div>
+          <div class="status-filter-row">
+            ${["open", "needs_review", "resolved", ""]
+              .map(
+                (value) => `
+                  <button class="filter-chip ${status === value || (!value && !status) ? "active" : ""}" data-review-status="${escapeHtml(value)}">
+                    ${escapeHtml(value || "Все статусы")}
+                  </button>
+                `
+              )
+              .join("")}
+          </div>
+        </div>
+      `,
+      list: renderTableList(
+        payload.items,
+        (item) => `
+          <div class="table-row-head">
+            <div class="table-primary">${escapeHtml(item.queue_key || "queue")} · ${escapeHtml(item.subject_type || "item")}</div>
+            <span class="badge ${badgeClass(item.status)}">${escapeHtml(item.status || "—")}</span>
+          </div>
+          <div class="table-secondary">${escapeHtml(item.suggested_action || "—")} · confidence ${escapeHtml(
+            Number(item.confidence || 0).toFixed(2)
+          )}</div>
+          <div class="table-secondary">${escapeHtml(item.machine_reason || item.task_key || "—")}</div>
+        `
+      ),
+      detail: payload.detail
+        ? `
+            <h3 class="detail-title">${escapeHtml(payload.detail.queue_key || "Review task")}</h3>
+            <div class="detail-grid">
+              <div class="detail-kv"><div class="k">Статус</div><div class="v">${escapeHtml(payload.detail.status || "—")}</div></div>
+              <div class="detail-kv"><div class="k">Действие</div><div class="v">${escapeHtml(payload.detail.suggested_action || "—")}</div></div>
+              <div class="detail-kv"><div class="k">Confidence</div><div class="v">${escapeHtml(
+                Number(payload.detail.confidence || 0).toFixed(2)
+              )}</div></div>
+              <div class="detail-kv"><div class="k">Пакет</div><div class="v">${escapeHtml(payload.detail.review_pack_id || "—")}</div></div>
+            </div>
+            ${
+              payload.detail.subject_summary
+                ? `<div class="detail-section"><h3>Объект</h3><div class="muted">${escapeHtml(payload.detail.subject_summary)}</div></div>`
+                : ""
+            }
+            ${
+              payload.detail.machine_reason
+                ? `<div class="detail-section"><h3>Machine reason</h3><div class="muted">${escapeHtml(payload.detail.machine_reason)}</div></div>`
+                : ""
+            }
+            ${
+              payload.detail.source_links?.length
+                ? `<div class="detail-section"><h3>Source links</h3><ul class="detail-link-list">${payload.detail.source_links
+                    .map(
+                      (link) => `
+                        <li><a class="inline-link static" href="${escapeHtml(link)}" target="_blank" rel="noreferrer">${escapeHtml(link)}</a></li>
+                      `
+                    )
+                    .join("")}</ul></div>`
+                : ""
+            }
+            <div class="detail-section"><h3>Payload</h3><pre class="json-block">${escapeHtml(
+              payload.detail.candidate_payload_pretty || "{}"
+            )}</pre></div>
+          `
+        : emptyState("Нет review task", "Выберите запись слева."),
+      selectionBanner: drawerOpen && payload.detail
+        ? renderSelectionBanner(
+            payload.detail.queue_key || "Review task",
+            payload.detail.subject_type || payload.detail.suggested_action || "review"
+          )
+        : "",
+      detailOpen: drawerOpen,
+    });
+    bindTextFilter("review_ops");
+    queryInteractiveAll("[data-review-queue]").forEach((button) => {
+      button.addEventListener("click", async () => {
+        state.filters.review_ops.queue = button.dataset.reviewQueue;
+        await loadCurrentScreen();
+      });
+    });
+    queryInteractiveAll("[data-review-status]").forEach((button) => {
+      button.addEventListener("click", async () => {
+        state.filters.review_ops.status = button.dataset.reviewStatus;
+        await loadCurrentScreen();
+      });
+    });
+    bindRowSelection("review_ops");
+  }
+
   function renderEntitiesScreen(payload) {
     const query = state.filters.entities.query || "";
     const drawerOpen = isDetailDrawerOpen("entities", payload.detail);
@@ -1412,6 +1527,14 @@
       }
       ${renderLinkSection("Должности", detail.positions, (item) => `${escapeHtml(item.position_title || "—")} · ${escapeHtml(item.organization || "—")}`)}
       ${renderLinkSection(
+        "Фото",
+        detail.media,
+        (item) => escapeHtml(item.media_kind || "media"),
+        {
+          secondary: (item) => escapeHtml(item.file_path || item.source_url || "—"),
+        }
+      )}
+      ${renderLinkSection(
         "Связанный контент",
         detail.content,
         (item) => `${escapeHtml(formatDate(item.published_at))} · ${escapeHtml(item.title || "—")}`,
@@ -1440,6 +1563,30 @@
         detail.cases,
         (item) => escapeHtml(item.title || "—"),
         { resolveJump: (item) => ({ screen: "cases", id: item.id }) }
+      )}
+      ${renderLinkSection(
+        "Disclosures",
+        detail.disclosures,
+        (item) => `${escapeHtml(String(item.disclosure_year || "—"))} · доход ${escapeHtml(String(item.income_amount ?? item.raw_income_text ?? "—"))}`,
+        {
+          secondary: (item) => escapeHtml(item.source_url || "—"),
+        }
+      )}
+      ${renderLinkSection(
+        "Affiliations",
+        detail.affiliations,
+        (item) => `${escapeHtml(item.role_type || "—")} · ${escapeHtml(item.company_name || "—")}`,
+        {
+          secondary: (item) => escapeHtml(item.source_url || item.evidence_class || "—"),
+        }
+      )}
+      ${renderLinkSection(
+        "Restrictions",
+        detail.restrictions,
+        (item) => `${escapeHtml(item.restriction_type || "—")} · ${escapeHtml(item.target_name || "—")}`,
+        {
+          secondary: (item) => escapeHtml(item.right_category || item.stated_justification || "—"),
+        }
       )}
       ${renderLinkSection(
         "Связи",
@@ -2271,6 +2418,8 @@
       case "bridge_case":
       case "bridge_bill":
       case "bridge_contract":
+      case "bridge_affiliation":
+      case "bridge_restriction":
         return { width: 244, height: 102 };
       case "bridge_content":
       case "bridge_evidence":
@@ -2979,6 +3128,7 @@
       search: "Быстрый поиск по контенту и связанным объектам.",
       claims: "Список заявлений, статусов и evidence linkages.",
       cases: "Открытые и собранные дела с таймлайном claims.",
+      review_ops: "Очереди ручной и полуавтоматической верификации, merge и promotion.",
       entities: "Сущности, должности, claims, content и связи.",
       relations: "Структурные, evidence и weak-similarity связи с card/table режимом.",
       officials: "Руководители и заместители госорганов из официальных directory sources с card/table режимом.",
@@ -3128,7 +3278,7 @@
       return {
         navigation: [
           { key: "monitoring", label: "Мониторинг", sections: [{ key: "overview", label: "Обзор" }, { key: "content", label: "Контент" }, { key: "search", label: "Поиск" }] },
-          { key: "verification", label: "Проверка", sections: [{ key: "claims", label: "Заявления" }, { key: "cases", label: "Дела" }] },
+          { key: "verification", label: "Проверка", sections: [{ key: "claims", label: "Заявления" }, { key: "cases", label: "Дела" }, { key: "review_ops", label: "Review Ops" }] },
           { key: "analytics", label: "Аналитика", sections: [{ key: "entities", label: "Сущности" }, { key: "relations", label: "Связи" }, { key: "officials", label: "Руководство" }] },
           { key: "system", label: "Система", sections: [{ key: "settings", label: "Настройки" }] },
         ],
@@ -3208,9 +3358,14 @@
           items: [{ id: 31, title: "Кейс назначения", status: "open", case_type: "oversight", claims_count: 3 }],
           detail: { id: 31, title: "Кейс назначения", status: "open", case_type: "oversight", claims: [{ claim_text: "Иванов занимает должность" }], events: [{ event_date: "2026-04-25", event_title: "Публикация профиля" }] },
         },
+        review_ops: {
+          queues: [{ queue_key: "content_duplicates", total: 1, open_total: 1 }],
+          items: [{ id: 501, queue_key: "content_duplicates", subject_type: "content_cluster", suggested_action: "merge", confidence: 0.91, status: "open", machine_reason: "Normalized duplicate" }],
+          detail: { id: 501, queue_key: "content_duplicates", subject_type: "content_cluster", suggested_action: "merge", confidence: 0.91, status: "open", subject_summary: "dup cluster · items 2", candidate_payload_pretty: "{\n  \"items\": [11, 12]\n}" },
+        },
         entities: {
           items: [{ id: 1, canonical_name: "Иванов Иван Иванович", entity_type: "person", content_count: 4, positions_count: 1 }],
-          detail: { id: 1, entity_id: 1, canonical_name: "Иванов Иван Иванович", entity_type: "person", description: "Министр тестирования", positions: [{ position_title: "Министр тестирования", organization: "Министерство тестирования" }], content: [{ title: "Executive profile snapshot", published_at: "2026-04-25" }], claims: [{ claim_text: "Иванов занимает должность" }], cases: [{ title: "Кейс назначения" }], relations: [{ relation_type: "works_at", from_name: "Иванов Иван Иванович", to_name: "Министерство тестирования" }] },
+          detail: { id: 1, entity_id: 1, canonical_name: "Иванов Иван Иванович", entity_type: "person", description: "Министр тестирования", positions: [{ position_title: "Министр тестирования", organization: "Министерство тестирования" }], media: [{ media_kind: "photo", file_path: "processed/documents/entity_media/photos/ivanov.jpg" }], disclosures: [{ disclosure_year: 2024, income_amount: 1234567.89, source_url: "https://example.test/disclosure/1" }], affiliations: [{ role_type: "director", company_name: "Тестовая компания", source_url: "https://example.test/egrul/1" }], restrictions: [{ restriction_type: "internet_block", target_name: "Сайт example.test", right_category: "internet" }], content: [{ title: "Executive profile snapshot", published_at: "2026-04-25" }], claims: [{ claim_text: "Иванов занимает должность" }], cases: [{ title: "Кейс назначения" }], relations: [{ relation_type: "works_at", from_name: "Иванов Иван Иванович", to_name: "Министерство тестирования" }] },
         },
         relations: {
           items: [

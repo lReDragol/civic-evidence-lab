@@ -126,6 +126,10 @@ RELATION_TYPE_META = {
         "label": "Похожий паттерн голосований",
         "summary": "{from_name} и {to_name} показывают похожий паттерн голосований.",
     },
+    "restricted": {
+        "label": "Ограничивает",
+        "summary": "{from_name} ограничивает права, доступ или действия {to_name}.",
+    },
 }
 DETECTED_BY_LABELS = {
     "official_positions": "официальные должности",
@@ -134,6 +138,8 @@ DETECTED_BY_LABELS = {
     "bill_votes": "записи голосований Госдумы",
     "investigation_case": "материал расследования",
     "risk_patterns": "детектор риск-паттернов",
+    "restriction_events": "корпус ограничений",
+    "company_affiliations": "реестр аффилиаций",
 }
 LAYER_LABELS = {
     "structural": "структурная",
@@ -157,6 +163,7 @@ NAVIGATION = [
         "sections": [
             {"key": "claims", "label": "Заявления"},
             {"key": "cases", "label": "Дела"},
+            {"key": "review_ops", "label": "Review Ops"},
         ],
     },
     {
@@ -394,6 +401,8 @@ class DashboardDataService:
             return self._claims_screen(filters)
         if screen == "cases":
             return self._cases_screen(filters)
+        if screen == "review_ops":
+            return self._review_ops_screen(filters)
         if screen == "entities":
             return self._entities_screen(filters)
         if screen == "relations":
@@ -981,6 +990,8 @@ class DashboardDataService:
             self._relation_map_append_claim_bridges(scoped_entity_ids, node_map, degree_map, edges, edge_keys)
             self._relation_map_append_bill_bridges(scoped_entity_ids, node_map, degree_map, edges, edge_keys)
             self._relation_map_append_contract_bridges(scoped_entity_ids, node_map, degree_map, edges, edge_keys)
+            self._relation_map_append_affiliation_bridges(scoped_entity_ids, node_map, degree_map, edges, edge_keys)
+            self._relation_map_append_restriction_bridges(scoped_entity_ids, node_map, degree_map, edges, edge_keys)
 
         for node_id, node in node_map.items():
             degree = degree_map.get(node_id, 0)
@@ -1372,6 +1383,215 @@ class DashboardDataService:
                     summary=f"{entity.get('canonical_name') or 'Сущность'} выступает стороной контракта.",
                 )
 
+    def _relation_map_append_affiliation_bridges(
+        self,
+        entity_ids: set[int],
+        node_map: dict[str, dict[str, Any]],
+        degree_map: defaultdict[str, int],
+        edges: list[dict[str, Any]],
+        edge_keys: set[tuple[Any, ...]],
+    ) -> None:
+        if not entity_ids or not self._table_exists("company_affiliations"):
+            return
+        placeholders = ",".join("?" for _ in entity_ids)
+        rows = self.db.execute(
+            f"""
+            SELECT ca.id, ca.entity_id, ca.company_entity_id, ca.company_name, ca.role_type,
+                   ca.role_title, ca.period_start, ca.period_end, ca.source_content_id, ca.evidence_class
+            FROM company_affiliations ca
+            WHERE ca.entity_id IN ({placeholders})
+              AND ca.company_entity_id IN ({placeholders})
+            ORDER BY ca.id DESC
+            LIMIT 36
+            """,
+            tuple(entity_ids) * 2,
+        ).fetchall()
+        for row in rows:
+            affiliation = self._row_to_dict(row)
+            affiliation_id = int(affiliation["id"])
+            affiliation_node_id = f"affiliation:{affiliation_id}"
+            title = " · ".join(
+                value for value in [affiliation.get("role_title"), affiliation.get("company_name")] if value
+            ) or f"Affiliation #{affiliation_id}"
+            meta = " · ".join(
+                value
+                for value in [
+                    affiliation.get("role_type"),
+                    affiliation.get("period_start"),
+                    affiliation.get("period_end"),
+                    affiliation.get("evidence_class"),
+                ]
+                if value
+            )
+            self._map_ensure_node(
+                node_map,
+                affiliation_node_id,
+                "bridge_affiliation",
+                "Аффилиация",
+                title,
+                meta,
+                description=title,
+            )
+            person_node_id = f"entity:{int(affiliation['entity_id'])}"
+            company_node_id = f"entity:{int(affiliation['company_entity_id'])}"
+            self._map_add_edge(
+                edges,
+                edge_keys,
+                degree_map,
+                person_node_id,
+                affiliation_node_id,
+                affiliation.get("role_title") or affiliation.get("role_type") or "роль",
+                "affiliation",
+                summary="Биография или реестр указывают на аффилиацию персоны с компанией.",
+            )
+            self._map_add_edge(
+                edges,
+                edge_keys,
+                degree_map,
+                affiliation_node_id,
+                company_node_id,
+                affiliation.get("company_name") or "компания",
+                "affiliation",
+                summary="Аффилиация связывает персону и компанию.",
+            )
+            content_id = affiliation.get("source_content_id")
+            if content_id and self._table_exists("content_items"):
+                content_row = self.db.execute(
+                    """
+                    SELECT ci.id, ci.title, ci.body_text, ci.published_at, ci.content_type, s.name AS source_name
+                    FROM content_items ci
+                    LEFT JOIN sources s ON s.id = ci.source_id
+                    WHERE ci.id=?
+                    """,
+                    (int(content_id),),
+                ).fetchone()
+                if content_row:
+                    content = self._row_to_dict(content_row)
+                    content_node_id = f"content:{int(content['id'])}"
+                    self._map_ensure_node(
+                        node_map,
+                        content_node_id,
+                        "bridge_content",
+                        "Контент",
+                        content.get("title") or f"Content #{content_id}",
+                        " · ".join(
+                            value for value in [content.get("source_name"), content.get("published_at"), content.get("content_type")] if value
+                        ),
+                        description=content.get("body_text") or content.get("title") or f"Content #{content_id}",
+                        jump_screen="content",
+                        jump_id=int(content_id),
+                    )
+                    self._map_add_edge(
+                        edges,
+                        edge_keys,
+                        degree_map,
+                        content_node_id,
+                        affiliation_node_id,
+                        "источник",
+                        "origin",
+                        summary="Профиль или документ описывает company affiliation.",
+                    )
+
+    def _relation_map_append_restriction_bridges(
+        self,
+        entity_ids: set[int],
+        node_map: dict[str, dict[str, Any]],
+        degree_map: defaultdict[str, int],
+        edges: list[dict[str, Any]],
+        edge_keys: set[tuple[Any, ...]],
+    ) -> None:
+        if not entity_ids or not self._table_exists("restriction_events"):
+            return
+        placeholders = ",".join("?" for _ in entity_ids)
+        rows = self.db.execute(
+            f"""
+            SELECT re.id, re.issuer_entity_id, re.target_entity_id, re.target_name,
+                   re.restriction_type, re.right_category, re.stated_justification,
+                   re.source_content_id, re.event_date
+            FROM restriction_events re
+            WHERE re.issuer_entity_id IN ({placeholders})
+              AND re.target_entity_id IN ({placeholders})
+            ORDER BY re.id DESC
+            LIMIT 36
+            """,
+            tuple(entity_ids) * 2,
+        ).fetchall()
+        for row in rows:
+            event = self._row_to_dict(row)
+            event_id = int(event["id"])
+            event_node_id = f"restriction:{event_id}"
+            event_title = " · ".join(
+                value for value in [event.get("restriction_type"), event.get("target_name")] if value
+            ) or f"Restriction #{event_id}"
+            self._map_ensure_node(
+                node_map,
+                event_node_id,
+                "bridge_restriction",
+                "Ограничение",
+                event_title,
+                " · ".join(value for value in [event.get("right_category"), event.get("event_date")] if value),
+                description=event.get("stated_justification") or event_title,
+            )
+            issuer_node_id = f"entity:{int(event['issuer_entity_id'])}"
+            target_node_id = f"entity:{int(event['target_entity_id'])}"
+            self._map_add_edge(
+                edges,
+                edge_keys,
+                degree_map,
+                issuer_node_id,
+                event_node_id,
+                "инициатор",
+                "restriction",
+                summary="Орган или должностное лицо выступает инициатором ограничения.",
+            )
+            self._map_add_edge(
+                edges,
+                edge_keys,
+                degree_map,
+                event_node_id,
+                target_node_id,
+                event.get("restriction_type") or "ограничение",
+                "restriction",
+                summary=event.get("stated_justification") or "Restriction event связывает инициатора и цель.",
+            )
+            content_id = event.get("source_content_id")
+            if content_id and self._table_exists("content_items"):
+                content_row = self.db.execute(
+                    """
+                    SELECT ci.id, ci.title, ci.body_text, ci.published_at, ci.content_type, s.name AS source_name
+                    FROM content_items ci
+                    LEFT JOIN sources s ON s.id = ci.source_id
+                    WHERE ci.id=?
+                    """,
+                    (int(content_id),),
+                ).fetchone()
+                if content_row:
+                    content = self._row_to_dict(content_row)
+                    content_node_id = f"content:{int(content['id'])}"
+                    self._map_ensure_node(
+                        node_map,
+                        content_node_id,
+                        "bridge_content",
+                        "Контент",
+                        content.get("title") or f"Content #{content_id}",
+                        " · ".join(
+                            value for value in [content.get("source_name"), content.get("published_at"), content.get("content_type")] if value
+                        ),
+                        description=content.get("body_text") or content.get("title") or f"Content #{content_id}",
+                        jump_screen="content",
+                        jump_id=int(content_id),
+                    )
+                    self._map_add_edge(
+                        edges,
+                        edge_keys,
+                        degree_map,
+                        content_node_id,
+                        event_node_id,
+                        "документ",
+                        "origin",
+                        summary="Документ или запись описывает restriction event.",
+                    )
+
     def _map_ensure_node(
         self,
         node_map: dict[str, dict[str, Any]],
@@ -1534,6 +1754,10 @@ class DashboardDataService:
                     display = f"Законопроект: {title}"
                 elif role == "bridge_contract":
                     display = f"Контракт: {title}"
+                elif role == "bridge_affiliation":
+                    display = f"Аффилиация: {title}"
+                elif role == "bridge_restriction":
+                    display = f"Ограничение: {title}"
                 else:
                     display = title
                 nodes.append(
@@ -1754,6 +1978,59 @@ class DashboardDataService:
             relations = relations[:30]
 
         detail = self._row_to_dict(row)
+        media = [
+            self._row_to_dict(item)
+            for item in self.db.execute(
+                """
+                SELECT em.id, em.media_kind, em.source_url, em.is_primary, a.file_path, a.mime_type
+                FROM entity_media em
+                JOIN attachments a ON a.id = em.attachment_id
+                WHERE em.entity_id=?
+                ORDER BY em.is_primary DESC, em.id DESC
+                LIMIT 10
+                """,
+                (entity_id,),
+            ).fetchall()
+        ] if self._table_exists("entity_media") else []
+        disclosures = [
+            self._row_to_dict(item)
+            for item in self.db.execute(
+                """
+                SELECT id, disclosure_year, income_amount, raw_income_text, source_url
+                FROM person_disclosures
+                WHERE entity_id=?
+                ORDER BY disclosure_year DESC, id DESC
+                LIMIT 20
+                """,
+                (entity_id,),
+            ).fetchall()
+        ] if self._table_exists("person_disclosures") else []
+        affiliations = [
+            self._row_to_dict(item)
+            for item in self.db.execute(
+                """
+                SELECT id, company_entity_id, company_name, role_type, role_title, source_url, evidence_class
+                FROM company_affiliations
+                WHERE entity_id=?
+                ORDER BY id DESC
+                LIMIT 20
+                """,
+                (entity_id,),
+            ).fetchall()
+        ] if self._table_exists("company_affiliations") else []
+        restrictions = [
+            self._row_to_dict(item)
+            for item in self.db.execute(
+                """
+                SELECT id, restriction_type, right_category, target_name, stated_justification, source_content_id
+                FROM restriction_events
+                WHERE issuer_entity_id=? OR target_entity_id=?
+                ORDER BY id DESC
+                LIMIT 20
+                """,
+                (entity_id, entity_id),
+            ).fetchall()
+        ] if self._table_exists("restriction_events") else []
         detail["entity_id"] = detail["id"]
         detail.update(
             {
@@ -1762,6 +2039,10 @@ class DashboardDataService:
                 "claims": claims,
                 "cases": cases,
                 "relations": relations,
+                "media": media,
+                "disclosures": disclosures,
+                "affiliations": affiliations,
+                "restrictions": restrictions,
             }
         )
         return detail
@@ -2123,6 +2404,127 @@ class DashboardDataService:
         ]
         items = [{"key": key, "value": self.settings.get(key)} for key in keys if key in self.settings]
         return {"items": items, "detail": {"project_root": str(Path.cwd())}}
+
+    def _review_ops_screen(self, filters: dict[str, Any]) -> dict[str, Any]:
+        queue_key = (filters.get("queue") or "").strip()
+        status = (filters.get("status") or "").strip()
+        query = self._query(filters.get("query") or "")
+        where = ["1=1"]
+        params: list[Any] = []
+        if queue_key:
+            where.append("queue_key=?")
+            params.append(queue_key)
+        if status:
+            where.append("status=?")
+            params.append(status)
+        rows = [
+            self._row_to_dict(row)
+            for row in self.db.execute(
+                f"""
+                SELECT id, task_key, queue_key, subject_type, subject_id, related_id,
+                       suggested_action, confidence, machine_reason, status, review_pack_id,
+                       created_at, updated_at
+                FROM review_tasks
+                WHERE {' AND '.join(where)}
+                ORDER BY
+                    CASE status WHEN 'open' THEN 0 WHEN 'needs_review' THEN 1 WHEN 'resolved' THEN 2 ELSE 3 END,
+                    confidence DESC,
+                    id DESC
+                LIMIT 240
+                """,
+                params,
+            ).fetchall()
+        ] if self._table_exists("review_tasks") else []
+        if query:
+            rows = [
+                row
+                for row in rows
+                if self._contains_query(
+                    query,
+                    row.get("task_key"),
+                    row.get("queue_key"),
+                    row.get("subject_type"),
+                    row.get("machine_reason"),
+                )
+            ]
+        selected_id = filters.get("selected_id") or (rows[0]["id"] if rows else None)
+        detail = None
+        if selected_id and self._table_exists("review_tasks"):
+            row = self.db.execute(
+                """
+                SELECT *
+                FROM review_tasks
+                WHERE id=?
+                """,
+                (selected_id,),
+            ).fetchone()
+            if row:
+                detail = self._row_to_dict(row)
+                try:
+                    detail["candidate_payload_json"] = json.loads(detail.get("candidate_payload") or "{}")
+                except json.JSONDecodeError:
+                    detail["candidate_payload_json"] = {}
+                try:
+                    detail["source_links"] = json.loads(detail.get("source_links_json") or "[]")
+                except json.JSONDecodeError:
+                    detail["source_links"] = []
+                detail["subject_summary"] = self._review_subject_summary(detail)
+                detail["candidate_payload_pretty"] = json.dumps(
+                    detail.get("candidate_payload_json") or {},
+                    ensure_ascii=False,
+                    indent=2,
+                )
+        queues = []
+        if self._table_exists("review_tasks"):
+            for row in self.db.execute(
+                """
+                SELECT queue_key,
+                       COUNT(*) AS total,
+                       SUM(CASE WHEN status='open' THEN 1 ELSE 0 END) AS open_total
+                FROM review_tasks
+                GROUP BY queue_key
+                ORDER BY queue_key
+                """
+            ).fetchall():
+                queues.append(self._row_to_dict(row))
+        return {"items": rows, "detail": detail, "queues": queues}
+
+    def _review_subject_summary(self, task: dict[str, Any]) -> str:
+        subject_type = task.get("subject_type")
+        subject_id = task.get("subject_id")
+        related_id = task.get("related_id")
+        if subject_type == "content_cluster" and subject_id and self._table_exists("content_clusters"):
+            row = self.db.execute(
+                "SELECT canonical_title, item_count FROM content_clusters WHERE id=?",
+                (subject_id,),
+            ).fetchone()
+            if row:
+                return f"{row[0] or 'content cluster'} · items {row[1] or 0}"
+        if subject_type == "person_disclosure" and subject_id and self._table_exists("person_disclosures"):
+            row = self.db.execute(
+                """
+                SELECT e.canonical_name, pd.disclosure_year, pd.income_amount
+                FROM person_disclosures pd
+                JOIN entities e ON e.id = pd.entity_id
+                WHERE pd.id=?
+                """,
+                (subject_id,),
+            ).fetchone()
+            if row:
+                return f"{row[0]} · {row[1]} · доход {row[2] or '—'}"
+        if subject_type == "company_affiliation" and subject_id and related_id and self._table_exists("entities"):
+            left = self.db.execute("SELECT canonical_name FROM entities WHERE id=?", (subject_id,)).fetchone()
+            right = self.db.execute("SELECT canonical_name FROM entities WHERE id=?", (related_id,)).fetchone()
+            if left or right:
+                return f"{(left[0] if left else subject_id)} -> {(right[0] if right else related_id)}"
+        if subject_type == "restriction_event" and subject_id and self._table_exists("restriction_events"):
+            row = self.db.execute(
+                "SELECT restriction_type, target_name, right_category FROM restriction_events WHERE id=?",
+                (subject_id,),
+            ).fetchone()
+            if row:
+                return f"{row[0] or 'restriction'} · {row[1] or '—'} · {row[2] or '—'}"
+        return ""
 
     def _count(self, table_name: str) -> int:
         if not self._table_exists(table_name):

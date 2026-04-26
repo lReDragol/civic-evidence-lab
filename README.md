@@ -25,6 +25,13 @@ Desktop dashboard только показывает состояние и вру
 ```powershell
 python -m runtime.healthcheck
 python -m runtime.run_job --job relations
+python -m runtime.run_job --job profiles_enrichment
+python -m runtime.run_job --job photo_backfill
+python -m runtime.run_job --job anticorruption_disclosures
+python -m runtime.run_job --job company_registry_enrichment
+python -m runtime.run_job --job restriction_corpus
+python -m runtime.run_job --job content_dedupe
+python -m runtime.run_job --job relation_rebuild_enriched
 python -m runtime.run_job --job classifier_audit
 python -m runtime.run_pipeline --mode nightly
 python -m runtime.daemon
@@ -36,6 +43,8 @@ Runtime пишет состояние прямо в `db/news_unified.db`:
 - `job_runs`, `job_leases`, `pipeline_runs`
 - `source_health_checks`, `source_sync_state`, `dead_letter_items`
 - `relation_candidates`, `relation_support`, `classifier_audit_samples`, `runtime_metadata`
+- `content_clusters`, `person_disclosures`, `declared_assets`, `company_affiliations`
+- `compensation_facts`, `restriction_events`, `entity_media`, `review_tasks`
 
 Nightly pipeline собирает `pipeline_version`, прогоняет `classifier_audit`/drift gate, пересобирает `db/news_analysis.db` и затем запускает Obsidian export.
 Локальный путь выгрузки берётся из `config/settings.json` через `obsidian_export_dir`; шаблон в `config/settings.example.json` по умолчанию указывает на `obsidian_export_graph`.
@@ -66,6 +75,34 @@ Web bundle лежит в `ui_web/`, bridge и controller-логика — в `ui
 python -m collectors.executive_directory_scraper
 ```
 
+## Enrichment contour
+
+Отдельный enrichment-контур строит персональные профили, фото, декларации,
+имущественные факты, аффилиации, ограничения и review packs поверх уже
+нормализованных `content_items/raw_blobs/attachments`.
+
+Основные enrichment job'ы:
+
+```powershell
+python -m runtime.run_job --job profiles_enrichment
+python -m runtime.run_job --job photo_backfill
+python -m runtime.run_job --job anticorruption_disclosures
+python -m runtime.run_job --job company_registry_enrichment
+python -m runtime.run_job --job state_company_reports
+python -m runtime.run_job --job restriction_corpus
+python -m runtime.run_job --job content_dedupe
+python -m runtime.run_job --job review_pack_export
+python -m runtime.run_job --job review_pack_import
+python -m runtime.run_job --job relation_rebuild_enriched
+```
+
+Новый UI-раздел `Проверка -> Review Ops` читает `review_tasks` и показывает
+очереди `content_duplicates`, `entity_duplicates`, `assets_affiliations`,
+`restrictions_justifications`.
+
+CSV review packs пишутся в каталог из `review_export_dir` / `review_import_dir`
+(`reports/review_packs` по умолчанию).
+
 ## Файловая модель
 
 - `raw_source_items` хранит исходный сигнал и сырой JSON.
@@ -94,7 +131,7 @@ python tools\build_analysis_snapshot.py
 python tools\export_obsidian.py --db .\db\news_analysis.db --vault .\obsidian_export_graph --mode graph
 ```
 
-Экспорт создаёт разделы `Sources`, `Content`, `Claims`, `Cases`, `Entities`, `Bills`, `VoteSessions`, `Contracts`, `Risks`, `WeakLinks`, `Tags`, `Files` и копирует медиа в `Attachments`. В `graph`-режиме index note также хранит `built_from_pipeline_version`.
+Экспорт создаёт разделы `Sources`, `Content`, `Claims`, `Cases`, `Entities`, `Bills`, `VoteSessions`, `Contracts`, `Risks`, `Profiles`, `Disclosures`, `Assets`, `Affiliations`, `Restrictions`, `ReviewPacks`, `WeakLinks`, `Tags`, `Files` и копирует медиа в `Attachments`. В `graph`-режиме index note также хранит `built_from_pipeline_version`.
 
 ## OCR fallback
 

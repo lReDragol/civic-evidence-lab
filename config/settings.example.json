@@ -60,6 +60,19 @@
     "deputies_playwright_fallback": false,
     "executive_directory_interval_seconds": 604800,
     "senators_interval_seconds": 604800,
+    "profiles_enrichment_interval_seconds": 604800,
+    "photo_backfill_interval_seconds": 86400,
+    "photo_backfill_limit": 400,
+    "anticorruption_disclosures_interval_seconds": 86400,
+    "company_registry_enrichment_interval_seconds": 86400,
+    "company_registry_enrichment_limit": 250,
+    "company_affiliations_profile_limit": 600,
+    "state_company_reports_interval_seconds": 604800,
+    "restriction_corpus_interval_seconds": 86400,
+    "content_dedupe_interval_seconds": 43200,
+    "review_pack_export_interval_seconds": 86400,
+    "review_pack_import_interval_seconds": 86400,
+    "relation_rebuild_enriched_interval_seconds": 86400,
     "youtube_interval_seconds": 86400,
     "rss_interval_seconds": 3600,
     "llm_interval_seconds": 43200,
@@ -74,6 +87,14 @@
     "log_file": "app.log",
 
     "obsidian_export_dir": "obsidian_export_graph",
+    "review_export_dir": "reports/review_packs",
+    "review_import_dir": "reports/review_packs",
+    "review_export_queues": [
+        "content_duplicates",
+        "entity_duplicates",
+        "assets_affiliations",
+        "restrictions_justifications"
+    ],
 
     "runtime": {
         "daemon_enabled": true,
