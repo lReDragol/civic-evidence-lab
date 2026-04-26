@@ -41,12 +41,42 @@ POSITION_MARKERS = (
     "директор",
     "начальник",
     "глава",
+    "губернатор",
+    "мэр",
+    "президент",
 )
+ORG_ALIAS_MAP = {
+    "сбербанк россии": "Сбербанк",
+    "сбербанк": "Сбербанк",
+    "российские железные дороги": "Российские железные дороги",
+    "ржд": "РЖД",
+    "росатом": "Росатом",
+    "ростех": "Ростех",
+    "ростелеком": "Ростелеком",
+    "роснефть": "Роснефть",
+    "газпром": "Газпром",
+    "втб": "ВТБ",
+    "камаз": "КАМАЗ",
+    "автоваз": "АвтоВАЗ",
+    "роскосмос": "Роскосмос",
+}
 FULL_NAME_STOPWORDS = {
     "заместитель",
     "председатель",
     "председателя",
+    "федерального",
+    "федеральной",
+    "федеральный",
+    "российской",
+    "российской",
+    "российская",
+    "российский",
+    "федерации",
     "правительства",
+    "собрания",
+    "президента",
+    "содружества",
+    "безопасности",
     "руководитель",
     "руководителя",
     "аппарата",
@@ -162,6 +192,199 @@ def normalize_position_title(value: str) -> str:
     if text:
         text = text[0].upper() + text[1:]
     return text
+
+
+def _dedupe_repeated_phrase(value: str) -> str:
+    text = clean_text(value)
+    if not text:
+        return ""
+    tokens = text.split()
+    if len(tokens) >= 6 and len(tokens) % 2 == 0:
+        half = len(tokens) // 2
+        if [item.casefold() for item in tokens[:half]] == [item.casefold() for item in tokens[half:]]:
+            return " ".join(tokens[:half])
+    return text
+
+
+def infer_position_from_context(full_name: str, context_text: str) -> str:
+    text = clean_text(context_text)
+    if not text:
+        return ""
+    if full_name:
+        text = clean_text(re.sub(re.escape(full_name), " ", text, flags=re.IGNORECASE))
+    text = re.sub(r"\b(?:подробнее|смотреть\s+биографию)\b", "", text, flags=re.IGNORECASE)
+    text = _dedupe_repeated_phrase(text).strip(" -–,;:,")
+    if looks_like_position(text):
+        return normalize_position_title(text)
+    for candidate in re.split(r"[\n;|]|(?<=\.)\s+", text):
+        candidate = clean_text(candidate.strip(" -–,;:,"))
+        if looks_like_position(candidate):
+            return normalize_position_title(candidate)
+    return ""
+
+
+def _normalize_org_name(name: str) -> str:
+    org = clean_text(name).strip(" -–,;:,")
+    org = re.sub(r"^(?:ПАО|ОАО|АО|ООО|ППК|ГК|ФГУП|ГУП|МУП)\s+", "", org, flags=re.IGNORECASE)
+    org = org.strip("«»\"' ")
+    replacements = (
+        (r"^Федеральной службы\b", "Федеральная служба"),
+        (r"^Федерального агентства\b", "Федеральное агентство"),
+        (r"^Федерального казначейства\b", "Федеральное казначейство"),
+        (r"^Федеральной налоговой службы\b", "Федеральная налоговая служба"),
+        (r"^Федеральной антимонопольной службы\b", "Федеральная антимонопольная служба"),
+        (r"^Федеральной таможенной службы\b", "Федеральная таможенная служба"),
+        (r"^Федеральной пробирной палаты\b", "Федеральная пробирная палата"),
+        (r"^Государственной фельдъегерской службы\b", "Государственная фельдъегерская служба"),
+        (r"^Службы внешней разведки\b", "Служба внешней разведки"),
+        (r"^Центрального банка\b", "Центральный банк"),
+        (r"^Конституционного Суда\b", "Конституционный Суд"),
+        (r"^Российской академии наук\b", "Российская академия наук"),
+        (r"^Российского фонда прямых инвестиций\b", "Российский фонд прямых инвестиций"),
+        (r"^Торгово-промышленной палаты\b", "Торгово-промышленная палата"),
+        (r"^Фонда пенсионного и социального страхования\b", "Фонд пенсионного и социального страхования"),
+        (r"^Федерального фонда обязательного медицинского страхования\b", "Федеральный фонд обязательного медицинского страхования"),
+    )
+    for pattern, replacement in replacements:
+        org = re.sub(pattern, replacement, org, flags=re.IGNORECASE)
+    normalized = normalize_text(org)
+    for key, value in ORG_ALIAS_MAP.items():
+        if key in normalized:
+            return value
+    return org
+
+
+def _normalize_region_organization(name: str) -> str:
+    org = clean_text(name)
+    lower = normalize_text(org)
+    if lower.endswith(" республики"):
+        tokens = org.split()
+        if tokens and normalize_text(tokens[-1]) == "республики":
+            normalized_tokens = []
+            for token in tokens[:-1]:
+                if token.endswith("ской"):
+                    normalized_tokens.append(f"{token[:-4]}ская")
+                elif token.endswith("ой"):
+                    normalized_tokens.append(f"{token[:-2]}ая")
+                elif token.endswith("ей"):
+                    normalized_tokens.append(f"{token[:-2]}яя")
+                else:
+                    normalized_tokens.append(token)
+            normalized_tokens.append("Республика")
+            return clean_text(" ".join(normalized_tokens))
+    if lower.endswith(" области"):
+        adj = org[: -len(" области")].strip()
+        if adj.endswith("ской"):
+            adj = f"{adj[:-4]}ская"
+        elif adj.endswith("ой"):
+            adj = f"{adj[:-2]}ая"
+        elif adj.endswith("ей"):
+            adj = f"{adj[:-2]}яя"
+        return clean_text(f"{adj} область")
+    if lower.endswith(" края"):
+        adj = org[: -len(" края")].strip()
+        if adj.endswith("ского"):
+            adj = f"{adj[:-5]}ский"
+        elif adj.endswith("ого"):
+            adj = f"{adj[:-3]}ый"
+        elif adj.endswith("его"):
+            adj = f"{adj[:-3]}ий"
+        return clean_text(f"{adj} край")
+    return org
+
+
+def infer_organization_from_position(position_title: str, fallback_organization: str = "") -> str:
+    title = clean_text(position_title)
+    fallback = clean_text(fallback_organization)
+    if not title:
+        return fallback
+
+    match = re.match(r"^(Губернатор)\s+(.+)$", title, flags=re.IGNORECASE)
+    if match:
+        return _normalize_region_organization(match.group(2))
+    match = re.match(r"^(Мэр)\s+(.+)$", title, flags=re.IGNORECASE)
+    if match:
+        return clean_text(match.group(2))
+    match = re.match(r"^(Глава\s+Республики)\s+(.+)$", title, flags=re.IGNORECASE)
+    if match:
+        return clean_text(f"{match.group(1)} {match.group(2)}")
+    match = re.match(r"^(?:Временно\s+исполняющий\s+обязанности\s+)?губернатора?\s+(.+)$", title, flags=re.IGNORECASE)
+    if match:
+        return _normalize_region_organization(match.group(1))
+    match = re.match(r"^(Глава)\s+(.+)$", title, flags=re.IGNORECASE)
+    if match:
+        return _normalize_region_organization(match.group(2))
+
+    if "аппарата правительства российской федерации" in normalize_text(title):
+        return "Аппарат Правительства Российской Федерации"
+    if "председатель правительства российской федерации" in normalize_text(title):
+        return "Правительство Российской Федерации"
+    if "председателя правительства российской федерации" in normalize_text(title):
+        return "Правительство Российской Федерации"
+    if "председатель государственной думы" in normalize_text(title) or "в государственной думе" in normalize_text(title):
+        return "Государственная Дума РФ"
+    if "совета федерации" in normalize_text(title):
+        return "Совет Федерации"
+    if "конституционного суда российской федерации" in normalize_text(title):
+        return "Конституционный Суд Российской Федерации"
+    if "управляющий делами президента российской федерации" in normalize_text(title):
+        return "Управление делами Президента Российской Федерации"
+    if "главного управления специальных программ президента российской федерации" in normalize_text(title):
+        return "Главное управление специальных программ Президента Российской Федерации"
+
+    quoted = re.search(
+        r"(?:ПАО|ОАО|АО|ООО|ППК|ГК|ФГУП|ГУП|МУП)?\s*[«\"]([^»\"]+)[»\"]",
+        title,
+        flags=re.IGNORECASE,
+    )
+    if quoted:
+        return _normalize_org_name(quoted.group(1))
+
+    normalized_title = normalize_text(title)
+    for key, value in ORG_ALIAS_MAP.items():
+        if key in normalized_title:
+            return value
+
+    extracted_patterns = (
+        r"^(?:Первый\s+)?Заместитель\s+Руководителя\s+(.+)$",
+        r"^(?:Первый\s+)?Заместитель\s+министра\s+(.+)$",
+        r"^Министр\s+(.+)$",
+        r"^Руководитель\s+(.+)$",
+        r"^Директор\s+(.+)$",
+        r"^Председатель\s+(.+)$",
+        r"^Президент,\s*председатель\s+правления\s+(.+)$",
+        r"^Председатель\s+правления\s+(.+)$",
+        r"^Президент\s+(.+)$",
+        r"^Генеральный\s+директор(?:\s*[-–]\s*председатель\s+правления)?\s+(.+)$",
+    )
+    for pattern in extracted_patterns:
+        match = re.match(pattern, title, flags=re.IGNORECASE)
+        if not match:
+            continue
+        org = clean_text(match.group(1))
+        if normalize_text(org) in {"службы", "агентства", "фонда", "палаты", "банка", "комиссии"}:
+            return fallback
+        if "в государственной думе" in normalize_text(org):
+            return "Государственная Дума РФ"
+        if "аппарата правительства российской федерации" in normalize_text(org):
+            return "Аппарат Правительства Российской Федерации"
+        return _normalize_org_name(org)
+
+    ministry = re.search(
+        r"(?:министр|заместитель\s+министра)\s+(.+)$",
+        title,
+        flags=re.IGNORECASE,
+    )
+    if ministry:
+        tail = clean_text(ministry.group(1))
+        if tail:
+            if normalize_text(tail).startswith("министерств"):
+                return tail
+            return clean_text(f"Министерство {tail}")
+
+    if fallback:
+        return fallback
+    return ""
 
 
 def slugify(value: str, fallback: str = "item") -> str:
@@ -332,6 +555,8 @@ def parse_profile_links_directory(
             "profile_url": profile_url,
             "context_text": clean_text(" ".join(context_candidates)),
         }
+        if not clean_text(person["position_title"]):
+            person["position_title"] = infer_position_from_context(full_name, person["context_text"])
         people.append(person)
     return people
 
@@ -736,8 +961,13 @@ def store_person_record(
     if not looks_like_full_name(full_name):
         raise ValueError(f"Invalid executive full name: {full_name!r}")
 
+    position_title = clean_text(person.get("position_title")) or infer_position_from_context(
+        clean_text(person.get("full_name")),
+        clean_text(person.get("context_text")),
+    )
     organization = clean_text(person.get("organization") or source_cfg.get("organization"))
-    position_title = clean_text(person.get("position_title"))
+    if not organization:
+        organization = infer_organization_from_position(position_title, clean_text(source_cfg.get("organization")))
     profile_url = clean_text(person.get("profile_url"))
     photo_url = clean_text(person.get("photo_url"))
     bio_text = clean_text(person.get("bio_text"))
@@ -902,14 +1132,29 @@ def _people_from_source(session, source_cfg: dict[str, Any], timeout: int = 25) 
             source_cfg.get("href_patterns") or [],
         )
 
-    people = [
-        {
-            **person,
-            "organization": clean_text(person.get("organization") or source_cfg.get("organization")),
-        }
-        for person in people
-        if looks_like_full_name(clean_text(person.get("full_name")))
-    ]
+    normalized_people: list[dict[str, Any]] = []
+    fallback_org = clean_text(source_cfg.get("organization"))
+    for person in people:
+        full_name = clean_text(person.get("full_name"))
+        if not looks_like_full_name(full_name):
+            continue
+        position_title = clean_text(person.get("position_title")) or infer_position_from_context(
+            full_name,
+            clean_text(person.get("context_text")),
+        )
+        organization = clean_text(person.get("organization")) or infer_organization_from_position(
+            position_title,
+            fallback_org,
+        )
+        normalized_people.append(
+            {
+                **person,
+                "full_name": full_name,
+                "position_title": position_title,
+                "organization": organization,
+            }
+        )
+    people = normalized_people
 
     if mode == "profile_links" and source_cfg.get("fetch_profiles"):
         detail_limit = int(source_cfg.get("detail_limit") or len(people))
@@ -973,20 +1218,35 @@ def _deactivate_missing_positions(
         (
             clean_text(person.get("full_name")),
             clean_text(person.get("position_title")),
-            organization,
+            clean_text(person.get("organization"))
+            or infer_organization_from_position(
+                clean_text(person.get("position_title")),
+                organization,
+            ),
         )
         for person in active_people
         if clean_text(person.get("position_title"))
     }
-    rows = conn.execute(
-        """
-        SELECT op.id, e.canonical_name, op.position_title, op.organization
-        FROM official_positions op
-        JOIN entities e ON e.id = op.entity_id
-        WHERE op.source_type=? AND op.organization=? AND op.is_active=1
-        """,
-        (source_type, organization),
-    ).fetchall()
+    if organization:
+        rows = conn.execute(
+            """
+            SELECT op.id, e.canonical_name, op.position_title, op.organization
+            FROM official_positions op
+            JOIN entities e ON e.id = op.entity_id
+            WHERE op.source_type=? AND op.organization=? AND op.is_active=1
+            """,
+            (source_type, organization),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT op.id, e.canonical_name, op.position_title, op.organization
+            FROM official_positions op
+            JOIN entities e ON e.id = op.entity_id
+            WHERE op.source_type=? AND op.is_active=1
+            """,
+            (source_type,),
+        ).fetchall()
     for row in rows:
         key = (
             clean_text(row["canonical_name"]),

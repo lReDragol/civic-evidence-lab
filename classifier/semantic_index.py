@@ -78,6 +78,7 @@ def build_semantic_index(settings: dict[str, Any] | None = None, top_k: int = 5,
                 SELECT id, COALESCE(title, '') || ' ' || COALESCE(body_text, '') AS text
                 FROM content_items
                 WHERE length(COALESCE(title, '') || COALESCE(body_text, '')) > 20
+                  AND COALESCE(status, '') != 'suppressed_template'
                 ORDER BY id DESC
                 LIMIT ?
                 """,

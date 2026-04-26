@@ -11,6 +11,72 @@ from config.db_utils import SCHEMA_PATH, exec_schema
 
 DAEMON_JOB_ID = "__daemon__"
 
+SOURCE_HEALTH_MATRIX: dict[str, dict[str, str]] = {
+    "government_news": {
+        "primary_transport": "requests",
+        "fallback_transport": "playwright",
+        "expected_cadence": "daily",
+        "quality_expectations": "html_listing",
+        "fixture_sample": "https://government.ru/news/",
+    },
+    "government_docs": {
+        "primary_transport": "requests",
+        "fallback_transport": "playwright",
+        "expected_cadence": "daily",
+        "quality_expectations": "document_listing",
+        "fixture_sample": "https://government.ru/docs/",
+    },
+    "kremlin_transcripts": {
+        "primary_transport": "requests",
+        "fallback_transport": "playwright",
+        "expected_cadence": "daily",
+        "quality_expectations": "html_listing",
+        "fixture_sample": "https://kremlin.ru/events/president/transcripts/",
+    },
+    "pravo_gov": {
+        "primary_transport": "requests",
+        "fallback_transport": "requests_insecure",
+        "expected_cadence": "daily",
+        "quality_expectations": "official_documents",
+        "fixture_sample": "https://pravo.gov.ru/",
+    },
+    "publication_pravo_https": {
+        "primary_transport": "requests_insecure",
+        "fallback_transport": "http",
+        "expected_cadence": "daily",
+        "quality_expectations": "official_publication",
+        "fixture_sample": "https://publication.pravo.gov.ru/",
+    },
+    "publication_pravo_http": {
+        "primary_transport": "http",
+        "fallback_transport": "requests_insecure",
+        "expected_cadence": "daily",
+        "quality_expectations": "official_publication",
+        "fixture_sample": "http://publication.pravo.gov.ru/",
+    },
+    "rosreestr_press_archive": {
+        "primary_transport": "requests_insecure",
+        "fallback_transport": "playwright",
+        "expected_cadence": "daily",
+        "quality_expectations": "archive_listing",
+        "fixture_sample": "https://rosreestr.gov.ru/press/archive/",
+    },
+    "rosreestr_press_news": {
+        "primary_transport": "requests_insecure",
+        "fallback_transport": "playwright",
+        "expected_cadence": "daily",
+        "quality_expectations": "news_listing",
+        "fixture_sample": "https://rosreestr.gov.ru/site/press/news/",
+    },
+    "senators": {
+        "primary_transport": "requests",
+        "fallback_transport": "playwright",
+        "expected_cadence": "weekly",
+        "quality_expectations": "directory_listing",
+        "fixture_sample": "http://council.gov.ru/events/news/",
+    },
+}
+
 
 def utc_now_naive() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0)
@@ -49,6 +115,49 @@ def json_loads(value: str | None, default: Any):
         return json.loads(value)
     except (TypeError, json.JSONDecodeError):
         return default
+
+
+def _classify_failure_class(*, error_text: str | None = None, http_status: int | None = None) -> str | None:
+    lowered = (error_text or "").lower()
+    if http_status in {403, 429}:
+        return "rate_limited" if http_status == 429 else "http_forbidden"
+    if http_status == 404:
+        return "not_found"
+    if http_status and http_status >= 500:
+        return "upstream_http"
+    if "timeout" in lowered:
+        return "timeout"
+    if "tls" in lowered or "ssl" in lowered or "certificate" in lowered or "cert" in lowered:
+        return "tls"
+    if "404" in lowered:
+        return "not_found"
+    if "403" in lowered:
+        return "http_forbidden"
+    if "429" in lowered:
+        return "rate_limited"
+    if "connection" in lowered or "reset by peer" in lowered:
+        return "connection"
+    if "snapshot" in lowered:
+        return "missing_snapshot"
+    if "placeholder" in lowered or "map.svg" in lowered or "banner" in lowered or "icon" in lowered:
+        return "bad_asset"
+    if lowered:
+        return "runtime_error"
+    return None
+
+
+def _quality_state_from_health(*, success: bool | None, state: str | None, last_error: str | None, warnings: list[str] | None = None) -> tuple[str, str | None, str | None]:
+    warning_text = "; ".join(str(item) for item in (warnings or []) if item)
+    combined_error = "; ".join(part for part in (last_error, warning_text) if part) or None
+    failure_class = _classify_failure_class(error_text=combined_error)
+    if success is False or state == "degraded":
+        return "degraded", combined_error or "healthcheck_failed", failure_class
+    if warning_text:
+        lowered = warning_text.lower()
+        if any(token in lowered for token in ("snapshot", "map.svg", "placeholder", "404", "ssl", "tls", "cert", "timeout")):
+            return "degraded", warning_text, _classify_failure_class(error_text=warning_text) or failure_class
+        return "warning", warning_text, failure_class
+    return "ok", None, None
 
 
 def ensure_runtime_schema(conn: sqlite3.Connection):
@@ -408,11 +517,14 @@ def update_source_sync_state(
     last_http_status: int | None = None,
     transport_mode: str | None = None,
     last_error: str | None = None,
+    quality_state: str | None = None,
+    quality_issue: str | None = None,
+    failure_class: str | None = None,
     metadata: dict[str, Any] | None = None,
 ):
     existing = conn.execute(
         """
-        SELECT consecutive_failures, metadata_json
+        SELECT consecutive_failures, metadata_json, quality_state, quality_issue, failure_class
         FROM source_sync_state
         WHERE source_key=?
         """,
@@ -437,17 +549,25 @@ def update_source_sync_state(
             resolved_state = "degraded"
         elif success is False:
             resolved_state = "warning"
+    resolved_quality_state = quality_state or (existing[2] if existing and existing[2] else None)
+    resolved_quality_issue = quality_issue if quality_issue is not None else (existing[3] if existing and existing[3] else None)
+    resolved_failure_class = failure_class or (existing[4] if existing and existing[4] else None)
+    if resolved_quality_state is None:
+        resolved_quality_state = "ok" if success is True else "degraded" if resolved_state == "degraded" else "warning" if resolved_state == "warning" else "unknown"
 
     conn.execute(
         """
         INSERT INTO source_sync_state(
-            source_key, source_id, state, last_success_at, last_attempt_at,
+            source_key, source_id, state, quality_state, quality_issue, failure_class, last_success_at, last_attempt_at,
             consecutive_failures, last_cursor, last_external_id, last_etag, last_hash,
             last_http_status, transport_mode, last_error, metadata_json
-        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(source_key) DO UPDATE SET
             source_id=COALESCE(excluded.source_id, source_sync_state.source_id),
             state=COALESCE(excluded.state, source_sync_state.state),
+            quality_state=COALESCE(excluded.quality_state, source_sync_state.quality_state),
+            quality_issue=COALESCE(excluded.quality_issue, source_sync_state.quality_issue),
+            failure_class=COALESCE(excluded.failure_class, source_sync_state.failure_class),
             last_success_at=COALESCE(excluded.last_success_at, source_sync_state.last_success_at),
             last_attempt_at=excluded.last_attempt_at,
             consecutive_failures=excluded.consecutive_failures,
@@ -464,6 +584,9 @@ def update_source_sync_state(
             source_key,
             source_id,
             resolved_state,
+            resolved_quality_state,
+            resolved_quality_issue,
+            resolved_failure_class,
             now if success else None,
             now,
             consecutive_failures,
@@ -496,6 +619,22 @@ def record_source_health_report(
             row = conn.execute("SELECT id FROM sources WHERE url=? LIMIT 1", (url,)).fetchone()
             source_id = int(row[0]) if row else None
 
+        health_meta = dict(SOURCE_HEALTH_MATRIX.get(source_key, {}))
+        health_meta.update(
+            {
+                "health_title": item.get("title"),
+                "final_url": item.get("final_url"),
+            }
+        )
+        failure_class = _classify_failure_class(
+            error_text=str(item.get("error") or ""),
+            http_status=int(item.get("status")) if item.get("status") is not None else None,
+        )
+        quality_state, quality_issue, resolved_failure_class = _quality_state_from_health(
+            success=bool(item.get("ok")),
+            state="degraded" if not item.get("ok") else "ok",
+            last_error=item.get("error"),
+        )
         conn.execute(
             """
             INSERT INTO source_health_checks(
@@ -530,10 +669,10 @@ def record_source_health_report(
             last_http_status=item.get("status"),
             transport_mode=transport_mode,
             last_error=item.get("error"),
-            metadata={
-                "health_title": item.get("title"),
-                "final_url": item.get("final_url"),
-            },
+            quality_state=quality_state,
+            quality_issue=quality_issue,
+            failure_class=resolved_failure_class or failure_class,
+            metadata=health_meta,
         )
         inserted += 1
         if not item.get("ok"):
@@ -605,7 +744,9 @@ def runtime_summary(conn: sqlite3.Connection) -> dict[str, Any]:
         ).fetchone()[0]
     ) if table_exists(conn, "relation_candidates") else 0
     degraded_sources = int(
-        conn.execute("SELECT COUNT(*) FROM source_sync_state WHERE state='degraded'").fetchone()[0]
+        conn.execute(
+            "SELECT COUNT(*) FROM source_sync_state WHERE COALESCE(quality_state, state)='degraded'"
+        ).fetchone()[0]
     ) if table_exists(conn, "source_sync_state") else 0
     dead_letters = int(
         conn.execute("SELECT COUNT(*) FROM dead_letter_items WHERE resolved_at IS NULL").fetchone()[0]

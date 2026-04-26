@@ -2,6 +2,7 @@ import logging
 import re
 import sqlite3
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -154,7 +155,6 @@ def process_claims_for_negation(settings=None, limit: int = 2000):
                      datetime.now().isoformat()),
                 )
             except Exception:
-                from datetime import datetime
                 pass
 
             for tag_row in conn.execute(
@@ -260,6 +260,21 @@ def process_tags_for_negation(settings=None, limit: int = 5000):
     log.info("Negation: adjusted %d tags (confidence reduced, :negated tags added)", adjusted)
     conn.close()
     return {"tags_adjusted": adjusted}
+
+
+def process_negations(settings=None, limit: int = 2000):
+    claims = process_claims_for_negation(settings=settings, limit=limit)
+    tags = process_tags_for_negation(settings=settings, limit=max(limit * 2, 5000))
+    return {
+        "ok": True,
+        "items_seen": int(claims.get("negated_claims", 0)) + int(claims.get("rebutted_claims", 0)) + int(tags.get("tags_adjusted", 0)),
+        "items_new": int(claims.get("negated_claims", 0)),
+        "items_updated": int(tags.get("tags_adjusted", 0)),
+        "artifacts": {
+            "claims": claims,
+            "tags": tags,
+        },
+    }
 
 
 def main():

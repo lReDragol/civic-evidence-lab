@@ -44,6 +44,18 @@ ADDITIVE_COLUMNS = {
         "candidate_state": "TEXT DEFAULT 'pending'",
         "explain_path_json": "TEXT",
     },
+    "relation_support": {
+        "support_class": "TEXT DEFAULT 'seed'",
+    },
+    "source_sync_state": {
+        "quality_state": "TEXT DEFAULT 'unknown'",
+        "quality_issue": "TEXT",
+        "failure_class": "TEXT",
+    },
+    "content_clusters": {
+        "representative_score": "REAL DEFAULT 0",
+        "suppression_reason": "TEXT",
+    },
 }
 
 ADDITIVE_SCHEMA_SQL = """
@@ -140,10 +152,12 @@ CREATE TABLE IF NOT EXISTS content_clusters (
     canonical_title TEXT,
     method          TEXT DEFAULT 'title_signature',
     similarity_score REAL DEFAULT 0,
+    representative_score REAL DEFAULT 0,
     item_count      INTEGER DEFAULT 0,
     first_seen_at   TEXT,
     last_seen_at    TEXT,
     status          TEXT DEFAULT 'active',
+    suppression_reason TEXT,
     metadata_json   TEXT,
     created_at      TEXT DEFAULT (datetime('now')),
     updated_at      TEXT DEFAULT (datetime('now')),
@@ -441,6 +455,20 @@ def ensure_additive_schema(conn: sqlite3.Connection):
         index_name="idx_relation_candidates_candidate_state",
         columns_sql="candidate_state",
         required_columns=("candidate_state",),
+    )
+    _create_index_if_columns_exist(
+        conn,
+        table_name="relation_support",
+        index_name="idx_relation_support_class",
+        columns_sql="support_class",
+        required_columns=("support_class",),
+    )
+    _create_index_if_columns_exist(
+        conn,
+        table_name="source_sync_state",
+        index_name="idx_source_sync_state_quality",
+        columns_sql="quality_state",
+        required_columns=("quality_state",),
     )
     conn.commit()
 

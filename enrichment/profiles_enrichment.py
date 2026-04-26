@@ -15,6 +15,117 @@ from enrichment.common import (
 )
 
 
+def _infer_legislative_position_and_org(row) -> tuple[str, str]:
+    position = clean_text(row["position"])
+    normalized = normalize_text(position)
+    if "сенатор" in normalized or "совет федерац" in normalized:
+        return position or "сенатор Российской Федерации", "Совет Федерации"
+    return position or "Депутат Государственной Думы", "Государственная Дума РФ"
+
+
+def _materialize_missing_deputy_positions(conn) -> int:
+    created = 0
+    rows = conn.execute(
+        """
+        SELECT
+            dp.entity_id,
+            dp.position,
+            dp.faction,
+            dp.region,
+            dp.biography_url
+        FROM deputy_profiles dp
+        WHERE dp.is_active=1
+          AND NOT EXISTS (
+              SELECT 1
+              FROM official_positions op
+              WHERE op.entity_id = dp.entity_id
+                AND COALESCE(op.is_active,1)=1
+          )
+        ORDER BY dp.entity_id
+        """
+    ).fetchall()
+    for row in rows:
+        position_title, organization = _infer_legislative_position_and_org(row)
+        conn.execute(
+            """
+            INSERT INTO official_positions(
+                entity_id, position_title, organization, region, faction,
+                started_at, source_url, source_type, is_active
+            ) VALUES(?,?,?,?,?,date('now'),?,?,1)
+            """,
+            (
+                int(row["entity_id"]),
+                position_title,
+                organization,
+                clean_text(row["region"]) or None,
+                clean_text(row["faction"]) or None,
+                clean_text(row["biography_url"]) or None,
+                "deputy_profile",
+            ),
+        )
+        created += 1
+    return created
+
+
+def _materialize_missing_official_positions_from_profiles(conn) -> int:
+    from collectors.executive_directory_scraper import infer_organization_from_position
+
+    created = 0
+    rows = conn.execute(
+        """
+        SELECT
+            c.id AS content_item_id,
+            c.url,
+            rs.raw_payload
+        FROM content_items c
+        JOIN raw_source_items rs ON rs.id = c.raw_item_id
+        WHERE c.content_type='official_profile'
+        ORDER BY c.id
+        """
+    ).fetchall()
+    for row in rows:
+        payload = parse_json(row["raw_payload"], {})
+        if not isinstance(payload, dict):
+            continue
+        entity_id = payload.get("entity_id")
+        if not entity_id:
+            continue
+        exists = conn.execute(
+            """
+            SELECT 1
+            FROM official_positions
+            WHERE entity_id=? AND COALESCE(is_active,1)=1
+            LIMIT 1
+            """,
+            (int(entity_id),),
+        ).fetchone()
+        if exists:
+            continue
+        position_title = clean_text(payload.get("position_title") or payload.get("position"))
+        organization = clean_text(payload.get("organization")) or infer_organization_from_position(position_title)
+        if not position_title or not organization:
+            continue
+        conn.execute(
+            """
+            INSERT INTO official_positions(
+                entity_id, position_title, organization, region, faction,
+                started_at, source_url, source_type, is_active
+            ) VALUES(?,?,?,?,?,date('now'),?,?,1)
+            """,
+            (
+                int(entity_id),
+                position_title,
+                organization,
+                clean_text(payload.get("region")) or None,
+                clean_text(payload.get("faction")) or None,
+                clean_text(payload.get("profile_url") or row["url"]) or None,
+                clean_text(payload.get("source_type")) or "official_profile",
+            ),
+        )
+        created += 1
+    return created
+
+
 def _normalize_existing_profile_rows(conn) -> int:
     updated = 0
     rows = conn.execute(
@@ -258,20 +369,28 @@ def run_profiles_enrichment(settings: dict[str, Any] | None = None) -> dict[str,
         normalized = _normalize_existing_profile_rows(conn)
         deputy_created, deputy_updated = _materialize_deputy_profiles(conn)
         official_created, official_updated = _materialize_official_profiles(conn)
+        deputy_position_backfill = _materialize_missing_deputy_positions(conn)
+        official_position_backfill = _materialize_missing_official_positions_from_profiles(conn)
         conn.commit()
         return {
             "ok": True,
-            "items_seen": deputy_created + deputy_updated + official_created + official_updated,
-            "items_new": deputy_created + official_created,
+            "items_seen": deputy_created
+            + deputy_updated
+            + official_created
+            + official_updated
+            + deputy_position_backfill
+            + official_position_backfill,
+            "items_new": deputy_created + official_created + deputy_position_backfill + official_position_backfill,
             "items_updated": deputy_updated + official_updated + normalized,
             "warnings": warnings,
             "artifacts": {
                 "normalized_profile_rows": normalized,
                 "deputy_profile_content": {"created": deputy_created, "updated": deputy_updated},
                 "official_profile_content": {"created": official_created, "updated": official_updated},
+                "deputy_position_backfill": deputy_position_backfill,
+                "official_position_backfill": official_position_backfill,
                 **collection_stats,
             },
         }
     finally:
         conn.close()
-

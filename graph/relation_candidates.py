@@ -394,17 +394,22 @@ def _candidate_state(
     calibrated_score: float,
     explain_path: list[dict[str, Any]],
 ) -> str:
-    has_support_layer = any(
+    has_evidence_support = any(
         (
             support_items > 0,
             support_sources > 0,
             support_domains > 0,
-            support_claim_cluster_count > 0,
             support_hard_evidence_count > 0,
+        )
+    )
+    has_support_layer = any(
+        (
+            has_evidence_support,
+            support_claim_cluster_count > 0,
             semantic_support_score >= 0.35,
         )
     )
-    if structural_seed_kind and not has_support_layer:
+    if structural_seed_kind and not has_evidence_support:
         return "seed_only"
     if (
         explain_path
@@ -415,8 +420,10 @@ def _candidate_state(
         )
     ):
         return "promoted"
-    if has_support_layer:
+    if has_evidence_support or (not structural_seed_kind and has_support_layer):
         return "review"
+    if structural_seed_kind:
+        return "seed_only"
     return "pending"
 
 
@@ -870,12 +877,13 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
                 conn.execute(
                     """
                     INSERT INTO relation_support(
-                        candidate_id, support_kind, content_item_id, source_id, domain, category, metadata_json
-                    ) VALUES(?,?,?,?,?,?,?)
+                        candidate_id, support_kind, support_class, content_item_id, source_id, domain, category, metadata_json
+                    ) VALUES(?,?,?,?,?,?,?,?)
                     """,
                     (
                         candidate_id,
                         "content",
+                        "evidence",
                         row["content_item_id"],
                         row["source_id"],
                         _normalize_domain(row["source_url"], row["source_id"]),
@@ -888,12 +896,13 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
             for claim_cluster_id in shared_claim_cluster_ids[:10]:
                 conn.execute(
                     """
-                    INSERT INTO relation_support(candidate_id, support_kind, metadata_json)
-                    VALUES(?,?,?)
+                    INSERT INTO relation_support(candidate_id, support_kind, support_class, metadata_json)
+                    VALUES(?,?,?,?)
                     """,
                     (
                         candidate_id,
                         "claim_cluster",
+                        "support",
                         json.dumps({"claim_cluster_id": claim_cluster_id}, ensure_ascii=False),
                     ),
                 )
@@ -902,12 +911,13 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
             if entity_semantic_score >= 0.35:
                 conn.execute(
                     """
-                    INSERT INTO relation_support(candidate_id, support_kind, metric_value, metadata_json)
-                    VALUES(?,?,?,?)
+                    INSERT INTO relation_support(candidate_id, support_kind, support_class, metric_value, metadata_json)
+                    VALUES(?,?,?,?,?)
                     """,
                     (
                         candidate_id,
                         "semantic_neighbor",
+                        "support",
                         entity_semantic_score,
                         json.dumps({"pair": [entity_a, entity_b]}, ensure_ascii=False),
                     ),
@@ -918,12 +928,13 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
                 for contract_id in sorted(contract_map.get(entity_a, set()) & contract_map.get(entity_b, set()))[:10]:
                     conn.execute(
                         """
-                        INSERT INTO relation_support(candidate_id, support_kind, metadata_json)
-                        VALUES(?,?,?)
+                        INSERT INTO relation_support(candidate_id, support_kind, support_class, metadata_json)
+                        VALUES(?,?,?,?)
                         """,
                         (
                             candidate_id,
                             "contract",
+                            "seed",
                             json.dumps({"contract_id": contract_id}, ensure_ascii=False),
                         ),
                     )
@@ -933,12 +944,13 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
                 for bill_id in sorted(bill_map.get(entity_a, set()) & bill_map.get(entity_b, set()))[:10]:
                     conn.execute(
                         """
-                        INSERT INTO relation_support(candidate_id, support_kind, metadata_json)
-                        VALUES(?,?,?)
+                        INSERT INTO relation_support(candidate_id, support_kind, support_class, metadata_json)
+                        VALUES(?,?,?,?)
                         """,
                         (
                             candidate_id,
                             "bill",
+                            "seed",
                             json.dumps({"bill_id": bill_id}, ensure_ascii=False),
                         ),
                     )
@@ -948,12 +960,13 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
                 for case_id in sorted(case_map.get(entity_a, set()) & case_map.get(entity_b, set()))[:10]:
                     conn.execute(
                         """
-                        INSERT INTO relation_support(candidate_id, support_kind, metadata_json)
-                        VALUES(?,?,?)
+                        INSERT INTO relation_support(candidate_id, support_kind, support_class, metadata_json)
+                        VALUES(?,?,?,?)
                         """,
                         (
                             candidate_id,
                             "case",
+                            "seed",
                             json.dumps({"case_id": case_id}, ensure_ascii=False),
                         ),
                     )
@@ -963,12 +976,13 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
                 for risk_id in sorted(risk_map.get(entity_a, set()) & risk_map.get(entity_b, set()))[:10]:
                     conn.execute(
                         """
-                        INSERT INTO relation_support(candidate_id, support_kind, metadata_json)
-                        VALUES(?,?,?)
+                        INSERT INTO relation_support(candidate_id, support_kind, support_class, metadata_json)
+                        VALUES(?,?,?,?)
                         """,
                         (
                             candidate_id,
                             "risk",
+                            "seed",
                             json.dumps({"risk_id": risk_id}, ensure_ascii=False),
                         ),
                     )
@@ -977,10 +991,10 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
             for tag_name in metrics["specific_tags"]:
                 conn.execute(
                     """
-                    INSERT INTO relation_support(candidate_id, support_kind, tag_name)
-                    VALUES(?,?,?)
+                    INSERT INTO relation_support(candidate_id, support_kind, support_class, tag_name)
+                    VALUES(?,?,?,?)
                     """,
-                    (candidate_id, "tag", tag_name),
+                    (candidate_id, "tag", "seed", tag_name),
                 )
                 support_rows_created += 1
 
@@ -996,12 +1010,13 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
             ):
                 conn.execute(
                     """
-                    INSERT INTO relation_support(candidate_id, support_kind, metric_value, metadata_json)
-                    VALUES(?,?,?,?)
+                    INSERT INTO relation_support(candidate_id, support_kind, support_class, metric_value, metadata_json)
+                    VALUES(?,?,?,?,?)
                     """,
                     (
                         candidate_id,
                         "metric",
+                        "seed",
                         float(metric_value),
                         json.dumps({"metric": metric_key}, ensure_ascii=False),
                     ),

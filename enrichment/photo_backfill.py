@@ -7,6 +7,8 @@ from typing import Any
 from urllib.parse import urlparse
 
 import requests
+from requests import exceptions as requests_exceptions
+import urllib3
 
 from db.file_store import attach_file
 from enrichment.common import (
@@ -23,6 +25,19 @@ from enrichment.common import (
 )
 
 
+SKIP_PHOTO_PATTERNS = (
+    "map.svg",
+    "placeholder",
+    "avatar-placeholder",
+    "no-photo",
+    "/icons/",
+    "/icon/",
+    "/banner",
+    "/banners/",
+)
+ALLOW_INSECURE_PHOTO_HOSTS = {"roskazna.gov.ru"}
+
+
 def _extension_for_response(url: str, mime_type: str) -> str:
     ext = mimetypes.guess_extension((mime_type or "").split(";")[0].strip()) or ""
     if ext:
@@ -31,6 +46,29 @@ def _extension_for_response(url: str, mime_type: str) -> str:
     if "." in path.rsplit("/", 1)[-1]:
         return f".{path.rsplit('.', 1)[-1]}"
     return ".bin"
+
+
+def _is_bad_photo_candidate(photo_url: str) -> bool:
+    lowered = clean_text(photo_url).lower()
+    if not lowered:
+        return True
+    return any(token in lowered for token in SKIP_PHOTO_PATTERNS)
+
+
+def _fetch_photo(session: requests.Session, photo_url: str) -> requests.Response:
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        response = session.get(photo_url, timeout=20, headers=headers)
+        response.raise_for_status()
+        return response
+    except requests_exceptions.SSLError:
+        host = (urlparse(photo_url).hostname or "").lower()
+        if host in ALLOW_INSECURE_PHOTO_HOSTS:
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+            response = session.get(photo_url, timeout=20, headers=headers, verify=False)
+            response.raise_for_status()
+            return response
+        raise
 
 
 def _collect_candidates(conn, limit: int):
@@ -148,6 +186,7 @@ def run_photo_backfill(settings: dict[str, Any] | None = None, *, limit: int = 1
     session = requests.Session()
     created = 0
     updated = 0
+    skipped_bad_assets = 0
     warnings: list[str] = []
     try:
         candidates = _collect_candidates(conn, effective_limit)
@@ -184,14 +223,19 @@ def run_photo_backfill(settings: dict[str, Any] | None = None, *, limit: int = 1
                     warnings.append(f"{candidate['entity_id']}: resolve-photo {error}")
             if not photo_url:
                 continue
+            if _is_bad_photo_candidate(photo_url):
+                skipped_bad_assets += 1
+                continue
             try:
-                response = session.get(photo_url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
-                response.raise_for_status()
+                response = _fetch_photo(session, photo_url)
             except Exception as error:
                 warnings.append(f"{candidate['entity_id']}: {error}")
                 continue
 
             mime_type = clean_text(response.headers.get("Content-Type")) or "application/octet-stream"
+            if "svg" in mime_type.lower():
+                skipped_bad_assets += 1
+                continue
             ext = _extension_for_response(photo_url, mime_type)
             photo_dir = ensure_dir(processed_root / "photos")
             file_name = f"{candidate['entity_id']}-{slugify(candidate['full_name'], 'photo')}{ext}"
@@ -288,6 +332,7 @@ def run_photo_backfill(settings: dict[str, Any] | None = None, *, limit: int = 1
             "items_new": created,
             "items_updated": updated,
             "warnings": warnings,
+            "artifacts": {"skipped_bad_assets": skipped_bad_assets},
         }
     finally:
         conn.close()

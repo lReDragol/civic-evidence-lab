@@ -39,6 +39,14 @@ def create_classifier_db(db_path: Path):
                     'Иноагент: Распутин Ярослав Иванович',
                     'Минюст включил в реестр иноагентов Распутина Ярослава Ивановича.',
                     'raw_signal'
+                ),
+                (
+                    103,
+                    1,
+                    'restriction_record',
+                    'РКН ограничил доступ к интернет-ресурсу',
+                    'Роскомнадзор ограничил доступ к интернет-ресурсу за нарушение требований законодательства.',
+                    'raw_signal'
                 );
             """
         )
@@ -91,6 +99,16 @@ class ClassifierV3Tests(unittest.TestCase):
                         """
                     ).fetchall()
                 }
+                tags_103 = {
+                    row["tag_name"]: row
+                    for row in conn.execute(
+                        """
+                        SELECT tag_name, namespace, normalized_tag, confidence_calibrated, decision_source
+                        FROM content_tags
+                        WHERE content_item_id=103
+                        """
+                    ).fetchall()
+                }
                 votes_101 = conn.execute(
                     "SELECT COUNT(*) FROM content_tag_votes WHERE content_item_id=101"
                 ).fetchone()[0]
@@ -117,7 +135,52 @@ class ClassifierV3Tests(unittest.TestCase):
             self.assertEqual(tags_102["иноагент"]["namespace"], "event")
             self.assertEqual(tags_102["иноагент"]["decision_source"], "classifier_v3")
             self.assertIsNotNone(tags_102["иноагент"]["confidence_calibrated"])
-            self.assertEqual([tuple(row) for row in processed_flags], [(101, 1), (102, 1)])
+            self.assertNotIn("технологии", tags_103)
+            self.assertNotIn("technology", tags_103)
+            self.assertNotIn("искусственный интеллект", tags_103)
+            self.assertEqual([tuple(row) for row in processed_flags], [(101, 1), (102, 1), (103, 1)])
+
+    def test_classifier_v3_cleans_legacy_generic_tags_on_strict_content_types(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "classifier.db"
+            create_classifier_db(db_path)
+            settings = {"db_path": str(db_path), "ensure_schema_on_connect": True}
+
+            conn = sqlite3.connect(db_path)
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO content_tags(
+                        content_item_id, tag_level, tag_name, namespace, normalized_tag,
+                        confidence, confidence_calibrated, tag_source, decision_source
+                    ) VALUES(103, 0, 'technology', 'topic', 'technology', 0.9, 0.9, 'granular', NULL)
+                    """
+                )
+                conn.execute(
+                    "UPDATE content_items SET classification_v3_processed=1 WHERE id=103"
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            result = classify_content_items(settings=settings, batch_size=20)
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["cleanup_deleted"], 1)
+
+            conn = sqlite3.connect(db_path)
+            try:
+                remaining = conn.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM content_tags
+                    WHERE content_item_id=103
+                      AND lower(COALESCE(normalized_tag, tag_name, ''))='technology'
+                    """
+                ).fetchone()[0]
+            finally:
+                conn.close()
+
+            self.assertEqual(remaining, 0)
 
     def test_failed_llm_v2_pass_does_not_mark_item_processed(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -129,7 +192,7 @@ class ClassifierV3Tests(unittest.TestCase):
                 result = classify_content_llm_v2(settings=settings, batch_size=20)
 
             self.assertEqual(result["classified"], 0)
-            self.assertEqual(result["failed"], 2)
+            self.assertEqual(result["failed"], 3)
 
             conn = sqlite3.connect(db_path)
             try:
@@ -139,7 +202,7 @@ class ClassifierV3Tests(unittest.TestCase):
             finally:
                 conn.close()
 
-            self.assertEqual(processed_flags, [(0,), (0,)])
+            self.assertEqual(processed_flags, [(0,), (0,), (0,)])
 
 
 if __name__ == "__main__":

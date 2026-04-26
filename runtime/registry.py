@@ -252,7 +252,45 @@ def _review_pack_import(settings: dict[str, Any]):
 
 
 def _tagger(settings: dict[str, Any]):
-    return __import__("classifier.tagger_v3", fromlist=["classify_content_items"]).classify_content_items(settings)
+    module = __import__("classifier.tagger_v3", fromlist=["classify_content_items"])
+    batch_size = max(100, int(settings.get("classifier_v3_batch_size", 1000) or 1000))
+    max_batches = max(1, int(settings.get("classifier_v3_max_batches", 100) or 100))
+    processed = 0
+    tags_written = 0
+    votes_written = 0
+    cleanup_deleted = 0
+    batches = 0
+    warnings: list[str] = []
+
+    for _ in range(max_batches):
+        result = module.classify_content_items(settings, batch_size=batch_size)
+        if not result.get("ok", True):
+            return result
+        batches += 1
+        processed += int(result.get("processed") or 0)
+        tags_written += int(result.get("tags_written") or 0)
+        votes_written += int(result.get("votes_written") or 0)
+        cleanup_deleted += int(result.get("cleanup_deleted") or 0)
+        if int(result.get("processed") or 0) <= 0:
+            break
+    else:
+        warnings.append(f"classifier_v3_max_batches_reached:{max_batches}")
+
+    return {
+        "ok": True,
+        "items_seen": processed,
+        "items_new": tags_written,
+        "items_updated": votes_written,
+        "warnings": warnings,
+        "artifacts": {
+            "processed": processed,
+            "tags_written": tags_written,
+            "votes_written": votes_written,
+            "cleanup_deleted": cleanup_deleted,
+            "batches": batches,
+            "batch_size": batch_size,
+        },
+    }
 
 
 def _llm(settings: dict[str, Any]):
@@ -372,6 +410,10 @@ def _classifier_audit(settings: dict[str, Any]):
     return __import__("classifier.audit", fromlist=["build_classifier_audit"]).build_classifier_audit(settings)
 
 
+def _quality_gate(settings: dict[str, Any]):
+    return __import__("quality.pipeline_gate", fromlist=["build_quality_gate"]).build_quality_gate(settings)
+
+
 def _backup(settings: dict[str, Any]):
     return __import__("db.backup", fromlist=["backup_database"]).backup_database()
 
@@ -461,6 +503,7 @@ JOB_SPECS = [
     JobSpec("relations", "Связи сущностей", "Анализ", 86400, "relations_interval_seconds", "graph", timeout_seconds=3600, runner=_relations),
     JobSpec("relation_rebuild_enriched", "Enriched relation rebuild", "Обогащение", 86400, "relation_rebuild_enriched_interval_seconds", "graph", timeout_seconds=7200, runner=_relation_rebuild_enriched),
     JobSpec("classifier_audit", "Classifier audit / drift gate", "Система", 86400, "classifier_audit_interval_seconds", "quality", timeout_seconds=3600, scheduled=False, runner=_classifier_audit),
+    JobSpec("quality_gate", "QA quality gate", "Система", 86400, "quality_gate_interval_seconds", "quality", timeout_seconds=3600, scheduled=False, runner=_quality_gate),
     JobSpec("analysis_snapshot", "Analysis snapshot", "Система", 86400, "analysis_snapshot_interval_seconds", "snapshot", timeout_seconds=10800, scheduled=False, runner=_build_analysis_snapshot),
     JobSpec("obsidian_export", "Obsidian graph export", "Система", 86400, "obsidian_export_interval_seconds", "export", timeout_seconds=10800, scheduled=False, runner=_obsidian_export),
     JobSpec("backup", "Бэкап БД", "Система", 86400, "backup_interval_seconds", "maintenance", timeout_seconds=3600, runner=_backup),
@@ -529,7 +572,16 @@ PIPELINE_JOB_IDS = {
         "state_company_reports",
         "restriction_corpus",
         "content_dedupe",
+        "tagger",
+        "ner",
+        "entity_resolve",
+        "quotes",
+        "claims",
+        "claim_cluster",
         "semantic_index",
+        "evidence_link",
+        "negation",
+        "authenticity",
         "structural_links",
         "entity_relation_builder",
         "relations",
@@ -537,8 +589,8 @@ PIPELINE_JOB_IDS = {
         "cases",
         "accountability",
         "risk_patterns",
-        "claim_cluster",
         "classifier_audit",
+        "quality_gate",
         "analysis_snapshot",
         "obsidian_export",
         "review_pack_export",

@@ -13,13 +13,16 @@ DEFAULT_CONFIG = {
     "gold_claims_target": 300,
     "gold_relations_target": 300,
     "gold_tags_target": 300,
+    "gold_duplicates_target": 300,
     "min_reviewed_per_kind": 30,
     "claims_precision_threshold": 0.85,
     "relations_precision_threshold": 0.80,
     "tags_precision_threshold": 0.85,
+    "duplicates_precision_threshold": 0.85,
     "claim_status_drift_threshold": 0.20,
     "relation_drift_threshold": 0.30,
     "tag_drift_threshold": 0.35,
+    "duplicate_drift_threshold": 0.30,
     "strict_gate": True,
     "report_path": str(PROJECT_ROOT / "reports" / "classifier_audit_latest.json"),
 }
@@ -216,6 +219,36 @@ def _sample_tag_rows(conn, limit: int) -> list[dict[str, Any]]:
     return _round_robin_sample(rows, limit=limit, group_key=lambda row: row["tag_name"])
 
 
+def _sample_duplicate_rows(conn, limit: int) -> list[dict[str, Any]]:
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='review_tasks'").fetchone() is None:
+        return []
+    rows = _row_dicts(
+        conn.execute(
+            """
+            SELECT
+                rt.id,
+                rt.subject_id,
+                COALESCE(rt.suggested_action, '') AS suggested_action,
+                COALESCE(rt.confidence, 0) AS confidence,
+                COALESCE(rt.machine_reason, '') AS machine_reason,
+                COALESCE(cc.cluster_type, 'document_dedupe') AS cluster_type,
+                COALESCE(cc.status, 'active') AS cluster_status,
+                COALESCE(cc.item_count, 0) AS item_count,
+                COALESCE(cc.canonical_title, '') AS canonical_title,
+                COALESCE(cc.updated_at, cc.created_at, '') AS seen_at
+            FROM review_tasks rt
+            LEFT JOIN content_clusters cc
+              ON cc.id = rt.subject_id
+            WHERE rt.queue_key='content_duplicates'
+            ORDER BY COALESCE(rt.confidence, 0) DESC, rt.id DESC
+            LIMIT ?
+            """,
+            (max(limit * 4, limit),),
+        ).fetchall()
+    )
+    return _round_robin_sample(rows, limit=limit, group_key=lambda row: row["suggested_action"] or row["cluster_type"])
+
+
 def _insert_samples(conn, *, batch_name: str, sample_kind: str, rows: list[dict[str, Any]]) -> int:
     inserted = 0
     for row in rows:
@@ -232,6 +265,9 @@ def _insert_samples(conn, *, batch_name: str, sample_kind: str, rows: list[dict[
         elif sample_kind == "tag_assignment":
             actual_label = str(row["tag_name"])
             target_ref = f"tag_assignment:{target_id}"
+        elif sample_kind == "content_duplicate":
+            actual_label = str(row["suggested_action"] or row["cluster_type"] or "content_duplicate")
+            target_ref = f"content_duplicate:{target_id}"
 
         conn.execute(
             """
@@ -286,6 +322,18 @@ def _current_distributions(conn) -> dict[str, dict[str, int]]:
         )
         if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='content_tags'").fetchone()
         else {},
+        "duplicate_actions": _distribution(
+            conn.execute(
+                """
+                SELECT COALESCE(suggested_action, 'unknown') AS suggested_action, COUNT(*)
+                FROM review_tasks
+                WHERE queue_key='content_duplicates'
+                GROUP BY COALESCE(suggested_action, 'unknown')
+                """
+            ).fetchall()
+        )
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='review_tasks'").fetchone()
+        else {},
     }
 
 
@@ -295,6 +343,7 @@ def _reviewed_distributions(conn) -> dict[str, dict[str, int]]:
             "claim_status": {},
             "relation_types": {},
             "top_tags": {},
+            "duplicate_actions": {},
         }
 
     def grouped(sample_kind: str) -> dict[str, int]:
@@ -315,6 +364,7 @@ def _reviewed_distributions(conn) -> dict[str, dict[str, int]]:
         "claim_status": grouped("claim"),
         "relation_types": grouped("relation_candidate"),
         "top_tags": grouped("tag_assignment"),
+        "duplicate_actions": grouped("content_duplicate"),
     }
 
 
@@ -334,16 +384,18 @@ def build_classifier_audit(settings: dict[str, Any] | None = None) -> dict[str, 
         claims = _sample_claim_rows(conn, int(cfg["gold_claims_target"]))
         relations = _sample_relation_rows(conn, int(cfg["gold_relations_target"]))
         tags = _sample_tag_rows(conn, int(cfg["gold_tags_target"]))
+        duplicates = _sample_duplicate_rows(conn, int(cfg["gold_duplicates_target"]))
 
         inserted = 0
         inserted += _insert_samples(conn, batch_name=batch_name, sample_kind="claim", rows=claims)
         inserted += _insert_samples(conn, batch_name=batch_name, sample_kind="relation_candidate", rows=relations)
         inserted += _insert_samples(conn, batch_name=batch_name, sample_kind="tag_assignment", rows=tags)
+        inserted += _insert_samples(conn, batch_name=batch_name, sample_kind="content_duplicate", rows=duplicates)
 
         live_distributions = _current_distributions(conn)
         reviewed_distributions = _reviewed_distributions(conn)
         reviewed_ready = any(
-            reviewed_distributions.get(key) for key in ("claim_status", "relation_types", "top_tags")
+            reviewed_distributions.get(key) for key in ("claim_status", "relation_types", "top_tags", "duplicate_actions")
         )
         preferred_kind = "reviewed" if reviewed_ready else "reviewed_pending"
         current_distributions = live_distributions
@@ -393,18 +445,24 @@ def build_classifier_audit(settings: dict[str, Any] | None = None) -> dict[str, 
                     current_distributions["top_tags"],
                     (baseline.get("top_tags") or {}),
                 ),
+                "duplicate_actions": _total_variation_distance(
+                    current_distributions["duplicate_actions"],
+                    (baseline.get("duplicate_actions") or {}),
+                ),
             }
         else:
             drift = {
                 "claim_status": 0.0,
                 "relation_types": 0.0,
                 "top_tags": 0.0,
+                "duplicate_actions": 0.0,
             }
 
         precision_thresholds = {
             "claim": float(cfg["claims_precision_threshold"]),
             "relation_candidate": float(cfg["relations_precision_threshold"]),
             "tag_assignment": float(cfg["tags_precision_threshold"]),
+            "content_duplicate": float(cfg["duplicates_precision_threshold"]),
         }
         min_reviewed = int(cfg["min_reviewed_per_kind"])
         degrade_reasons: list[str] = []
@@ -415,6 +473,8 @@ def build_classifier_audit(settings: dict[str, Any] | None = None) -> dict[str, 
                 degrade_reasons.append(f"relation_types_drift>{cfg['relation_drift_threshold']}")
             if drift["top_tags"] > float(cfg["tag_drift_threshold"]):
                 degrade_reasons.append(f"top_tags_drift>{cfg['tag_drift_threshold']}")
+            if drift["duplicate_actions"] > float(cfg["duplicate_drift_threshold"]):
+                degrade_reasons.append(f"duplicate_actions_drift>{cfg['duplicate_drift_threshold']}")
 
         for sample_kind, threshold in precision_thresholds.items():
             metrics = reviewed_metrics.get(sample_kind)
@@ -449,12 +509,14 @@ def build_classifier_audit(settings: dict[str, Any] | None = None) -> dict[str, 
                 "claim": int(cfg["gold_claims_target"]),
                 "relation_candidate": int(cfg["gold_relations_target"]),
                 "tag_assignment": int(cfg["gold_tags_target"]),
+                "content_duplicate": int(cfg["gold_duplicates_target"]),
             },
             "reviewed_baseline_ready": reviewed_ready,
             "samples_created": {
                 "claim": len(claims),
                 "relation_candidate": len(relations),
                 "tag_assignment": len(tags),
+                "content_duplicate": len(duplicates),
             },
             "reviewed_metrics": reviewed_metrics,
             "drift": drift,
@@ -483,7 +545,7 @@ def build_classifier_audit(settings: dict[str, Any] | None = None) -> dict[str, 
         fatal_errors = ["classifier_drift_gate_failed"] if degraded and bool(cfg.get("strict_gate", True)) else []
         return {
             "ok": not fatal_errors,
-            "items_seen": len(claims) + len(relations) + len(tags),
+            "items_seen": len(claims) + len(relations) + len(tags) + len(duplicates),
             "items_new": inserted,
             "items_updated": sum(int(metrics["reviewed"]) for metrics in reviewed_metrics.values()),
             "warnings": warnings,

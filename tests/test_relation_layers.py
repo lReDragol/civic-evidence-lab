@@ -180,6 +180,46 @@ def create_case_cluster_db(db_path: Path):
         conn.close()
 
 
+def create_case_claim_only_seed_db(db_path: Path):
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+        conn.executescript(
+            """
+            INSERT INTO sources(id, name, category, url, is_active) VALUES
+                (1, 'Seed Source', 'media', 'https://seed.example.test', 1);
+
+            INSERT INTO entities(id, entity_type, canonical_name) VALUES
+                (50, 'person', 'Фигурант В'),
+                (51, 'organization', 'Компания Г');
+
+            INSERT INTO content_items(id, source_id, content_type, title, body_text, status)
+            VALUES
+                (401, 1, 'article', 'Claim A', 'Claim body A', 'raw_signal'),
+                (402, 1, 'article', 'Claim B', 'Claim body B', 'raw_signal');
+
+            INSERT INTO claims(id, content_item_id, claim_text, claim_type, canonical_text, canonical_hash, claim_cluster_id, status)
+            VALUES
+                (901, 401, 'Совместное утверждение', 'fact', 'совместное утверждение', 'hash-1', 77, 'unverified'),
+                (902, 402, 'Совместное утверждение', 'fact', 'совместное утверждение', 'hash-1', 77, 'unverified');
+
+            INSERT INTO cases(id, title, description, case_type, status) VALUES
+                (950, 'Кейс 950', 'Case cluster only', 'investigation', 'open');
+
+            INSERT INTO case_claims(case_id, claim_id, role) VALUES
+                (950, 901, 'central'),
+                (950, 902, 'supporting');
+
+            INSERT INTO entity_mentions(entity_id, content_item_id, mention_type, confidence) VALUES
+                (50, 401, 'subject', 1.0),
+                (51, 402, 'organization', 1.0);
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 class RelationLayerTests(unittest.TestCase):
     def test_relation_extractor_requires_independent_sources_and_cleans_old_rows(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -270,7 +310,7 @@ class RelationLayerTests(unittest.TestCase):
             self.assertEqual(rows[0][5:8], (0, 0, 0))
             self.assertEqual(promoted, 0)
 
-    def test_relation_candidate_builder_moves_structural_seed_to_review_with_semantic_support(self):
+    def test_relation_candidate_builder_keeps_structural_seed_only_when_only_semantic_support_exists(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "relations.db"
             create_structural_relation_db(db_path)
@@ -313,7 +353,7 @@ class RelationLayerTests(unittest.TestCase):
 
             self.assertEqual(result["relation_candidates_created"], 1)
             self.assertEqual(row[0], "same_contract_cluster")
-            self.assertEqual(row[1:3], ("review", "review"))
+            self.assertEqual(row[1:3], ("seed_only", "seed_only"))
             self.assertGreaterEqual(float(row[3] or 0.0), 0.71)
             self.assertTrue(support)
 
@@ -410,6 +450,40 @@ class RelationLayerTests(unittest.TestCase):
             self.assertEqual(rows, [(40, 41, "same_case_cluster", "seed_only", "seed_only")])
             self.assertTrue(any(kind == "case" and '"case_id": 801' in metadata for kind, metadata in support))
             self.assertEqual(promoted, 0)
+
+    def test_relation_candidate_builder_does_not_move_case_seed_to_review_without_evidence_items(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "relations.db"
+            create_case_claim_only_seed_db(db_path)
+
+            result = rebuild_relation_candidates({"db_path": str(db_path)})
+
+            conn = sqlite3.connect(db_path)
+            try:
+                row = conn.execute(
+                    """
+                    SELECT entity_a_id, entity_b_id, candidate_type, promotion_state, candidate_state,
+                           support_items, support_sources, support_domains, support_claim_cluster_count
+                    FROM relation_candidates
+                    ORDER BY id
+                    LIMIT 1
+                    """
+                ).fetchone()
+                support_rows = conn.execute(
+                    """
+                    SELECT support_kind, metadata_json
+                    FROM relation_support
+                    ORDER BY id
+                    """
+                ).fetchall()
+            finally:
+                conn.close()
+
+            self.assertEqual(result["relation_candidates_created"], 1)
+            self.assertEqual(row[0:5], (50, 51, "same_case_cluster", "seed_only", "seed_only"))
+            self.assertEqual(row[5:8], (0, 0, 0))
+            self.assertEqual(row[8], 1)
+            self.assertTrue(any(kind == "claim_cluster" for kind, _ in support_rows))
 
 
 if __name__ == "__main__":

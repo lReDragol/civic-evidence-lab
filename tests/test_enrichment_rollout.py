@@ -111,6 +111,67 @@ class EnrichmentRolloutTests(unittest.TestCase):
             self.assertEqual(review_rows[0][2], "merge")
             self.assertEqual(review_rows[0][3], "open")
 
+    def test_content_dedupe_marks_repeated_cta_clusters_as_suppressed_templates(self):
+        from enrichment.content_dedupe import run_content_dedupe
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "enrichment.db"
+            create_db(db_path)
+
+            conn = sqlite3.connect(db_path)
+            try:
+                conn.executescript(
+                    """
+                    INSERT INTO sources(id, name, category, url, is_active)
+                    VALUES
+                        (1, 'Source A', 'telegram', 'https://t.me/a', 1),
+                        (2, 'Source B', 'telegram', 'https://t.me/b', 1),
+                        (3, 'Source C', 'telegram', 'https://t.me/c', 1);
+
+                    INSERT INTO content_items(id, source_id, external_id, content_type, title, body_text, published_at, url, status)
+                    VALUES
+                        (21, 1, 'tmpl-1', 'post', 'Москва подпишитесь на наш канал!', 'Москва подпишитесь на наш канал и следите за обновлениями.', '2026-04-20', 'https://t.me/a/21', 'raw_signal'),
+                        (22, 2, 'tmpl-2', 'post', 'Москва подпишитесь на наш канал!', 'Москва подпишитесь на наш канал и следите за обновлениями.', '2026-04-21', 'https://t.me/b/22', 'raw_signal'),
+                        (23, 3, 'tmpl-3', 'post', 'Москва подпишитесь на наш канал!', 'Москва подпишитесь на наш канал и следите за обновлениями.', '2026-04-22', 'https://t.me/c/23', 'raw_signal');
+                    """
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            result = run_content_dedupe({"db_path": str(db_path), "ensure_schema_on_connect": True}, min_cluster_size=2)
+
+            conn = sqlite3.connect(db_path)
+            try:
+                cluster = conn.execute(
+                    """
+                    SELECT cluster_type, status, suppression_reason
+                    FROM content_clusters
+                    ORDER BY id
+                    LIMIT 1
+                    """
+                ).fetchone()
+                statuses = conn.execute(
+                    "SELECT id, status FROM content_items WHERE id IN (21,22,23) ORDER BY id"
+                ).fetchall()
+                task = conn.execute(
+                    """
+                    SELECT queue_key, suggested_action
+                    FROM review_tasks
+                    ORDER BY id
+                    LIMIT 1
+                    """
+                ).fetchone()
+            finally:
+                conn.close()
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(cluster[0], "suppressed_template")
+            self.assertEqual(cluster[1], "suppressed")
+            self.assertTrue(cluster[2])
+            self.assertEqual(statuses, [(21, "suppressed_template"), (22, "suppressed_template"), (23, "suppressed_template")])
+            self.assertEqual(task, ("content_duplicates", "suppress_template"))
+
     def test_photo_backfill_materializes_entity_media_and_profile_content(self):
         from enrichment.photo_backfill import run_photo_backfill
 
@@ -651,6 +712,59 @@ class EnrichmentRolloutTests(unittest.TestCase):
                 [
                     (1001, 1002, "head_of", "company_affiliations", 1),
                     (1003, 1004, "restricted", "restriction_events", 1),
+                ],
+            )
+
+    def test_profiles_enrichment_backfills_missing_official_positions_from_deputy_profiles(self):
+        from enrichment.profiles_enrichment import run_profiles_enrichment
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "enrichment.db"
+            create_db(db_path)
+
+            conn = sqlite3.connect(db_path)
+            try:
+                conn.executescript(
+                    """
+                    INSERT INTO entities(id, entity_type, canonical_name, description)
+                    VALUES
+                        (1201, 'person', 'Володин Вячеслав Викторович', 'Председатель ГД'),
+                        (1202, 'person', 'Матвиенко Валентина Ивановна', 'Председатель Совета Федерации');
+
+                    INSERT INTO deputy_profiles(
+                        entity_id, full_name, position, faction, region, biography_url, photo_url, is_active
+                    ) VALUES
+                        (1201, 'Володин Вячеслав Викторович', 'Председатель ГД', 'Единая Россия', '', '', '', 1),
+                        (1202, 'Матвиенко Валентина Ивановна', 'сенатор Российской Федерации', '', 'Санкт-Петербург', '', '', 1);
+                    """
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            result = run_profiles_enrichment(
+                {"db_path": str(db_path), "ensure_schema_on_connect": True, "profiles_enrichment_collect": False}
+            )
+
+            conn = sqlite3.connect(db_path)
+            try:
+                positions = conn.execute(
+                    """
+                    SELECT entity_id, position_title, organization, faction, region, source_type
+                    FROM official_positions
+                    ORDER BY entity_id
+                    """
+                ).fetchall()
+            finally:
+                conn.close()
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(len(positions), 2)
+            self.assertEqual(
+                positions,
+                [
+                    (1201, "Председатель ГД", "Государственная Дума РФ", "Единая Россия", None, "deputy_profile"),
+                    (1202, "сенатор Российской Федерации", "Совет Федерации", None, "Санкт-Петербург", "deputy_profile"),
                 ],
             )
 

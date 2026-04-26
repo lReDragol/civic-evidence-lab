@@ -5,12 +5,13 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from runtime.runner import _heartbeat_loop, run_job_once
+from runtime.runner import _finalize_job_state, _heartbeat_loop, run_job_once
 from runtime.state import (
     acquire_job_lease,
     active_job_lease,
     force_recover_job,
     finish_job_run,
+    record_source_health_report,
     now_iso,
     parse_iso,
     recover_abandoned_runs,
@@ -20,6 +21,7 @@ from runtime.state import (
     set_runtime_metadata,
     start_job_run,
     get_runtime_metadata,
+    update_source_sync_state,
 )
 
 
@@ -213,6 +215,153 @@ class RuntimeStateTests(unittest.TestCase):
             _heartbeat_loop(fake_event, {}, "telegram", "owner-a", 60)
 
         heartbeat_mock.assert_called_once()
+
+    def test_update_source_sync_state_persists_quality_state_and_failure_class(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "runtime.db"
+            create_db(db_path)
+
+            conn = sqlite3.connect(db_path)
+            try:
+                update_source_sync_state(
+                    conn,
+                    source_key="government_news",
+                    success=False,
+                    state="degraded",
+                    transport_mode="healthcheck",
+                    last_error="ConnectTimeout: example",
+                    metadata={"fixture_sample": "https://government.ru/news/"},
+                    quality_state="degraded",
+                    quality_issue="timeout on primary transport",
+                    failure_class="timeout",
+                )
+                row = conn.execute(
+                    """
+                    SELECT state, quality_state, quality_issue, failure_class, transport_mode, metadata_json
+                    FROM source_sync_state
+                    WHERE source_key='government_news'
+                    """
+                ).fetchone()
+            finally:
+                conn.close()
+
+            self.assertEqual(row[0], "degraded")
+            self.assertEqual(row[1], "degraded")
+            self.assertIn("timeout", row[2])
+            self.assertEqual(row[3], "timeout")
+            self.assertEqual(row[4], "healthcheck")
+            self.assertIn("fixture_sample", row[5])
+
+    def test_record_source_health_report_classifies_failure_and_quality_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "runtime.db"
+            create_db(db_path)
+
+            conn = sqlite3.connect(db_path)
+            try:
+                conn.execute(
+                    "INSERT INTO sources(id, name, category, url, is_active) VALUES(1, 'Gov', 'official_site', 'https://government.ru/news/', 1)"
+                )
+                conn.commit()
+
+                stats = record_source_health_report(
+                    conn,
+                    {
+                        "items": [
+                            {
+                                "source": "government_news",
+                                "url": "https://government.ru/news/",
+                                "ok": False,
+                                "status": None,
+                                "error": "ConnectTimeout: HTTPSConnectionPool(...)",
+                                "checked_at": "2026-04-26T12:00:00",
+                            }
+                        ]
+                    },
+                    transport_mode="healthcheck",
+                )
+                row = conn.execute(
+                    """
+                    SELECT state, quality_state, failure_class, metadata_json
+                    FROM source_sync_state
+                    WHERE source_key='government_news'
+                    """
+                ).fetchone()
+            finally:
+                conn.close()
+
+            self.assertEqual(stats, {"inserted": 1, "degraded": 1})
+            self.assertEqual(row[0], "degraded")
+            self.assertEqual(row[1], "degraded")
+            self.assertEqual(row[2], "timeout")
+            self.assertIn("fixture_sample", row[3])
+
+    def test_finalize_job_state_retries_when_runtime_metadata_hits_database_lock(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "runtime.db"
+            create_db(db_path)
+            settings = {"db_path": str(db_path), "ensure_schema_on_connect": True}
+
+            conn = sqlite3.connect(db_path)
+            try:
+                run_id = start_job_run(
+                    conn,
+                    job_id="dummy",
+                    trigger_mode="manual",
+                    requested_by="test",
+                    owner="owner-a",
+                )
+                acquire_job_lease(conn, "dummy", "owner-a", ttl_seconds=300)
+            finally:
+                conn.close()
+
+            spec = SimpleNamespace(id="dummy", source_keys=())
+            result = {
+                "ok": True,
+                "job_id": "dummy",
+                "started_at": "2026-04-26T12:00:00",
+                "finished_at": "2026-04-26T12:00:01",
+                "items_seen": 1,
+                "items_new": 0,
+                "items_updated": 0,
+                "warnings": [],
+                "retriable_errors": [],
+                "fatal_errors": [],
+                "artifacts": {},
+            }
+
+            from runtime import state as runtime_state_module
+
+            call_state = {"calls": 0}
+
+            def flaky_set_runtime_metadata(conn, key, value):
+                call_state["calls"] += 1
+                if call_state["calls"] == 1:
+                    raise sqlite3.OperationalError("database is locked")
+                return runtime_state_module.set_runtime_metadata(conn, key, value)
+
+            with patch("runtime.runner.set_runtime_metadata", side_effect=flaky_set_runtime_metadata):
+                _finalize_job_state(
+                    settings,
+                    job_id="dummy",
+                    owner="owner-a",
+                    run_id=run_id,
+                    spec=spec,
+                    result=result,
+                    pipeline_version=None,
+                )
+
+            conn = sqlite3.connect(db_path)
+            try:
+                row = conn.execute("SELECT status, finished_at FROM job_runs WHERE id=?", (run_id,)).fetchone()
+                lease_count = conn.execute("SELECT COUNT(*) FROM job_leases WHERE job_id='dummy'").fetchone()[0]
+                last_finished = get_runtime_metadata(conn, "last_job_finished:dummy")
+            finally:
+                conn.close()
+
+            self.assertEqual(row[0], "ok")
+            self.assertEqual(lease_count, 0)
+            self.assertEqual(last_finished, "2026-04-26T12:00:01")
 
 
 if __name__ == "__main__":

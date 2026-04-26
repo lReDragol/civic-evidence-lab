@@ -14,6 +14,15 @@ from config.db_utils import get_db, load_settings
 log = logging.getLogger(__name__)
 
 GENERIC_TAGS = {"technology", "international", "regional", "технологии", "искусственный интеллект", "ес"}
+STRICT_CONTENT_PRIORS = {
+    "official_profile",
+    "deputy_profile",
+    "executive_profile",
+    "restriction_record",
+    "company_report",
+    "declaration",
+    "anticorruption_declaration",
+}
 PARLIAMENT_CONTEXT = (
     "депутат",
     "госдум",
@@ -147,6 +156,15 @@ def _strong_context_for_generic(normalized_text: str, normalized_tag: str) -> bo
     return any(pattern in normalized_text for pattern in patterns)
 
 
+def _allow_generic_tag_for_content_type(content_type: str, normalized_text: str, normalized_tag: str, support_votes: int) -> bool:
+    lowered_type = _normalize(content_type)
+    if lowered_type in STRICT_CONTENT_PRIORS:
+        return False
+    if support_votes >= 2 and _strong_context_for_generic(normalized_text, normalized_tag):
+        return True
+    return _strong_context_for_generic(normalized_text, normalized_tag)
+
+
 def _upsert_final_tag(
     conn: sqlite3.Connection,
     *,
@@ -196,11 +214,47 @@ def _upsert_final_tag(
         )
 
 
+def _cleanup_strict_generic_tags(conn: sqlite3.Connection) -> int:
+    content_types = ",".join("?" * len(STRICT_CONTENT_PRIORS))
+    generic_tags = ",".join("?" * len(GENERIC_TAGS))
+    params = tuple(sorted(STRICT_CONTENT_PRIORS)) + tuple(sorted(GENERIC_TAGS))
+    existing = conn.execute(
+        f"""
+        SELECT COUNT(*)
+        FROM content_tags ct
+        JOIN content_items ci ON ci.id = ct.content_item_id
+        WHERE COALESCE(ci.content_type, '') IN ({content_types})
+          AND lower(COALESCE(ct.normalized_tag, ct.tag_name, '')) IN ({generic_tags})
+          AND COALESCE(ct.decision_source, '') <> 'manual_review'
+        """,
+        params,
+    ).fetchone()
+    deleted = int(existing[0] or 0) if existing else 0
+    if deleted <= 0:
+        return 0
+    conn.execute(
+        f"""
+        DELETE FROM content_tags
+        WHERE id IN (
+            SELECT ct.id
+            FROM content_tags ct
+            JOIN content_items ci ON ci.id = ct.content_item_id
+            WHERE COALESCE(ci.content_type, '') IN ({content_types})
+              AND lower(COALESCE(ct.normalized_tag, ct.tag_name, '')) IN ({generic_tags})
+              AND COALESCE(ct.decision_source, '') <> 'manual_review'
+        )
+        """,
+        params,
+    )
+    return deleted
+
+
 def classify_content_items(settings: dict[str, Any] | None = None, batch_size: int = 1000) -> dict[str, Any]:
     settings = settings or load_settings()
     conn = get_db(settings)
     conn.row_factory = sqlite3.Row
     try:
+        cleaned_generic_tags = _cleanup_strict_generic_tags(conn)
         content_columns = {row[1] for row in conn.execute("PRAGMA table_info(content_items)").fetchall()}
         if "classification_v3_processed" in content_columns:
             conn.execute(
@@ -220,23 +274,32 @@ def classify_content_items(settings: dict[str, Any] | None = None, batch_size: i
             )
         rows = conn.execute(
             """
-            SELECT id, title, body_text
+            SELECT id, content_type, title, body_text, status
             FROM content_items
             WHERE (length(body_text) > 5 OR length(title) > 3)
               AND COALESCE(classification_v3_processed, 0) = 0
+              AND COALESCE(status, '') != 'suppressed_template'
             ORDER BY id
             LIMIT ?
             """,
             (batch_size,),
         ).fetchall()
         if not rows:
-            return {"ok": True, "processed": 0, "tags_written": 0, "votes_written": 0}
+            conn.commit()
+            return {
+                "ok": True,
+                "processed": 0,
+                "tags_written": 0,
+                "votes_written": 0,
+                "cleanup_deleted": cleaned_generic_tags,
+            }
 
         processed = 0
         tags_written = 0
         votes_written = 0
         for row in rows:
             content_id = int(row["id"])
+            content_type = str(row["content_type"] or "")
             text = f"{row['title'] or ''}\n{row['body_text'] or ''}".strip()
             norm_text = _normalize(text)
             has_parliament_context = any(ctx in norm_text for ctx in PARLIAMENT_CONTEXT)
@@ -257,7 +320,7 @@ def classify_content_items(settings: dict[str, Any] | None = None, batch_size: i
                     generic = normalized_tag in GENERIC_TAGS
                     strong_context = _strong_context_for_generic(norm_text, normalized_tag)
                     vote_value = "support"
-                    if generic and not strong_context:
+                    if generic and not _allow_generic_tag_for_content_type(content_type, norm_text, normalized_tag, 1):
                         vote_value = "abstain"
                     evidence_text = ""
                     level_explanations = explanations.get(level, [])
@@ -300,8 +363,7 @@ def classify_content_items(settings: dict[str, Any] | None = None, batch_size: i
                 namespace = _namespace_for(tag_name, 0)
                 normalized_tag = _normalized_tag(tag_name)
                 generic = normalized_tag in GENERIC_TAGS
-                strong_context = _strong_context_for_generic(norm_text, normalized_tag)
-                vote_value = "support" if (not generic or strong_context) else "abstain"
+                vote_value = "support" if (not generic or _allow_generic_tag_for_content_type(content_type, norm_text, normalized_tag, 1)) else "abstain"
                 _record_vote(
                     conn,
                     content_item_id=content_id,
@@ -396,7 +458,12 @@ def classify_content_items(settings: dict[str, Any] | None = None, batch_size: i
 
             for payload in supported.values():
                 generic = payload["normalized_tag"] in GENERIC_TAGS
-                if generic and payload["votes"] < 2 and not _strong_context_for_generic(norm_text, payload["normalized_tag"]):
+                if generic and not _allow_generic_tag_for_content_type(
+                    content_type,
+                    norm_text,
+                    payload["normalized_tag"],
+                    int(payload["votes"]),
+                ):
                     continue
                 raw_conf = round(payload["score_sum"] / max(1, payload["votes"]), 4)
                 calibrated = _calibrate_confidence(raw_conf, payload["votes"])
@@ -424,6 +491,7 @@ def classify_content_items(settings: dict[str, Any] | None = None, batch_size: i
             "processed": processed,
             "tags_written": tags_written,
             "votes_written": votes_written,
+            "cleanup_deleted": cleaned_generic_tags,
         }
     finally:
         conn.close()

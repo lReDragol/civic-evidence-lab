@@ -17,6 +17,24 @@
     "notes": "Руководство и министры Правительства РФ"
   },
   {
+    "key": "government_people",
+    "enabled": true,
+    "name": "Правительство РФ — персоналии",
+    "organization": "",
+    "category": "official_site",
+    "subcategory": "executive_directory",
+    "url": "http://government.ru/persons/",
+    "mode": "profile_links",
+    "href_patterns": [
+      "/persons/"
+    ],
+    "fetch_profiles": true,
+    "detail_limit": 260,
+    "credibility_tier": "A",
+    "update_frequency": "weekly",
+    "notes": "Единый каталог персоналий: губернаторы, главы субъектов, мэр Москвы, руководители корпораций и ведомств."
+  },
+  {
     "key": "minfin",
     "enabled": true,
     "name": "Минфин России — руководство",

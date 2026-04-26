@@ -5,6 +5,7 @@ import os
 import re
 import sqlite3
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -408,6 +409,7 @@ def process_claims_for_content(
         FROM content_items c
         JOIN sources s ON s.id = c.source_id
         WHERE (length(c.body_text) > 5 OR length(c.title) > 10)
+          AND COALESCE(c.status, '') != 'suppressed_template'
         LIMIT ?
         """,
         (content_limit,),
@@ -546,11 +548,13 @@ def process_claims_for_content(
             verified += 1
         else:
             if external_checks and SITE_SEARCH_AVAILABLE:
+                conn.commit()
                 site_results = verify_claim_with_site_search(claim_id, claim_text, settings)
                 if site_results > 0:
                     verified += 1
                     continue
             conn.execute("UPDATE claims SET status='unverified', needs_review=1 WHERE id=?", (claim_id,))
+        conn.commit()
 
     conn.commit()
 

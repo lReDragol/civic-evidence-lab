@@ -1979,6 +1979,12 @@ tass.ru (иногда)
 
 ## 21) Закрыто в последнем проходе
 
+- [x] Добавить mixed-source executive collector `government_people` на `http://government.ru/persons/`: теперь live enrichment тянет губернаторов, глав субъектов, мэра Москвы, руководителей агентств и топ госкомпаний из рабочего каталога персоналий.
+- [x] Добавить backfill `official_positions` из уже собранных `deputy_profiles` и `official_profile` payload, чтобы профиль не оставался без активной должности.
+- [x] Расширить inference должностей/организаций для `government_people`: `губернатор / глава / врио губернатора / заместитель Председателя Правительства / федеральные службы и агентства / управление делами Президента / Конституционный Суд` теперь материализуются в канонические `official_positions`.
+- [x] Прогнать live `profiles_enrichment` после этих фиксов: `official_positions_active=1019`, `executive_directory:government_people=212`, `deputy_profile positions=139`.
+- [x] Прогнать live `photo_backfill` на расширенном profile-corpus: `entity_media_total=433`, `entity_media_photo=433`, `attachments(photo)=10377`; основные остаточные ошибки связаны с TLS/cert у `roskazna.gov.ru`.
+- [x] Пересобрать `analysis_snapshot` и `obsidian_export` после enrichment-роста; Obsidian note groups обновлены, `Profiles=1009`.
 - [x] Убрать дубли и низкосигнальный шум в карточках `Дела`: однословные claims вроде `заявил`, `сказал`, `допрос`, `задержан` теперь скрываются в UI и больше не проходят в новые auto-cases через `cases.builder`.
 - [x] Сделать связи человекочитаемыми в web UI: `works_at`, `party_member`, `sponsored_bill` и т.п. теперь отдаются с human label, пояснением `почему связаны`, readable layer/detected-by и контекстом законопроекта/evidence.
 - [x] Сделать связи и связанные сущности кликабельными: из detail-pane можно перейти в `Сущности`, `Claims`, `Cases`, `Контент`, `Связи`.

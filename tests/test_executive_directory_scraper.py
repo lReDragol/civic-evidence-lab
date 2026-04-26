@@ -89,6 +89,24 @@ GOVERNMENT_INLINE_HTML = """
 """
 
 
+GOVERNMENT_GOVERNOR_HTML = """
+<html>
+  <body>
+    <section>
+      <article class="person-card">
+        <a href="/persons/705/">Авдеев Александр Александрович</a>
+        <div>Губернатор Владимирской области</div>
+      </article>
+      <article class="person-card">
+        <a href="/persons/580/">Собянин Сергей Семёнович</a>
+        <div>Мэр Москвы</div>
+      </article>
+    </section>
+  </body>
+</html>
+"""
+
+
 PROFILE_PAGE_HTML = """
 <html>
   <body>
@@ -216,6 +234,19 @@ class ExecutiveDirectoryScraperTests(unittest.TestCase):
             people[0]["profile_url"],
             "https://example.test/gov/persons/621/",
         )
+
+    def test_parse_profile_links_directory_infers_governor_and_mayor_from_context(self):
+        people = parse_profile_links_directory(
+            GOVERNMENT_GOVERNOR_HTML,
+            "http://example.test/persons/",
+            href_patterns=["/persons/"],
+        )
+
+        self.assertEqual(len(people), 2)
+        self.assertEqual(people[0]["full_name"], "Авдеев Александр Александрович")
+        self.assertEqual(people[0]["position_title"], "Губернатор Владимирской области")
+        self.assertEqual(people[1]["full_name"], "Собянин Сергей Семёнович")
+        self.assertEqual(people[1]["position_title"], "Мэр Москвы")
 
     def test_parse_profile_page_prefers_local_bio_block_and_trims_footer_noise(self):
         parsed = parse_profile_page(PROFILE_PAGE_HTML, "https://example.test/roskazna/person/22")
@@ -441,6 +472,102 @@ class ExecutiveDirectoryScraperTests(unittest.TestCase):
                     ("Заместитель руководителя", 0),
                     ("Первый заместитель руководителя", 1),
                 ],
+            )
+
+    def test_store_person_record_infers_region_and_company_organization_when_source_cfg_has_none(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "executive.db"
+            create_db(db_path)
+
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            try:
+                source_cfg = {
+                    "key": "government_people",
+                    "name": "Правительство РФ — фигуранты",
+                    "organization": "",
+                    "url": "http://example.test/persons/",
+                    "category": "official_site",
+                    "subcategory": "executive_directory",
+                }
+                source_id = ensure_source(conn, source_cfg)
+
+                store_person_record(
+                    conn,
+                    source_id,
+                    source_cfg,
+                    {
+                        "full_name": "Авдеев Александр Александрович",
+                        "position_title": "Губернатор Владимирской области",
+                        "profile_url": "http://example.test/persons/705/",
+                    },
+                )
+                store_person_record(
+                    conn,
+                    source_id,
+                    source_cfg,
+                    {
+                        "full_name": "Греф Герман Оскарович",
+                        "position_title": "Президент, председатель правления ПАО «Сбербанк России»",
+                        "profile_url": "http://example.test/persons/900/",
+                    },
+                )
+                store_person_record(
+                    conn,
+                    source_id,
+                    source_cfg,
+                    {
+                        "full_name": "Егоров Даниил Вячеславович",
+                        "position_title": "Руководитель Федеральной налоговой службы",
+                        "profile_url": "http://example.test/persons/901/",
+                    },
+                )
+                store_person_record(
+                    conn,
+                    source_id,
+                    source_cfg,
+                    {
+                        "full_name": "Голикова Татьяна Алексеевна",
+                        "position_title": "Заместитель Председателя Правительства Российской Федерации",
+                        "profile_url": "http://example.test/persons/902/",
+                    },
+                )
+                conn.commit()
+
+                positions = [
+                    tuple(row)
+                    for row in conn.execute(
+                        "SELECT canonical_name, description FROM entities WHERE entity_type='organization' ORDER BY canonical_name"
+                    ).fetchall()
+                ]
+                official_positions = [
+                    tuple(row)
+                    for row in conn.execute(
+                        "SELECT position_title, organization FROM official_positions ORDER BY id"
+                    ).fetchall()
+                ]
+            finally:
+                conn.close()
+
+            self.assertIn(("Владимирская область", "Официальный источник руководства"), positions)
+            self.assertIn(("Сбербанк", "Официальный источник руководства"), positions)
+            self.assertIn(("Федеральная налоговая служба", "Официальный источник руководства"), positions)
+            self.assertIn(("Правительство Российской Федерации", "Официальный источник руководства"), positions)
+            self.assertIn(
+                ("Губернатор Владимирской области", "Владимирская область"),
+                official_positions,
+            )
+            self.assertIn(
+                ("Президент, председатель правления ПАО «Сбербанк России»", "Сбербанк"),
+                official_positions,
+            )
+            self.assertIn(
+                ("Руководитель Федеральной налоговой службы", "Федеральная налоговая служба"),
+                official_positions,
+            )
+            self.assertIn(
+                ("Заместитель Председателя Правительства Российской Федерации", "Правительство Российской Федерации"),
+                official_positions,
             )
 
     def test_collect_source_applies_position_and_exclude_filters(self):

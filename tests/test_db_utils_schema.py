@@ -80,6 +80,9 @@ class DbUtilsSchemaTests(unittest.TestCase):
                 self.assertIn("evidence_class", columns("evidence_links"))
                 self.assertIn("decision_source", columns("content_tags"))
                 self.assertIn("candidate_state", columns("relation_candidates"))
+                self.assertIn("support_class", columns("relation_support"))
+                self.assertIn("quality_state", columns("source_sync_state"))
+                self.assertIn("suppression_reason", columns("content_clusters"))
 
                 self.assertTrue(
                     conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='content_tag_votes'").fetchone()

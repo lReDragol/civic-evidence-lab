@@ -48,6 +48,18 @@ def create_audit_db(db_path: Path):
             ) VALUES
                 (401, 1, 2, 'same_bill_cluster', 'candidate_builder:hybrid', 0.61, 0.4, 0.5, 0.6, 0.85, 0.1, 0.2, 0, 0, 0, 0, 'review', '{}'),
                 (402, 1, 3, 'same_contract_cluster', 'candidate_builder:hybrid', 0.59, 0.4, 0.45, 0.55, 1.0, 0.1, 0.2, 0, 0, 0, 0, 'review', '{}');
+
+            INSERT INTO content_clusters(
+                id, cluster_key, cluster_type, canonical_content_id, canonical_title, item_count, similarity_score, status
+            ) VALUES
+                (501, 'content:1', 'document_dedupe', 101, 'Материал 101', 2, 0.92, 'active');
+
+            INSERT INTO review_tasks(
+                id, task_key, queue_key, subject_type, subject_id, candidate_payload,
+                suggested_action, confidence, machine_reason, status
+            ) VALUES
+                (601, 'content-cluster-content:1', 'content_duplicates', 'content_cluster', 501, '{\"items\":[101,102]}',
+                 'merge_story', 0.92, 'Normalized title/body duplicate cluster', 'open');
             """
         )
         conn.commit()
@@ -68,6 +80,7 @@ class ClassifierAuditTests(unittest.TestCase):
                     "gold_claims_target": 2,
                     "gold_relations_target": 2,
                     "gold_tags_target": 2,
+                    "gold_duplicates_target": 1,
                     "report_path": str(report_path),
                 },
             }
@@ -92,7 +105,7 @@ class ClassifierAuditTests(unittest.TestCase):
             finally:
                 conn.close()
 
-            self.assertEqual(sample_counts, [("claim", 2), ("relation_candidate", 2), ("tag_assignment", 2)])
+            self.assertEqual(sample_counts, [("claim", 2), ("content_duplicate", 1), ("relation_candidate", 2), ("tag_assignment", 2)])
             self.assertEqual(baseline, {})
             self.assertEqual(last_status, "ok")
             self.assertIn("reviewed_baseline_pending", result["warnings"])
@@ -111,6 +124,7 @@ class ClassifierAuditTests(unittest.TestCase):
                     "gold_claims_target": 2,
                     "gold_relations_target": 2,
                     "gold_tags_target": 2,
+                    "gold_duplicates_target": 1,
                     "report_path": str(report_path),
                     "claim_status_drift_threshold": 0.05,
                     "relation_drift_threshold": 0.05,
@@ -131,6 +145,7 @@ class ClassifierAuditTests(unittest.TestCase):
                     SET review_status = CASE sample_kind
                         WHEN 'claim' THEN 'correct'
                         WHEN 'relation_candidate' THEN 'correct'
+                        WHEN 'content_duplicate' THEN 'correct'
                         ELSE 'correct'
                     END
                     """
@@ -195,6 +210,7 @@ class ClassifierAuditTests(unittest.TestCase):
                     "gold_claims_target": 2,
                     "gold_relations_target": 2,
                     "gold_tags_target": 2,
+                    "gold_duplicates_target": 1,
                     "report_path": str(report_path),
                 },
             }
@@ -210,6 +226,7 @@ class ClassifierAuditTests(unittest.TestCase):
                     SET review_status = CASE sample_kind
                         WHEN 'claim' THEN 'correct'
                         WHEN 'relation_candidate' THEN 'partially'
+                        WHEN 'content_duplicate' THEN 'correct'
                         ELSE 'correct'
                     END
                     """

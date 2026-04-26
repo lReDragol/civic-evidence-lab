@@ -658,6 +658,9 @@ CREATE TABLE IF NOT EXISTS source_sync_state (
     source_key      TEXT NOT NULL UNIQUE,
     source_id       INTEGER,
     state           TEXT DEFAULT 'unknown',
+    quality_state   TEXT DEFAULT 'unknown',
+    quality_issue   TEXT,
+    failure_class   TEXT,
     last_success_at TEXT,
     last_attempt_at TEXT,
     consecutive_failures INTEGER DEFAULT 0,
@@ -674,6 +677,7 @@ CREATE TABLE IF NOT EXISTS source_sync_state (
 
 CREATE INDEX IF NOT EXISTS idx_source_sync_state_id ON source_sync_state(source_id);
 CREATE INDEX IF NOT EXISTS idx_source_sync_state_state ON source_sync_state(state);
+CREATE INDEX IF NOT EXISTS idx_source_sync_state_quality ON source_sync_state(quality_state);
 CREATE INDEX IF NOT EXISTS idx_source_sync_state_success ON source_sync_state(last_success_at);
 
 CREATE TABLE IF NOT EXISTS dead_letter_items (
@@ -750,6 +754,7 @@ CREATE TABLE IF NOT EXISTS relation_support (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     candidate_id    INTEGER NOT NULL,
     support_kind    TEXT NOT NULL,
+    support_class   TEXT DEFAULT 'seed',
     content_item_id INTEGER,
     source_id       INTEGER,
     domain          TEXT,
@@ -767,6 +772,7 @@ CREATE TABLE IF NOT EXISTS relation_support (
 CREATE INDEX IF NOT EXISTS idx_relation_support_candidate ON relation_support(candidate_id);
 CREATE INDEX IF NOT EXISTS idx_relation_support_content ON relation_support(content_item_id);
 CREATE INDEX IF NOT EXISTS idx_relation_support_source ON relation_support(source_id);
+CREATE INDEX IF NOT EXISTS idx_relation_support_class ON relation_support(support_class);
 
 CREATE TABLE IF NOT EXISTS relation_features (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -866,10 +872,12 @@ CREATE TABLE IF NOT EXISTS content_clusters (
     canonical_title TEXT,
     method          TEXT DEFAULT 'title_signature',
     similarity_score REAL DEFAULT 0,
+    representative_score REAL DEFAULT 0,
     item_count      INTEGER DEFAULT 0,
     first_seen_at   TEXT,
     last_seen_at    TEXT,
     status          TEXT DEFAULT 'active',
+    suppression_reason TEXT,
     metadata_json   TEXT,
     created_at      TEXT DEFAULT (datetime('now')),
     updated_at      TEXT DEFAULT (datetime('now')),
