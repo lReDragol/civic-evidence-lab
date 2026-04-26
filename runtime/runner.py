@@ -161,7 +161,7 @@ def _finalize_job_state(
         conn = get_db(settings)
         try:
             if job_id == "source_health" and result.get("ok"):
-                record_source_health_report(conn, result.get("artifacts") or {})
+                record_source_health_report(conn, result.get("artifacts") or {}, settings=settings)
             if job_id == "analysis_snapshot" and result.get("ok"):
                 version = pipeline_version or str(
                     (result.get("artifacts") or {}).get("pipeline_version") or ""

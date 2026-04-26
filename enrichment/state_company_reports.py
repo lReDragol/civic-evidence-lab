@@ -7,7 +7,15 @@ import urllib3
 from bs4 import BeautifulSoup
 from requests import exceptions as requests_exceptions
 
+from config.source_health import (
+    fallback_urls,
+    find_fixture_path,
+    load_source_health_manifest,
+    manifest_entry,
+    primary_urls,
+)
 from enrichment.common import clean_text, ensure_content_item, ensure_raw_item, open_db, resolve_source_for_url
+from runtime.state import register_source_fixture, update_source_sync_state
 
 STATE_COMPANY_TARGETS = [
     {"name": "АвтоВАЗ", "url": "https://www.avtovaz.ru/company/management", "organization": "АвтоВАЗ"},
@@ -37,6 +45,29 @@ def _fetch_company_page(session: requests.Session, item: dict[str, str]) -> requ
         raise
 
 
+def _fetch_company_page_candidates(
+    session: requests.Session,
+    item: dict[str, str],
+    entry: dict[str, Any],
+) -> requests.Response:
+    urls = []
+    urls.extend(primary_urls(entry))
+    urls.append(item["url"])
+    urls.extend(fallback_urls(entry))
+    last_error: Exception | None = None
+    for candidate in list(dict.fromkeys(url for url in urls if url)):
+        candidate_item = dict(item)
+        candidate_item["url"] = candidate
+        try:
+            return _fetch_company_page(session, candidate_item)
+        except Exception as error:  # noqa: BLE001
+            last_error = error
+            continue
+    if last_error:
+        raise last_error
+    raise RuntimeError(f"missing_source_urls:{item.get('name')}")
+
+
 def _page_text(html: str) -> str:
     soup = BeautifulSoup(html, "lxml")
     for tag in soup.select("script, style, noscript, svg"):
@@ -52,14 +83,54 @@ def run_state_company_reports(settings: dict[str, Any] | None = None, *, targets
     conn = open_db(settings)
     created = 0
     warnings: list[str] = []
+    manifest = load_source_health_manifest(settings)
     try:
         for item in targets:
+            source_key = item.get("source_key") or f"state_company_reports:{item['name']}"
+            entry = manifest_entry(source_key, settings=settings, manifest=manifest)
             try:
-                response = _fetch_company_page(session, item)
+                response = _fetch_company_page_candidates(session, item, entry)
                 body_text = _page_text(response.text)
+                fallback_used = "archive" if response.url and "web.archive.org" in response.url else None
+                archive_derived = bool(fallback_used)
+                fixture_id = None
+                final_url = response.url or item["url"]
+            except Exception as error:
+                fixture_path = find_fixture_path(source_key, settings=settings, manifest=manifest)
+                if fixture_path:
+                    body_text = _page_text(fixture_path.read_text(encoding="utf-8", errors="ignore"))
+                    final_url = str(fixture_path)
+                    fallback_used = "fixture"
+                    archive_derived = True
+                    fixture_id = register_source_fixture(
+                        conn,
+                        source_key=source_key,
+                        fixture_kind="archive_fixture" if entry.get("acceptance_mode") == "archive_ok" else "local_fixture",
+                        origin_url=item["url"],
+                        local_path=str(fixture_path),
+                        metadata={"acceptance_mode": entry.get("acceptance_mode"), "quality_expectations": entry.get("quality_expectations")},
+                    )
+                else:
+                    warnings.append(f"{item['name']}: {error}")
+                    update_source_sync_state(
+                        conn,
+                        source_key=source_key,
+                        success=False,
+                        state="degraded",
+                        transport_mode="state_company_reports",
+                        last_error=str(error),
+                        metadata={
+                            "acceptance_mode": entry.get("acceptance_mode") or "direct_only",
+                            "organization": item["organization"],
+                            "primary_urls": primary_urls(entry) or [item["url"]],
+                            "fallback_urls": fallback_urls(entry),
+                        },
+                    )
+                    continue
+            try:
                 source_id = resolve_source_for_url(
                     conn,
-                    url=response.url or item["url"],
+                    url=item["url"],
                     fallback_name=f"{item['name']} — управление и отчёты",
                     fallback_category="official_site",
                     fallback_subcategory="state_company",
@@ -72,8 +143,11 @@ def run_state_company_reports(settings: dict[str, Any] | None = None, *, targets
                     external_id=external_id,
                     raw_payload={
                         "organization": item["organization"],
-                        "url": response.url or item["url"],
+                        "url": final_url,
                         "title": item["name"],
+                        "archive_derived": archive_derived,
+                        "fallback_used": fallback_used,
+                        "fixture_id": fixture_id,
                     },
                 )
                 existing = conn.execute(
@@ -89,11 +163,30 @@ def run_state_company_reports(settings: dict[str, Any] | None = None, *, targets
                     title=f"{item['name']} — руководство и отчёты",
                     body_text=body_text,
                     published_at=None,
-                    url=response.url or item["url"],
+                    url=item["url"],
                     status="official_document",
                 )
                 if not existing:
                     created += 1
+                update_source_sync_state(
+                    conn,
+                    source_key=source_key,
+                    source_id=source_id,
+                    success=True,
+                    state="ok",
+                    transport_mode="state_company_reports",
+                    quality_state="ok",
+                    metadata={
+                        "acceptance_mode": entry.get("acceptance_mode") or "direct_only",
+                        "organization": item["organization"],
+                        "primary_urls": primary_urls(entry) or [item["url"]],
+                        "fallback_urls": fallback_urls(entry),
+                        "fallback_used": fallback_used,
+                        "archive_derived": archive_derived,
+                        "fixture_id": fixture_id,
+                        "resolved_url": final_url,
+                    },
+                )
             except Exception as error:
                 warnings.append(f"{item['name']}: {error}")
         conn.commit()

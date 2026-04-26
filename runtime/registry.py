@@ -324,7 +324,13 @@ def _quotes(settings: dict[str, Any]):
 
 
 def _claims(settings: dict[str, Any]):
-    return __import__("verification.engine", fromlist=["process_claims_for_content"]).process_claims_for_content()
+    module = __import__("verification.engine", fromlist=["process_claims_for_content"])
+    return module.process_claims_for_content(
+        settings=settings,
+        content_limit=max(200, int(settings.get("claims_content_limit", 3000) or 3000)),
+        verification_limit=max(20, int(settings.get("claims_verification_limit", 200) or 200)),
+        external_checks=bool(settings.get("claims_external_checks", False)),
+    )
 
 
 def _claim_cluster(settings: dict[str, Any]):
@@ -420,7 +426,8 @@ def _backup(settings: dict[str, Any]):
 
 def _source_health(settings: dict[str, Any]):
     return __import__("tools.check_official_sources", fromlist=["check_sources"]).check_sources(
-        timeout=int(settings.get("health", {}).get("timeout_seconds", 8))
+        timeout=int(settings.get("health", {}).get("timeout_seconds", 8)),
+        settings=settings,
     )
 
 

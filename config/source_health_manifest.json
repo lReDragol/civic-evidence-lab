@@ -1,0 +1,284 @@
+{
+  "government_news": {
+    "acceptance_mode": "fixture_ok",
+    "required_for_gate": true,
+    "primary_urls": [
+      "https://government.ru/news/"
+    ],
+    "fallback_urls": [
+      "http://government.ru/news/"
+    ],
+    "fixture_paths": [
+      "../processed/source_fixtures/government_news/listing.html"
+    ],
+    "fixture_strategy": "local_html",
+    "expected_cadence": "daily",
+    "quality_expectations": "html_listing",
+    "warning_match": [
+      "government_news"
+    ]
+  },
+  "government_docs": {
+    "acceptance_mode": "fixture_ok",
+    "required_for_gate": true,
+    "primary_urls": [
+      "https://government.ru/docs/"
+    ],
+    "fallback_urls": [
+      "http://government.ru/docs/"
+    ],
+    "fixture_paths": [
+      "../processed/source_fixtures/government_docs/listing.html"
+    ],
+    "fixture_strategy": "local_html",
+    "expected_cadence": "daily",
+    "quality_expectations": "document_listing",
+    "warning_match": [
+      "government_docs"
+    ]
+  },
+  "kremlin_transcripts": {
+    "acceptance_mode": "fixture_ok",
+    "required_for_gate": true,
+    "primary_urls": [
+      "https://kremlin.ru/events/president/transcripts/"
+    ],
+    "fallback_urls": [
+      "https://special.kremlin.ru/events/president/transcripts"
+    ],
+    "fixture_paths": [
+      "../processed/source_fixtures/kremlin_transcripts/listing.html"
+    ],
+    "fixture_strategy": "local_html",
+    "expected_cadence": "daily",
+    "quality_expectations": "html_listing",
+    "warning_match": [
+      "kremlin_transcripts",
+      "special.kremlin.ru"
+    ]
+  },
+  "kremlin_transcripts_special": {
+    "acceptance_mode": "fixture_ok",
+    "required_for_gate": true,
+    "primary_urls": [
+      "https://special.kremlin.ru/events/president/transcripts"
+    ],
+    "fallback_urls": [
+      "https://kremlin.ru/events/president/transcripts/"
+    ],
+    "fixture_paths": [
+      "../processed/source_fixtures/kremlin_transcripts/listing.html"
+    ],
+    "fixture_strategy": "local_html",
+    "expected_cadence": "daily",
+    "quality_expectations": "html_listing",
+    "warning_match": [
+      "kremlin_transcripts_special"
+    ]
+  },
+  "pravo_gov": {
+    "acceptance_mode": "fixture_ok",
+    "required_for_gate": true,
+    "primary_urls": [
+      "https://pravo.gov.ru/"
+    ],
+    "fallback_urls": [
+      "http://pravo.gov.ru/"
+    ],
+    "fixture_paths": [
+      "../processed/source_fixtures/pravo_gov/index.html"
+    ],
+    "fixture_strategy": "local_html",
+    "expected_cadence": "daily",
+    "quality_expectations": "official_publication",
+    "warning_match": [
+      "pravo_gov"
+    ]
+  },
+  "publication_pravo_https": {
+    "acceptance_mode": "fixture_ok",
+    "required_for_gate": true,
+    "primary_urls": [
+      "https://publication.pravo.gov.ru/"
+    ],
+    "fallback_urls": [
+      "http://publication.pravo.gov.ru/"
+    ],
+    "fixture_paths": [
+      "../processed/source_fixtures/publication_pravo_https/index.html"
+    ],
+    "fixture_strategy": "local_html",
+    "expected_cadence": "daily",
+    "quality_expectations": "official_publication",
+    "warning_match": [
+      "publication_pravo_https"
+    ]
+  },
+  "publication_pravo_http": {
+    "acceptance_mode": "fixture_ok",
+    "required_for_gate": true,
+    "primary_urls": [
+      "http://publication.pravo.gov.ru/"
+    ],
+    "fallback_urls": [
+      "https://publication.pravo.gov.ru/"
+    ],
+    "fixture_paths": [
+      "../processed/source_fixtures/publication_pravo_https/index.html"
+    ],
+    "fixture_strategy": "local_html",
+    "expected_cadence": "daily",
+    "quality_expectations": "official_publication",
+    "warning_match": [
+      "publication_pravo_http"
+    ]
+  },
+  "rosreestr_press_archive": {
+    "acceptance_mode": "fixture_ok",
+    "required_for_gate": true,
+    "primary_urls": [
+      "https://rosreestr.gov.ru/press/archive/"
+    ],
+    "fallback_urls": [],
+    "fixture_paths": [
+      "../processed/source_fixtures/rosreestr_press_archive/listing.html"
+    ],
+    "fixture_strategy": "local_html",
+    "expected_cadence": "daily",
+    "quality_expectations": "archive_listing",
+    "warning_match": [
+      "rosreestr_press_archive"
+    ]
+  },
+  "rosreestr_press_news": {
+    "acceptance_mode": "fixture_ok",
+    "required_for_gate": true,
+    "primary_urls": [
+      "https://rosreestr.gov.ru/site/press/news/"
+    ],
+    "fallback_urls": [],
+    "fixture_paths": [
+      "../processed/source_fixtures/rosreestr_press_news/listing.html"
+    ],
+    "fixture_strategy": "local_html",
+    "expected_cadence": "daily",
+    "quality_expectations": "news_listing",
+    "warning_match": [
+      "rosreestr_press_news"
+    ]
+  },
+  "rosreestr_lk_property": {
+    "acceptance_mode": "fixture_ok",
+    "required_for_gate": true,
+    "primary_urls": [
+      "https://lk.rosreestr.ru/eservices/real-estate-objects-online"
+    ],
+    "fallback_urls": [],
+    "fixture_paths": [
+      "../processed/source_fixtures/rosreestr_lk_property/index.html"
+    ],
+    "fixture_strategy": "local_html",
+    "expected_cadence": "daily",
+    "quality_expectations": "official_publication",
+    "warning_match": [
+      "rosreestr_lk_property"
+    ]
+  },
+  "duma_disclosures": {
+    "acceptance_mode": "archive_ok",
+    "required_for_gate": true,
+    "primary_urls": [
+      "http://duma.gov.ru/duma/persons/properties/{year}/"
+    ],
+    "fallback_urls": {
+      "2024": [],
+      "2023": [],
+      "2022": []
+    },
+    "fixture_paths": {
+      "2024": [
+        "../processed/source_fixtures/duma_disclosures/2024.html"
+      ],
+      "2023": [
+        "../processed/source_fixtures/duma_disclosures/2023.html"
+      ],
+      "2022": [
+        "../processed/source_fixtures/duma_disclosures/2022.html"
+      ]
+    },
+    "fixture_strategy": "by_year",
+    "expected_cadence": "yearly",
+    "quality_expectations": "declaration_table",
+    "warning_match": [
+      "duma:",
+      "snapshot_not_found"
+    ]
+  },
+  "state_company_reports:Ростех": {
+    "acceptance_mode": "archive_ok",
+    "required_for_gate": true,
+    "primary_urls": [
+      "https://rostec.ru/about/management/",
+      "https://rostec.ru/about/governance/"
+    ],
+    "fallback_urls": [
+      "https://web.archive.org/web/20260301000000/https://rostec.ru/about/management/"
+    ],
+    "fixture_paths": [
+      "../processed/source_fixtures/state_company_reports/rostec_management.html"
+    ],
+    "fixture_strategy": "local_html",
+    "expected_cadence": "weekly",
+    "quality_expectations": "management_page",
+    "warning_match": [
+      "Ростех:"
+    ]
+  },
+  "state_company_reports:Газпром": {
+    "acceptance_mode": "direct_only",
+    "required_for_gate": false,
+    "primary_urls": [
+      "https://www.gazprom.ru/about/management/"
+    ],
+    "fallback_urls": [],
+    "fixture_paths": [],
+    "fixture_strategy": "none",
+    "expected_cadence": "weekly",
+    "quality_expectations": "management_page",
+    "warning_match": [
+      "Газпром:",
+      "www.gazprom.ru"
+    ]
+  },
+  "state_company_reports:РЖД": {
+    "acceptance_mode": "direct_only",
+    "required_for_gate": false,
+    "primary_urls": [
+      "https://company.rzd.ru/ru/9353/page/105104?id=1745"
+    ],
+    "fallback_urls": [],
+    "fixture_paths": [],
+    "fixture_strategy": "none",
+    "expected_cadence": "weekly",
+    "quality_expectations": "management_page",
+    "warning_match": [
+      "РЖД:",
+      "company.rzd.ru"
+    ]
+  },
+  "senators": {
+    "acceptance_mode": "fixture_ok",
+    "required_for_gate": false,
+    "primary_urls": [
+      "http://council.gov.ru/events/news/"
+    ],
+    "fallback_urls": [],
+    "fixture_paths": [],
+    "fixture_strategy": "local_html",
+    "expected_cadence": "weekly",
+    "quality_expectations": "directory_listing",
+    "warning_match": [
+      "senators"
+    ]
+  }
+}

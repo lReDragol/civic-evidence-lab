@@ -366,6 +366,21 @@ CREATE TABLE IF NOT EXISTS review_tasks (
 CREATE INDEX IF NOT EXISTS idx_review_tasks_queue ON review_tasks(queue_key);
 CREATE INDEX IF NOT EXISTS idx_review_tasks_status ON review_tasks(status);
 CREATE INDEX IF NOT EXISTS idx_review_tasks_pack ON review_tasks(review_pack_id);
+
+CREATE TABLE IF NOT EXISTS source_fixtures (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_key      TEXT NOT NULL,
+    fixture_kind    TEXT NOT NULL,
+    origin_url      TEXT,
+    archive_url     TEXT,
+    local_path      TEXT NOT NULL,
+    checksum        TEXT,
+    captured_at     TEXT DEFAULT (datetime('now')),
+    is_active       INTEGER DEFAULT 1,
+    metadata_json   TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_source_fixtures_key ON source_fixtures(source_key);
+CREATE INDEX IF NOT EXISTS idx_source_fixtures_active ON source_fixtures(is_active);
 """
 
 

@@ -6,6 +6,7 @@ from typing import Any
 import requests
 from bs4 import BeautifulSoup
 
+from config.source_health import fallback_urls, find_fixture_path, load_source_health_manifest, manifest_entry
 from enrichment.common import (
     clean_text,
     ensure_content_item,
@@ -19,10 +20,11 @@ from enrichment.common import (
     resolve_source_for_url,
     stable_hash,
 )
+from runtime.state import register_source_fixture, update_source_sync_state
 
 WAYBACK_CDX = "https://web.archive.org/cdx/search/cdx"
 DUMA_PROPERTY_URL_TEMPLATE = "http://duma.gov.ru/duma/persons/properties/{year}/"
-DEFAULT_DUMA_YEARS = (2024, 2023, 2022, 2021, 2020)
+DEFAULT_DUMA_YEARS = (2024, 2023, 2022)
 SPOUSE_PREFIXES = ("супруга", "супруг", "несовершеннолетний", "ребенок", "ребёнок")
 TRANSPORT_RE = re.compile(r"\bавтомобил|транспорт|мотоцикл|судно\b", re.IGNORECASE)
 ARCHIVE_FALLBACKS: dict[int, tuple[str, ...]] = {
@@ -91,6 +93,7 @@ def ingest_duma_property_html(
     html: str,
     year: int,
     page_url: str,
+    source_metadata: dict[str, Any] | None = None,
 ) -> dict[str, int]:
     soup = BeautifulSoup(html, "lxml")
     table = soup.find("table")
@@ -157,7 +160,7 @@ def ingest_duma_property_html(
                         income_text or None,
                         "deputy_property_page",
                         "hard",
-                        json_dumps({"full_name": name, "position": cells[2]}),
+                        json_dumps({"full_name": name, "position": cells[2], **(source_metadata or {})}),
                     ),
                 )
                 current_disclosure_id = int(cur.lastrowid)
@@ -278,6 +281,19 @@ def _wayback_snapshot(url: str, year: int) -> str | None:
     return next(iter(fallbacks), None)
 
 
+def _load_html_candidates(urls: list[str]) -> tuple[str | None, str | None, str | None]:
+    for candidate_url in urls:
+        if not candidate_url:
+            continue
+        try:
+            response = requests.get(candidate_url, timeout=40, headers={"User-Agent": "Mozilla/5.0"})
+            response.raise_for_status()
+            return response.text, response.url or candidate_url, "archive"
+        except Exception:
+            continue
+    return None, None, None
+
+
 def run_anticorruption_disclosures(settings: dict[str, Any] | None = None, *, years: tuple[int, ...] = DEFAULT_DUMA_YEARS) -> dict[str, Any]:
     settings = settings or {}
     conn = open_db(settings)
@@ -292,21 +308,116 @@ def run_anticorruption_disclosures(settings: dict[str, Any] | None = None, *, ye
         fallback_subcategory="anticorruption",
         is_official=1,
     )
+    manifest = load_source_health_manifest(settings)
+    disclosure_entry = manifest_entry("duma_disclosures", settings=settings, manifest=manifest)
     try:
         for year in years:
             page_url = DUMA_PROPERTY_URL_TEMPLATE.format(year=year)
+            source_key = f"duma_disclosures:{year}"
             try:
+                candidate_urls: list[str] = []
                 snapshot_url = _wayback_snapshot(page_url, year)
-                if not snapshot_url:
+                if snapshot_url:
+                    candidate_urls.append(snapshot_url)
+                candidate_urls.extend(fallback_urls(disclosure_entry, variant=year))
+                html = None
+                resolved_url = None
+                fallback_used = None
+                archive_derived = False
+                if candidate_urls:
+                    html, resolved_url, fallback_used = _load_html_candidates(
+                        list(dict.fromkeys(candidate_urls))
+                    )
+                    archive_derived = bool(html)
+                fixture_id = None
+                if not html:
+                    fixture_path = find_fixture_path(
+                        "duma_disclosures",
+                        variant=year,
+                        settings=settings,
+                        manifest=manifest,
+                    )
+                    if fixture_path:
+                        html = fixture_path.read_text(encoding="utf-8", errors="ignore")
+                        resolved_url = str(fixture_path)
+                        fallback_used = "fixture"
+                        archive_derived = True
+                        fixture_id = register_source_fixture(
+                            conn,
+                            source_key=source_key,
+                            fixture_kind="archive_fixture",
+                            origin_url=page_url,
+                            local_path=str(fixture_path),
+                            metadata={"acceptance_mode": "archive_ok", "quality_expectations": "declaration_table"},
+                        )
+                if not html:
                     warnings.append(f"duma:{year}:snapshot_not_found")
+                    update_source_sync_state(
+                        conn,
+                        source_key=source_key,
+                        source_id=source_id,
+                        success=False,
+                        state="degraded",
+                        transport_mode="anticorruption_disclosures",
+                        last_error="snapshot_not_found",
+                        quality_state="degraded",
+                        quality_issue="snapshot_not_found",
+                        failure_class="missing_snapshot",
+                        metadata={
+                            "acceptance_mode": "archive_ok",
+                            "archive_derived": False,
+                            "page_url": page_url,
+                        },
+                    )
                     continue
-                response = requests.get(snapshot_url, timeout=40, headers={"User-Agent": "Mozilla/5.0"})
-                response.raise_for_status()
-                stats = ingest_duma_property_html(conn, source_id=source_id, html=response.text, year=year, page_url=snapshot_url)
+                stats = ingest_duma_property_html(
+                    conn,
+                    source_id=source_id,
+                    html=html,
+                    year=year,
+                    page_url=resolved_url or page_url,
+                    source_metadata={
+                        "archive_derived": archive_derived,
+                        "fallback_used": fallback_used,
+                        "fixture_id": fixture_id,
+                    },
+                )
                 disclosures_created += int(stats.get("disclosures_created") or 0)
                 assets_created += int(stats.get("assets_created") or 0)
+                update_source_sync_state(
+                    conn,
+                    source_key=source_key,
+                    source_id=source_id,
+                    success=True,
+                    state="ok",
+                    transport_mode="anticorruption_disclosures",
+                    quality_state="ok",
+                    failure_class=None,
+                    metadata={
+                        "acceptance_mode": "archive_ok",
+                        "archive_derived": archive_derived,
+                        "fallback_used": fallback_used,
+                        "fixture_id": fixture_id,
+                        "page_url": page_url,
+                        "resolved_url": resolved_url or page_url,
+                    },
+                )
             except Exception as error:
                 warnings.append(f"duma:{year}:{error}")
+                update_source_sync_state(
+                    conn,
+                    source_key=source_key,
+                    source_id=source_id,
+                    success=False,
+                    state="degraded",
+                    transport_mode="anticorruption_disclosures",
+                    last_error=str(error),
+                    metadata={
+                        "acceptance_mode": "archive_ok",
+                        "archive_derived": False,
+                        "page_url": page_url,
+                    },
+                )
         conn.commit()
         return {
             "ok": True,

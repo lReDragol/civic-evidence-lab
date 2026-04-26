@@ -2524,6 +2524,12 @@ class DashboardDataService:
             ).fetchone()
             if row:
                 return f"{row[0] or 'restriction'} · {row[1] or '—'} · {row[2] or '—'}"
+        if subject_type == "source_health":
+            payload = self._json_loads(task.get("candidate_payload")) if task.get("candidate_payload") else {}
+            source_key = payload.get("source_key") or task.get("task_key")
+            effective_state = payload.get("effective_state") or "unknown"
+            failure_class = payload.get("failure_class") or payload.get("quality_issue") or "—"
+            return f"{source_key} · {effective_state} · {failure_class}"
         return ""
 
     def _count(self, table_name: str) -> int:

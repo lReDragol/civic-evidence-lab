@@ -7,6 +7,13 @@ from pathlib import Path
 from typing import Any
 
 from config.db_utils import SCHEMA_PATH, exec_schema
+from config.source_health import (
+    acceptance_mode,
+    fixture_checksum,
+    load_source_health_manifest,
+    manifest_entry,
+    smoke_fixture,
+)
 
 
 DAEMON_JOB_ID = "__daemon__"
@@ -76,6 +83,26 @@ SOURCE_HEALTH_MATRIX: dict[str, dict[str, str]] = {
         "fixture_sample": "http://council.gov.ru/events/news/",
     },
 }
+
+
+def _source_health_defaults(source_key: str, settings: dict[str, Any] | None = None) -> dict[str, Any]:
+    base = dict(SOURCE_HEALTH_MATRIX.get(source_key, {}))
+    entry = manifest_entry(source_key, settings=settings)
+    if entry:
+        base.update(
+            {
+                "acceptance_mode": acceptance_mode(entry),
+                "primary_urls": entry.get("primary_urls"),
+                "fallback_urls": entry.get("fallback_urls"),
+                "fixture_strategy": entry.get("fixture_strategy"),
+                "expected_cadence": entry.get("expected_cadence"),
+                "quality_expectations": entry.get("quality_expectations"),
+                "required_for_gate": bool(entry.get("required_for_gate")),
+            }
+        )
+        if entry.get("primary_urls") and not base.get("fixture_sample"):
+            base["fixture_sample"] = (entry.get("primary_urls") or [None])[0]
+    return {key: value for key, value in base.items() if value not in (None, "", [], {})}
 
 
 def utc_now_naive() -> datetime:
@@ -608,9 +635,11 @@ def record_source_health_report(
     report: dict[str, Any],
     *,
     transport_mode: str = "healthcheck",
+    settings: dict[str, Any] | None = None,
 ) -> dict[str, int]:
     inserted = 0
     degraded = 0
+    manifest = load_source_health_manifest(settings) if settings else {}
     for item in report.get("items", []):
         source_key = str(item.get("source") or item.get("url") or f"source-{inserted}")
         url = item.get("url")
@@ -619,20 +648,43 @@ def record_source_health_report(
             row = conn.execute("SELECT id FROM sources WHERE url=? LIMIT 1", (url,)).fetchone()
             source_id = int(row[0]) if row else None
 
-        health_meta = dict(SOURCE_HEALTH_MATRIX.get(source_key, {}))
+        health_meta = _source_health_defaults(source_key, settings=settings)
         health_meta.update(
             {
                 "health_title": item.get("title"),
                 "final_url": item.get("final_url"),
             }
         )
+        fixture_smoke = item.get("fixture_smoke")
+        if manifest and (not isinstance(fixture_smoke, dict) or not fixture_smoke):
+            fixture_smoke = smoke_fixture(source_key, settings=settings, manifest=manifest)
+        if fixture_smoke:
+            health_meta["fixture_smoke"] = fixture_smoke
+            if fixture_smoke.get("ok"):
+                fixture_id = register_source_fixture(
+                    conn,
+                    source_key=source_key,
+                    fixture_kind="archive_fixture" if fixture_smoke.get("archive_derived") else "local_fixture",
+                    origin_url=url,
+                    archive_url=((item.get("archive_url") or None) if isinstance(item, dict) else None),
+                    local_path=fixture_smoke.get("fixture_path"),
+                    metadata={
+                        "acceptance_mode": fixture_smoke.get("acceptance_mode"),
+                        "quality_expectations": health_meta.get("quality_expectations"),
+                    },
+                )
+                health_meta["fixture_id"] = fixture_id
+                health_meta["fallback_used"] = "archive" if fixture_smoke.get("archive_derived") else "fixture"
+                health_meta["archive_derived"] = bool(fixture_smoke.get("archive_derived"))
         failure_class = _classify_failure_class(
             error_text=str(item.get("error") or ""),
             http_status=int(item.get("status")) if item.get("status") is not None else None,
         )
+        effective_success = bool(item.get("ok")) or bool(fixture_smoke and fixture_smoke.get("ok"))
+        effective_state = "degraded" if not effective_success else "ok"
         quality_state, quality_issue, resolved_failure_class = _quality_state_from_health(
-            success=bool(item.get("ok")),
-            state="degraded" if not item.get("ok") else "ok",
+            success=effective_success,
+            state=effective_state,
             last_error=item.get("error"),
         )
         conn.execute(
@@ -664,11 +716,11 @@ def record_source_health_report(
             conn,
             source_key=source_key,
             source_id=source_id,
-            success=bool(item.get("ok")),
-            state="degraded" if not item.get("ok") else "ok",
+            success=effective_success,
+            state=effective_state,
             last_http_status=item.get("status"),
             transport_mode=transport_mode,
-            last_error=item.get("error"),
+            last_error=None if effective_success else item.get("error"),
             quality_state=quality_state,
             quality_issue=quality_issue,
             failure_class=resolved_failure_class or failure_class,
@@ -679,6 +731,104 @@ def record_source_health_report(
             degraded += 1
     conn.commit()
     return {"inserted": inserted, "degraded": degraded}
+
+
+def register_source_fixture(
+    conn: sqlite3.Connection,
+    *,
+    source_key: str,
+    fixture_kind: str,
+    local_path: str | None,
+    origin_url: str | None = None,
+    archive_url: str | None = None,
+    checksum: str | None = None,
+    captured_at: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> int | None:
+    if not local_path or not table_exists(conn, "source_fixtures"):
+        return None
+    path = Path(str(local_path))
+    if not path.exists():
+        return None
+    resolved_checksum = checksum or fixture_checksum(path)
+    row = conn.execute(
+        """
+        SELECT id
+        FROM source_fixtures
+        WHERE source_key=? AND local_path=? AND is_active=1
+        LIMIT 1
+        """,
+        (source_key, str(path)),
+    ).fetchone()
+    if row:
+        fixture_id = int(row[0])
+        conn.execute(
+            """
+            UPDATE source_fixtures
+            SET fixture_kind=?, origin_url=?, archive_url=?, checksum=?, captured_at=?, metadata_json=?, is_active=1
+            WHERE id=?
+            """,
+            (
+                fixture_kind,
+                origin_url,
+                archive_url,
+                resolved_checksum,
+                captured_at or now_iso(),
+                json_dumps(metadata or {}),
+                fixture_id,
+            ),
+        )
+        conn.commit()
+        return fixture_id
+    cur = conn.execute(
+        """
+        INSERT INTO source_fixtures(
+            source_key, fixture_kind, origin_url, archive_url, local_path, checksum, captured_at, is_active, metadata_json
+        ) VALUES(?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            source_key,
+            fixture_kind,
+            origin_url,
+            archive_url,
+            str(path),
+            resolved_checksum,
+            captured_at or now_iso(),
+            1,
+            json_dumps(metadata or {}),
+        ),
+    )
+    conn.commit()
+    return int(cur.lastrowid)
+
+
+def active_source_fixtures(conn: sqlite3.Connection, source_key: str) -> list[dict[str, Any]]:
+    if not table_exists(conn, "source_fixtures"):
+        return []
+    rows = conn.execute(
+        """
+        SELECT id, source_key, fixture_kind, origin_url, archive_url, local_path, checksum, captured_at, is_active, metadata_json
+        FROM source_fixtures
+        WHERE source_key=? AND is_active=1
+        ORDER BY id DESC
+        """,
+        (source_key,),
+    ).fetchall()
+    return [
+        {
+            "id": int(row[0]),
+            "source_key": row[1],
+            "fixture_kind": row[2],
+            "origin_url": row[3],
+            "archive_url": row[4],
+            "local_path": row[5],
+            "checksum": row[6],
+            "captured_at": row[7],
+            "is_active": int(row[8] or 0),
+            "metadata": json_loads(row[9], {}),
+        }
+        for row in rows
+    ]
 
 
 def record_dead_letter(

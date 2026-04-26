@@ -8,11 +8,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
+import requests
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from collectors.official_scraper import HEADERS
+from config.source_health import load_source_health_manifest, smoke_fixture
 
 DEFAULT_REPORT = PROJECT_ROOT / "reports" / "source_health_latest.json"
 
@@ -60,8 +63,6 @@ def _count_links(text: str) -> int:
 
 
 def probe_source(probe: Dict[str, object], timeout: int = 8) -> Dict[str, object]:
-    import requests
-
     started = time.perf_counter()
     url = str(probe["url"])
     verify = bool(probe.get("verify", True))
@@ -109,8 +110,23 @@ def probe_source(probe: Dict[str, object], timeout: int = 8) -> Dict[str, object
     return result
 
 
-def check_sources(timeout: int = 8, probes: Optional[Iterable[Dict[str, object]]] = None) -> Dict[str, object]:
-    items: List[Dict[str, object]] = [probe_source(probe, timeout=timeout) for probe in (probes or SOURCE_PROBES)]
+def check_sources(
+    timeout: int = 8,
+    probes: Optional[Iterable[Dict[str, object]]] = None,
+    settings: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
+    settings_dict = dict(settings or {})
+    manifest = load_source_health_manifest(settings_dict)
+    items: List[Dict[str, object]] = []
+    for probe in (probes or SOURCE_PROBES):
+        item = probe_source(probe, timeout=timeout)
+        if not item.get("ok"):
+            item["fixture_smoke"] = smoke_fixture(
+                str(probe.get("source") or item.get("source") or ""),
+                settings=settings_dict,
+                manifest=manifest,
+            )
+        items.append(item)
     ok_count = sum(1 for item in items if item["ok"])
     return {
         "checked_at": datetime.now().isoformat(timespec="seconds"),

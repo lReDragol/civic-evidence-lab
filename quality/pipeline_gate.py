@@ -6,6 +6,18 @@ from typing import Any
 
 from classifier.tagger_v3 import GENERIC_TAGS, STRICT_CONTENT_PRIORS
 from config.db_utils import PROJECT_ROOT, get_db, load_settings
+from config.source_health import (
+    HEALTHY_STATES,
+    acceptance_mode,
+    effective_source_state,
+    fallback_urls,
+    load_source_health_manifest,
+    manifest_entry,
+    match_warning_source,
+    primary_urls,
+    required_for_gate,
+    smoke_fixture,
+)
 from runtime.state import _classify_failure_class
 from runtime.state import get_runtime_metadata, now_iso
 
@@ -64,11 +76,47 @@ def _append_once(items: list[str], value: str) -> None:
         items.append(value)
 
 
+def _review_task_source_links(row: dict[str, Any]) -> list[str]:
+    links: list[str] = []
+    for value in row.get("primary_urls") or []:
+        if value and value not in links:
+            links.append(str(value))
+    for value in row.get("fallback_urls") or []:
+        if value and value not in links:
+            links.append(str(value))
+    if row.get("fixture_path"):
+        links.append(str(row["fixture_path"]))
+    return links
+
+
+def _sync_source_review_tasks(conn, rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        return
+    try:
+        from enrichment.common import ensure_review_task
+    except Exception:
+        return
+    for row in rows:
+        ensure_review_task(
+            conn,
+            task_key=f"source:{row['source_key']}",
+            queue_key="sources",
+            subject_type="source_health",
+            candidate_payload=row,
+            suggested_action="needs_more_docs" if row["effective_state"] == "blocked" else "promote",
+            confidence=0.99 if row["effective_state"] == "blocked" else 0.91,
+            machine_reason=row.get("failure_class") or row.get("quality_issue") or row.get("effective_state"),
+            source_links=_review_task_source_links(row),
+        )
+    conn.commit()
+
+
 def build_quality_gate(settings: dict[str, Any] | None = None) -> dict[str, Any]:
     settings = settings or load_settings()
     cfg = _config(settings)
     report_path = _report_path(settings)
     report_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest = load_source_health_manifest(settings)
 
     conn = get_db(settings)
     conn.row_factory = None
@@ -140,6 +188,84 @@ def build_quality_gate(settings: dict[str, Any] | None = None) -> dict[str, Any]
             ORDER BY source_key
             """
         ).fetchall()
+        source_state_rows = conn.execute(
+            """
+            SELECT source_key, state, COALESCE(quality_state, 'unknown') AS quality_state,
+                   COALESCE(failure_class, '') AS failure_class, COALESCE(last_error, '') AS last_error,
+                   COALESCE(metadata_json, '{}') AS metadata_json
+            FROM source_sync_state
+            ORDER BY source_key
+            """
+        ).fetchall()
+        source_state_map: dict[str, tuple[Any, ...]] = {str(row[0]): row for row in source_state_rows}
+        tracked_source_keys = set(source_state_map)
+
+        source_acceptance_rows: list[dict[str, Any]] = []
+        fixture_backed_sources: list[str] = []
+        archive_backed_sources: list[str] = []
+        unresolved_blockers: list[dict[str, Any]] = []
+        source_review_rows: list[dict[str, Any]] = []
+        acceptance_by_source: dict[str, dict[str, Any]] = {}
+
+        def resolve_source_acceptance(source_key: str) -> dict[str, Any]:
+            existing = acceptance_by_source.get(source_key)
+            if existing:
+                return existing
+            sync_row = source_state_map.get(source_key)
+            entry = manifest_entry(source_key, settings=settings, manifest=manifest)
+            entry_mode = acceptance_mode(entry)
+            try:
+                metadata = json.loads(sync_row[5]) if sync_row and sync_row[5] else {}
+            except json.JSONDecodeError:
+                metadata = {}
+            fixture_smoke = smoke_fixture(source_key, settings=settings, manifest=manifest)
+            failure_class = ""
+            if sync_row:
+                failure_class = (sync_row[3] or "").strip()
+                if not failure_class and (sync_row[4] or "").strip():
+                    failure_class = _classify_failure_class(error_text=sync_row[4]) or ""
+            if not failure_class and entry_mode in {"archive_ok", "fixture_ok"}:
+                failure_class = str((fixture_smoke or {}).get("failure_class") or "")
+            row = {
+                "source_key": source_key,
+                "required_for_gate": bool(required_for_gate(entry)),
+                "acceptance_mode": entry_mode,
+                "state": sync_row[1] if sync_row else "unknown",
+                "quality_state": sync_row[2] if sync_row else "unknown",
+                "failure_class": failure_class,
+                "last_error": sync_row[4] if sync_row else "",
+                "quality_issue": str(metadata.get("quality_issue") or ""),
+                "primary_urls": primary_urls(entry),
+                "fallback_urls": fallback_urls(entry),
+                "fixture_ok": bool(fixture_smoke.get("ok")),
+                "fixture_path": fixture_smoke.get("fixture_path") if fixture_smoke else None,
+                "archive_derived": bool(metadata.get("archive_derived") or (fixture_smoke or {}).get("archive_derived")),
+                "fallback_used": metadata.get("fallback_used"),
+            }
+            row["effective_state"] = effective_source_state(
+                state=row["state"],
+                quality_state=row["quality_state"],
+                failure_class=row["failure_class"],
+                metadata=metadata,
+                manifest_entry_value=entry,
+                fixture_smoke=fixture_smoke,
+            )
+            source_acceptance_rows.append(row)
+            acceptance_by_source[source_key] = row
+            if row["effective_state"] == "healthy_fixture":
+                fixture_backed_sources.append(source_key)
+            if row["effective_state"] == "healthy_archive":
+                archive_backed_sources.append(source_key)
+            if row["required_for_gate"]:
+                if row["effective_state"] not in HEALTHY_STATES:
+                    unresolved_blockers.append(row)
+                    source_review_rows.append(row)
+            elif row["effective_state"] in {"degraded_live", "degraded_parser", "blocked"}:
+                source_review_rows.append(row)
+            return row
+
+        for source_key in sorted(tracked_source_keys):
+            resolve_source_acceptance(source_key)
 
         ok_with_warning_rows = conn.execute(
             """
@@ -158,6 +284,23 @@ def build_quality_gate(settings: dict[str, Any] | None = None) -> dict[str, Any]
             """
         ).fetchall()
         critical_warning_jobs = _critical_warning_rows(ok_with_warning_rows)
+        unresolved_warning_jobs: list[dict[str, Any]] = []
+        for row in critical_warning_jobs:
+            source_key = match_warning_source(row["warning"], settings=settings, manifest=manifest)
+            row["source_key"] = source_key
+            source_required = False
+            if source_key:
+                acceptance_row = resolve_source_acceptance(source_key)
+                source_required = bool(acceptance_row.get("required_for_gate"))
+            row["resolved_by_source_policy"] = bool(
+                source_key
+                and (
+                    acceptance_by_source.get(source_key, {}).get("effective_state") in HEALTHY_STATES
+                    or not source_required
+                )
+            )
+            if not row["resolved_by_source_policy"]:
+                unresolved_warning_jobs.append(row)
 
         degrade_reasons: list[str] = []
         warnings: list[str] = []
@@ -169,10 +312,13 @@ def build_quality_gate(settings: dict[str, Any] | None = None) -> dict[str, Any]
             _append_once(degrade_reasons, "relation_quality_gate_failed")
         if duplicate_leakage > int(cfg["max_duplicate_leakage"]):
             _append_once(degrade_reasons, "dedupe_leak_gate_failed")
-        if len(degraded_rows) > int(cfg["max_degraded_sources"]):
+        if len(unresolved_blockers) > int(cfg["max_degraded_sources"]):
             _append_once(degrade_reasons, "source_health_gate_failed")
-        if len(critical_warning_jobs) > int(cfg["max_critical_warning_jobs"]):
+        if len(unresolved_warning_jobs) > int(cfg["max_critical_warning_jobs"]):
             _append_once(degrade_reasons, "source_health_gate_failed")
+
+        if source_review_rows:
+            _sync_source_review_tasks(conn, source_review_rows)
 
         report = {
             "ok": not degrade_reasons,
@@ -217,6 +363,12 @@ def build_quality_gate(settings: dict[str, Any] | None = None) -> dict[str, Any]
                     for row in degraded_rows
                 ],
             },
+            "source_acceptance": {
+                "rows": source_acceptance_rows,
+            },
+            "fixture_backed_sources": fixture_backed_sources,
+            "archive_backed_sources": archive_backed_sources,
+            "unresolved_blockers": unresolved_blockers,
             "ok_with_warning_jobs": [
                 {
                     "job_id": row[0],
@@ -226,6 +378,7 @@ def build_quality_gate(settings: dict[str, Any] | None = None) -> dict[str, Any]
                 for row in ok_with_warning_rows
             ],
             "critical_warning_jobs": critical_warning_jobs,
+            "unresolved_warning_jobs": unresolved_warning_jobs,
             "degrade_reasons": degrade_reasons,
             "report_path": str(report_path),
         }

@@ -165,6 +165,63 @@ class QualityGateTests(unittest.TestCase):
             self.assertEqual(len(result["artifacts"]["critical_warning_jobs"]), 1)
             self.assertEqual(result["artifacts"]["critical_warning_jobs"][0]["failure_class"], "bad_asset")
 
+    def test_quality_gate_allows_non_required_source_warning_when_manifest_matches(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "quality.db"
+            report_path = Path(tmp) / "qa_quality_latest.json"
+            manifest_path = Path(tmp) / "source_health_manifest.json"
+            create_quality_db(db_path)
+            manifest_path.write_text(
+                """
+                {
+                  "state_company_reports:Газпром": {
+                    "acceptance_mode": "direct_only",
+                    "required_for_gate": false,
+                    "warning_match": ["Газпром:", "www.gazprom.ru"]
+                  }
+                }
+                """,
+                encoding="utf-8",
+            )
+
+            conn = sqlite3.connect(db_path)
+            try:
+                conn.executescript(
+                    """
+                    INSERT INTO source_sync_state(source_key, state, quality_state, failure_class, last_error)
+                    VALUES('state_company_reports:Газпром', 'degraded', 'ok', '', 'ConnectTimeout: https://www.gazprom.ru/about/management/');
+
+                    INSERT INTO job_runs(job_id, trigger_mode, requested_by, owner, attempt_no, status, started_at, warnings_json)
+                    VALUES
+                        ('state_company_reports', 'manual', 'test', 'owner', 1, 'ok', '2026-04-26T00:00:00', '[\"Газпром: ConnectTimeout on https://www.gazprom.ru/about/management/\"]'),
+                        ('tagger', 'manual', 'test', 'owner', 1, 'ok', '2026-04-26T00:00:00', '[]');
+                    """
+                )
+                set_runtime_metadata(conn, "classifier_audit_last_status", "ok")
+                set_runtime_metadata(conn, "classifier_audit_last_report", {"reviewed_baseline_ready": True})
+                conn.commit()
+            finally:
+                conn.close()
+
+            result = build_quality_gate(
+                {
+                    "db_path": str(db_path),
+                    "ensure_schema_on_connect": True,
+                    "source_health_manifest_path": str(manifest_path),
+                    "quality_gate": {
+                        "report_path": str(report_path),
+                        "strict_gate": True,
+                    },
+                }
+            )
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["fatal_errors"], [])
+            self.assertEqual(len(result["artifacts"]["critical_warning_jobs"]), 1)
+            self.assertEqual(result["artifacts"]["critical_warning_jobs"][0]["source_key"], "state_company_reports:Газпром")
+            self.assertTrue(result["artifacts"]["critical_warning_jobs"][0]["resolved_by_source_policy"])
+            self.assertEqual(result["artifacts"]["unresolved_warning_jobs"], [])
+
 
 if __name__ == "__main__":
     unittest.main()
