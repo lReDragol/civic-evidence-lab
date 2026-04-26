@@ -68,7 +68,7 @@ def compute_source_credibility(conn, claim_id: int, source_id: int) -> float:
 def compute_document_evidence(conn, claim_id: int) -> float:
     links = conn.execute(
         """
-        SELECT el.strength, c.content_type, s.category
+        SELECT el.evidence_class, el.strength, c.content_type, s.category
         FROM evidence_links el
         LEFT JOIN content_items c ON c.id = el.evidence_item_id
         LEFT JOIN sources s ON s.id = c.source_id
@@ -80,21 +80,44 @@ def compute_document_evidence(conn, claim_id: int) -> float:
         return 0.0
 
     score = 0.0
-    for strength, content_type, source_category in links:
-        link_score = {"strong": 0.5, "moderate": 0.3, "weak": 0.1}.get(strength, 0.1)
+    class_weights = {"hard": 0.75, "support": 0.35, "seed": 0.12}
+    strength_weights = {"strong": 1.0, "moderate": 0.7, "weak": 0.4}
+    for evidence_class, strength, content_type, source_category in links:
+        link_score = class_weights.get(str(evidence_class or "support"), 0.25) * strength_weights.get(strength, 0.4)
         if content_type in OFFICIAL_CONTENT_TYPES:
-            link_score *= 1.5
+            link_score *= 1.35
         if source_category in OFFICIAL_CATEGORIES:
-            link_score *= 1.3
+            link_score *= 1.2
         score += link_score
     return min(1.0, score)
 
 
 def compute_cross_source_corroboration(conn, claim_id: int) -> float:
-    claim_row = conn.execute("SELECT content_item_id, claim_text FROM claims WHERE id=?", (claim_id,)).fetchone()
+    claim_cols = {row[1] for row in conn.execute("PRAGMA table_info(claims)").fetchall()}
+    has_claim_cluster = "claim_cluster_id" in claim_cols
+    select_sql = "SELECT content_item_id, claim_text" + (", claim_cluster_id" if has_claim_cluster else "") + " FROM claims WHERE id=?"
+    claim_row = conn.execute(select_sql, (claim_id,)).fetchone()
     if not claim_row:
         return 0.0
-    content_id, claim_text = claim_row
+    content_id = claim_row[0]
+    claim_text = claim_row[1]
+    claim_cluster_id = claim_row[2] if has_claim_cluster and len(claim_row) >= 3 else None
+
+    if claim_cluster_id:
+        clustered_sources = conn.execute(
+            """
+            SELECT COUNT(DISTINCT c.source_id)
+            FROM claims cl
+            JOIN content_items c ON c.id = cl.content_item_id
+            WHERE cl.claim_cluster_id=?
+              AND c.id != ?
+            """,
+            (claim_cluster_id, content_id),
+        ).fetchone()[0]
+        if clustered_sources >= 3:
+            return 0.8
+        if clustered_sources >= 2:
+            return 0.6
 
     source_ids = conn.execute(
         """
@@ -282,7 +305,7 @@ def compute_rhetoric_risk(conn, claim_id: int) -> float:
         risk += 0.2
 
     negative_filter_tags = conn.execute(
-        "SELECT COUNT(*) FROM content_tags WHERE content_item_id=? AND tag_name LIKE 'filter:%' OR tag_name LIKE 'negative:%'",
+        "SELECT COUNT(*) FROM content_tags WHERE content_item_id=? AND (tag_name LIKE 'filter:%' OR tag_name LIKE 'negative:%')",
         (content_id,),
     ).fetchone()[0]
     if negative_filter_tags > 0:
@@ -389,13 +412,60 @@ def store_verification(conn, claim_id: int, verifier_type: str, old_status: str,
         log.warning("Failed to store verification for claim %d: %s", claim_id, e)
 
 
+def _claim_update_columns(conn) -> set[str]:
+    return {row[1] for row in conn.execute("PRAGMA table_info(claims)").fetchall()}
+
+
+def _claim_update_payload(columns: set[str], result: Dict, new_status: str) -> dict[str, float | str]:
+    factors = result["factors"]
+    consistency_score = round(
+        max(
+            0.0,
+            min(
+                1.0,
+                0.45 * float(factors["temporal_consistency"])
+                + 0.35 * float(factors["entity_verification"])
+                + 0.20 * (1.0 - float(factors["contradiction_penalty"])),
+            ),
+        ),
+        4,
+    )
+    payload: dict[str, float | str] = {
+        "status": new_status,
+        "source_score": factors["source_credibility"],
+        "document_score": factors["document_evidence"],
+        "corroboration_score": factors["cross_source_corroboration"],
+    }
+    if "consistency_score" in columns:
+        payload["consistency_score"] = consistency_score
+    if "manipulation_risk" in columns:
+        payload["manipulation_risk"] = factors["rhetoric_risk"]
+    if "editor_review_score" in columns:
+        payload["editor_review_score"] = 0.0
+    if "temporal_consistency" in columns:
+        payload["temporal_consistency"] = factors["temporal_consistency"]
+    if "cross_source_score" in columns:
+        payload["cross_source_score"] = factors["cross_source_corroboration"]
+    if "entity_verification_score" in columns:
+        payload["entity_verification_score"] = factors["entity_verification"]
+    if "rhetoric_risk_score" in columns:
+        payload["rhetoric_risk_score"] = factors["rhetoric_risk"]
+    if "contradiction_score" in columns:
+        payload["contradiction_score"] = factors["contradiction_penalty"]
+    return payload
+
+
+def _content_item_has_authenticity_score(conn) -> bool:
+    return any(row[1] == "authenticity_score" for row in conn.execute("PRAGMA table_info(content_items)").fetchall())
+
+
 def reverify_all_claims(settings=None, limit: int = 500, claim_type_filter: Optional[str] = None):
     if settings is None:
         settings = load_settings()
     conn = get_db(settings)
     conn.row_factory = sqlite3.Row
 
-    query = "SELECT id, claim_text, claim_type, status FROM claims WHERE 1=1"
+    query = "SELECT id, claim_text, claim_type, status FROM claims WHERE COALESCE(status, '') != 'archived_low_signal'"
     params = []
     if claim_type_filter:
         query += " AND claim_type=?"
@@ -405,6 +475,8 @@ def reverify_all_claims(settings=None, limit: int = 500, claim_type_filter: Opti
 
     rows = conn.execute(query, params).fetchall()
     log.info("Re-verifying %d claims with 7-factor model", len(rows))
+    claim_columns = _claim_update_columns(conn)
+    has_content_authenticity_score = _content_item_has_authenticity_score(conn)
 
     status_changes = {}
     updated = 0
@@ -417,29 +489,18 @@ def reverify_all_claims(settings=None, limit: int = 500, claim_type_filter: Opti
         new_status = result["status"]
 
         try:
+            payload = _claim_update_payload(claim_columns, result, new_status)
+            assignments = ", ".join(f"{column_name}=?" for column_name in payload)
             conn.execute(
-                "UPDATE claims SET status=?, source_score=?, document_score=?, corroboration_score=?, "
-                "temporal_consistency=?, cross_source_score=?, entity_verification_score=?, "
-                "rhetoric_risk_score=?, contradiction_score=? WHERE id=?",
-                (
-                    new_status,
-                    result["factors"]["source_credibility"],
-                    result["factors"]["document_evidence"],
-                    result["factors"]["cross_source_corroboration"],
-                    result["factors"]["temporal_consistency"],
-                    result["factors"]["cross_source_corroboration"],
-                    result["factors"]["entity_verification"],
-                    result["factors"]["rhetoric_risk"],
-                    result["factors"]["contradiction_penalty"],
-                    claim_id,
-                ),
+                f"UPDATE claims SET {assignments} WHERE id=?",
+                (*payload.values(), claim_id),
             )
 
             content_row = conn.execute(
                 "SELECT c.id FROM claims cl JOIN content_items c ON c.id = cl.content_item_id WHERE cl.id=?",
                 (claim_id,),
             ).fetchone()
-            if content_row:
+            if content_row and has_content_authenticity_score:
                 conn.execute(
                     "UPDATE content_items SET authenticity_score=? WHERE id=?",
                     (result["score"], content_row[0]),

@@ -14,6 +14,7 @@ if sys_path not in sys.path:
     os.sys.path.insert(0, sys_path)
 
 from config.db_utils import get_db, load_settings
+from verification.claim_normalizer import canonical_hash, canonicalize_claim_text
 
 log = logging.getLogger(__name__)
 
@@ -261,10 +262,17 @@ def link_local_evidence_for_claim(
         )
         conn.execute(
             """
-            INSERT INTO evidence_links(claim_id, evidence_item_id, evidence_type, strength, notes)
-            VALUES(?,?,?,?,?)
+            INSERT INTO evidence_links(claim_id, evidence_item_id, evidence_type, evidence_class, strength, notes)
+            VALUES(?,?,?,?,?,?)
             """,
-            (claim_id, item["content_item_id"], "local_official_document", strength, notes),
+            (
+                claim_id,
+                item["content_item_id"],
+                "local_official_document",
+                "hard" if item["source_category"] in {"official_registry", "official_site"} else "support",
+                strength,
+                notes,
+            ),
         )
         links += 1
     return links
@@ -425,17 +433,38 @@ def process_claims_for_content(
 
         for claim in claims:
             try:
+                canonical_text = canonicalize_claim_text(claim["text"], claim["claim_type"])
+                if canonical_text is None:
+                    continue
+                canonical_key = canonical_hash(canonical_text)
                 existing = conn.execute(
-                    "SELECT id FROM claims WHERE content_item_id=? AND claim_text=? AND claim_type=?",
-                    (content_id, claim["text"][:500], claim["claim_type"]),
+                    """
+                    SELECT id
+                    FROM claims
+                    WHERE content_item_id=?
+                      AND claim_type=?
+                      AND (
+                            canonical_hash=?
+                            OR claim_text=?
+                          )
+                    """,
+                    (content_id, claim["claim_type"], canonical_key, claim["text"][:500]),
                 ).fetchone()
                 if existing:
                     claim_id = existing[0]
                 else:
                     cur = conn.execute(
-                        """INSERT INTO claims(content_item_id, claim_text, claim_type, status, source_score, needs_review)
-                           VALUES(?,?,?,?,?,1)""",
-                        (content_id, claim["text"][:500], claim["claim_type"], "unverified", CREDIBILITY_TIER_SCORES.get(tier, 0.15)),
+                        """INSERT INTO claims(content_item_id, claim_text, canonical_text, canonical_hash, claim_type, status, source_score, needs_review)
+                           VALUES(?,?,?,?,?,?,?,1)""",
+                        (
+                            content_id,
+                            claim["text"][:500],
+                            canonical_text[:500],
+                            canonical_key,
+                            claim["claim_type"],
+                            "unverified",
+                            CREDIBILITY_TIER_SCORES.get(tier, 0.15),
+                        ),
                     )
                     claim_id = cur.lastrowid
                     total_claims += 1
@@ -479,8 +508,8 @@ def process_claims_for_content(
                     evidence_found = True
                     try:
                         conn.execute(
-                            """INSERT INTO evidence_links(claim_id, evidence_item_id, evidence_type, strength, notes)
-                               VALUES(?,NULL,'registry_record','strong',?)""",
+                            """INSERT INTO evidence_links(claim_id, evidence_item_id, evidence_type, evidence_class, strength, notes)
+                               VALUES(?,NULL,'registry_record','hard','strong',?)""",
                             (claim_id, json.dumps(result, ensure_ascii=False)),
                         )
                     except Exception:
@@ -492,8 +521,8 @@ def process_claims_for_content(
                     evidence_found = True
                     try:
                         conn.execute(
-                            """INSERT INTO evidence_links(claim_id, evidence_item_id, evidence_type, strength, notes)
-                               VALUES(?,NULL,'court_record','strong',?)""",
+                            """INSERT INTO evidence_links(claim_id, evidence_item_id, evidence_type, evidence_class, strength, notes)
+                               VALUES(?,NULL,'court_record','hard','strong',?)""",
                             (claim_id, json.dumps(result, ensure_ascii=False)),
                         )
                     except Exception:
@@ -505,8 +534,8 @@ def process_claims_for_content(
                     evidence_found = True
                     try:
                         conn.execute(
-                            """INSERT INTO evidence_links(claim_id, evidence_item_id, evidence_type, strength, notes)
-                               VALUES(?,NULL,'fssp_record','moderate',?)""",
+                            """INSERT INTO evidence_links(claim_id, evidence_item_id, evidence_type, evidence_class, strength, notes)
+                               VALUES(?,NULL,'fssp_record','support','moderate',?)""",
                             (claim_id, json.dumps(result, ensure_ascii=False)),
                         )
                     except Exception:

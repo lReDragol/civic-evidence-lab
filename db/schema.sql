@@ -85,6 +85,7 @@ CREATE TABLE IF NOT EXISTS content_items (
     llm_processed   INTEGER DEFAULT 0,
     quotes_processed INTEGER DEFAULT 0,
     granular_processed INTEGER DEFAULT 0,
+    classification_v3_processed INTEGER DEFAULT 0,
     FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE CASCADE,
     FOREIGN KEY (raw_item_id) REFERENCES raw_source_items(id) ON DELETE SET NULL
 );
@@ -165,6 +166,9 @@ CREATE TABLE IF NOT EXISTS claims (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     content_item_id INTEGER NOT NULL,
     claim_text      TEXT NOT NULL,
+    canonical_text  TEXT,
+    canonical_hash  TEXT,
+    claim_cluster_id INTEGER,
     claim_type      TEXT,
     confidence_auto REAL,
     confidence_final REAL,
@@ -180,17 +184,21 @@ CREATE TABLE IF NOT EXISTS claims (
     reviewed_at     TEXT,
     created_at      TEXT DEFAULT (datetime('now')),
     FOREIGN KEY (content_item_id) REFERENCES content_items(id) ON DELETE CASCADE
+    -- claim_cluster_id FK added via additive schema helper for backward compatibility
 );
 
 CREATE INDEX IF NOT EXISTS idx_claims_status ON claims(status);
 CREATE INDEX IF NOT EXISTS idx_claims_content ON claims(content_item_id);
 CREATE INDEX IF NOT EXISTS idx_claims_review ON claims(needs_review);
+CREATE INDEX IF NOT EXISTS idx_claims_canonical_hash ON claims(canonical_hash);
+CREATE INDEX IF NOT EXISTS idx_claims_cluster ON claims(claim_cluster_id);
 
 CREATE TABLE IF NOT EXISTS evidence_links (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     claim_id        INTEGER NOT NULL,
     evidence_item_id INTEGER,
     evidence_type   TEXT NOT NULL,
+    evidence_class  TEXT DEFAULT 'support',
     strength        TEXT DEFAULT 'moderate',
     notes           TEXT,
     linked_by       TEXT,
@@ -201,6 +209,7 @@ CREATE TABLE IF NOT EXISTS evidence_links (
 
 CREATE INDEX IF NOT EXISTS idx_evidence_claim ON evidence_links(claim_id);
 CREATE INDEX IF NOT EXISTS idx_evidence_item ON evidence_links(evidence_item_id);
+CREATE INDEX IF NOT EXISTS idx_evidence_class ON evidence_links(evidence_class);
 
 CREATE TABLE IF NOT EXISTS cases (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -324,8 +333,12 @@ CREATE TABLE IF NOT EXISTS content_tags (
     content_item_id INTEGER NOT NULL,
     tag_level       INTEGER NOT NULL,
     tag_name        TEXT NOT NULL,
+    namespace       TEXT,
+    normalized_tag  TEXT,
     confidence      REAL DEFAULT 1.0,
+    confidence_calibrated REAL,
     tag_source      TEXT DEFAULT 'rule',
+    decision_source TEXT,
     FOREIGN KEY (content_item_id) REFERENCES content_items(id) ON DELETE CASCADE,
     UNIQUE(content_item_id, tag_level, tag_name)
 );
@@ -333,6 +346,27 @@ CREATE TABLE IF NOT EXISTS content_tags (
 CREATE INDEX IF NOT EXISTS idx_content_tags_item ON content_tags(content_item_id);
 CREATE INDEX IF NOT EXISTS idx_content_tags_name ON content_tags(tag_name);
 CREATE INDEX IF NOT EXISTS idx_content_tags_level ON content_tags(tag_level);
+CREATE INDEX IF NOT EXISTS idx_content_tags_namespace ON content_tags(namespace);
+CREATE INDEX IF NOT EXISTS idx_content_tags_normalized ON content_tags(normalized_tag);
+
+CREATE TABLE IF NOT EXISTS content_tag_votes (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    content_item_id INTEGER NOT NULL,
+    voter_name      TEXT NOT NULL,
+    tag_name        TEXT NOT NULL,
+    namespace       TEXT,
+    normalized_tag  TEXT,
+    vote_value      TEXT NOT NULL,
+    confidence_raw  REAL DEFAULT 0,
+    evidence_text   TEXT,
+    metadata_json   TEXT,
+    created_at      TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (content_item_id) REFERENCES content_items(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_content_tag_votes_item ON content_tag_votes(content_item_id);
+CREATE INDEX IF NOT EXISTS idx_content_tag_votes_tag ON content_tag_votes(normalized_tag);
+CREATE INDEX IF NOT EXISTS idx_content_tag_votes_vote ON content_tag_votes(vote_value);
 
 CREATE TABLE IF NOT EXISTS entity_relations (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -673,8 +707,13 @@ CREATE TABLE IF NOT EXISTS relation_candidates (
     entity_a_id     INTEGER NOT NULL,
     entity_b_id     INTEGER NOT NULL,
     candidate_type  TEXT NOT NULL,
+    seed_kind       TEXT,
     origin          TEXT NOT NULL,
     score           REAL DEFAULT 0,
+    structural_score REAL DEFAULT 0,
+    semantic_score  REAL DEFAULT 0,
+    support_score   REAL DEFAULT 0,
+    calibrated_score REAL DEFAULT 0,
     source_independence REAL DEFAULT 0,
     evidence_overlap REAL DEFAULT 0,
     temporal_proximity REAL DEFAULT 0,
@@ -685,12 +724,16 @@ CREATE TABLE IF NOT EXISTS relation_candidates (
     support_sources INTEGER DEFAULT 0,
     support_domains INTEGER DEFAULT 0,
     support_categories INTEGER DEFAULT 0,
+    support_claim_cluster_count INTEGER DEFAULT 0,
+    support_hard_evidence_count INTEGER DEFAULT 0,
     first_seen_at   TEXT,
     last_seen_at    TEXT,
     sample_content_ids TEXT,
+    candidate_state TEXT DEFAULT 'pending',
     promotion_state TEXT DEFAULT 'pending',
     promoted_relation_type TEXT,
     promoted_at     TEXT,
+    explain_path_json TEXT,
     metadata_json   TEXT,
     FOREIGN KEY (entity_a_id) REFERENCES entities(id) ON DELETE CASCADE,
     FOREIGN KEY (entity_b_id) REFERENCES entities(id) ON DELETE CASCADE,
@@ -701,6 +744,7 @@ CREATE INDEX IF NOT EXISTS idx_relation_candidates_pair ON relation_candidates(e
 CREATE INDEX IF NOT EXISTS idx_relation_candidates_score ON relation_candidates(score);
 CREATE INDEX IF NOT EXISTS idx_relation_candidates_state ON relation_candidates(promotion_state);
 CREATE INDEX IF NOT EXISTS idx_relation_candidates_type ON relation_candidates(candidate_type);
+CREATE INDEX IF NOT EXISTS idx_relation_candidates_candidate_state ON relation_candidates(candidate_state);
 
 CREATE TABLE IF NOT EXISTS relation_support (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -724,6 +768,26 @@ CREATE INDEX IF NOT EXISTS idx_relation_support_candidate ON relation_support(ca
 CREATE INDEX IF NOT EXISTS idx_relation_support_content ON relation_support(content_item_id);
 CREATE INDEX IF NOT EXISTS idx_relation_support_source ON relation_support(source_id);
 
+CREATE TABLE IF NOT EXISTS relation_features (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    candidate_id    INTEGER NOT NULL UNIQUE,
+    structural_score REAL DEFAULT 0,
+    content_support_score REAL DEFAULT 0,
+    source_diversity_score REAL DEFAULT 0,
+    semantic_support_score REAL DEFAULT 0,
+    shared_claim_cluster_score REAL DEFAULT 0,
+    evidence_quality_score REAL DEFAULT 0,
+    temporal_score REAL DEFAULT 0,
+    role_compatibility_score REAL DEFAULT 0,
+    calibrated_score REAL DEFAULT 0,
+    explain_path_json TEXT,
+    metadata_json   TEXT,
+    updated_at      TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (candidate_id) REFERENCES relation_candidates(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_relation_features_candidate ON relation_features(candidate_id);
+
 CREATE TABLE IF NOT EXISTS classifier_audit_samples (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     sample_kind     TEXT NOT NULL,
@@ -742,6 +806,57 @@ CREATE TABLE IF NOT EXISTS classifier_audit_samples (
 CREATE INDEX IF NOT EXISTS idx_classifier_audit_kind ON classifier_audit_samples(sample_kind);
 CREATE INDEX IF NOT EXISTS idx_classifier_audit_status ON classifier_audit_samples(review_status);
 CREATE INDEX IF NOT EXISTS idx_classifier_audit_batch ON classifier_audit_samples(batch_name);
+
+CREATE TABLE IF NOT EXISTS semantic_neighbors (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_kind     TEXT NOT NULL,
+    source_id       INTEGER NOT NULL,
+    neighbor_kind   TEXT NOT NULL,
+    neighbor_id     INTEGER NOT NULL,
+    score           REAL DEFAULT 0,
+    method          TEXT DEFAULT 'tfidf',
+    metadata_json   TEXT,
+    created_at      TEXT DEFAULT (datetime('now')),
+    UNIQUE(source_kind, source_id, neighbor_kind, neighbor_id, method)
+);
+
+CREATE INDEX IF NOT EXISTS idx_semantic_neighbors_source ON semantic_neighbors(source_kind, source_id);
+CREATE INDEX IF NOT EXISTS idx_semantic_neighbors_neighbor ON semantic_neighbors(neighbor_kind, neighbor_id);
+
+CREATE TABLE IF NOT EXISTS claim_clusters (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    cluster_key     TEXT NOT NULL UNIQUE,
+    canonical_text  TEXT NOT NULL,
+    claim_type      TEXT,
+    method          TEXT DEFAULT 'canonical',
+    status          TEXT DEFAULT 'active',
+    support_count   INTEGER DEFAULT 0,
+    metadata_json   TEXT,
+    created_at      TEXT DEFAULT (datetime('now')),
+    updated_at      TEXT DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_claim_clusters_type ON claim_clusters(claim_type);
+CREATE INDEX IF NOT EXISTS idx_claim_clusters_status ON claim_clusters(status);
+
+CREATE TABLE IF NOT EXISTS claim_occurrences (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    claim_cluster_id INTEGER NOT NULL,
+    claim_id        INTEGER,
+    content_item_id INTEGER,
+    occurrence_text TEXT NOT NULL,
+    occurrence_hash TEXT NOT NULL,
+    source_kind     TEXT DEFAULT 'claim',
+    metadata_json   TEXT,
+    created_at      TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (claim_cluster_id) REFERENCES claim_clusters(id) ON DELETE CASCADE,
+    FOREIGN KEY (claim_id) REFERENCES claims(id) ON DELETE SET NULL,
+    FOREIGN KEY (content_item_id) REFERENCES content_items(id) ON DELETE SET NULL,
+    UNIQUE(claim_cluster_id, content_item_id, occurrence_hash)
+);
+
+CREATE INDEX IF NOT EXISTS idx_claim_occurrences_cluster ON claim_occurrences(claim_cluster_id);
+CREATE INDEX IF NOT EXISTS idx_claim_occurrences_claim ON claim_occurrences(claim_id);
 
 CREATE TABLE IF NOT EXISTS investigation_leads (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,

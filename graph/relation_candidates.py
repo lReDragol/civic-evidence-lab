@@ -26,6 +26,8 @@ PROMOTED_RELATION_TYPES = (
     "same_contract_cluster",
     "same_case_cluster",
 )
+OFFICIAL_SOURCE_CATEGORIES = {"official_registry", "official_site"}
+HARD_CONTENT_TYPES = {"registry_record", "court_record", "enforcement", "procurement", "bill", "transcript"}
 GENERIC_TAGS = {
     "regional",
     "international",
@@ -209,12 +211,67 @@ def _shared_content_rows(conn) -> list[dict[str, Any]]:
 def _load_tag_map(conn) -> dict[int, set[str]]:
     if not _table_exists(conn, "content_tags"):
         return defaultdict(set)
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(content_tags)").fetchall()}
+    params: list[Any] = []
+    predicate = ""
+    if "decision_source" in columns:
+        has_v3 = conn.execute(
+            "SELECT 1 FROM content_tags WHERE COALESCE(decision_source, '')='classifier_v3' LIMIT 1"
+        ).fetchone()
+        if has_v3:
+            predicate = "WHERE COALESCE(decision_source, '')='classifier_v3'"
     data: dict[int, set[str]] = defaultdict(set)
     for content_item_id, tag_name in conn.execute(
-        "SELECT content_item_id, tag_name FROM content_tags"
+        f"SELECT content_item_id, tag_name FROM content_tags {predicate}",
+        params,
     ).fetchall():
         data[int(content_item_id)].add(str(tag_name or ""))
     return data
+
+
+def _load_claim_cluster_map(conn) -> dict[int, set[int]]:
+    if not _table_exists(conn, "claims"):
+        return defaultdict(set)
+    columns = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(claims)").fetchall()
+    }
+    if "claim_cluster_id" not in columns:
+        return defaultdict(set)
+    data: dict[int, set[int]] = defaultdict(set)
+    for entity_id, cluster_id in conn.execute(
+        """
+        SELECT DISTINCT em.entity_id, cl.claim_cluster_id
+        FROM claims cl
+        JOIN entity_mentions em ON em.content_item_id = cl.content_item_id
+        WHERE cl.claim_cluster_id IS NOT NULL
+        """
+    ).fetchall():
+        if entity_id is None or cluster_id is None:
+            continue
+        data[int(entity_id)].add(int(cluster_id))
+    return data
+
+
+def _load_entity_semantic_scores(conn) -> dict[tuple[int, int], float]:
+    if not _table_exists(conn, "semantic_neighbors"):
+        return {}
+    scores: dict[tuple[int, int], float] = {}
+    for source_id, neighbor_id, score in conn.execute(
+        """
+        SELECT source_id, neighbor_id, score
+        FROM semantic_neighbors
+        WHERE source_kind='entity'
+          AND neighbor_kind='entity'
+        """
+    ).fetchall():
+        if source_id is None or neighbor_id is None:
+            continue
+        entity_a = min(int(source_id), int(neighbor_id))
+        entity_b = max(int(source_id), int(neighbor_id))
+        pair = (entity_a, entity_b)
+        scores[pair] = max(float(score or 0.0), scores.get(pair, 0.0))
+    return scores
 
 
 def _score_candidate(
@@ -303,41 +360,95 @@ def _score_value(
     )
 
 
-def _apply_structural_seed_floor(
-    metrics: dict[str, Any],
+def _structural_score(
     *,
     structural_seed_kind: str | None,
     candidate_type: str,
-) -> dict[str, Any]:
+    bill_overlap: int,
+    contract_overlap: int,
+    case_overlap: int,
+    risk_overlap: int,
+    vote_overlap_count: int,
+    vote_overlap_ratio: float,
+) -> float:
     if structural_seed_kind == "vote" and candidate_type == "same_vote_pattern":
-        metrics["source_independence"] = round(max(float(metrics["source_independence"]), 0.85), 4)
-        metrics["evidence_overlap"] = round(max(float(metrics["evidence_overlap"]), 0.85), 4)
-        metrics["temporal_proximity"] = round(max(float(metrics["temporal_proximity"]), 0.75), 4)
-    elif structural_seed_kind == "bill" and candidate_type == "same_bill_cluster":
-        metrics["source_independence"] = round(max(float(metrics["source_independence"]), 0.50), 4)
-        metrics["evidence_overlap"] = round(max(float(metrics["evidence_overlap"]), 0.55), 4)
-        metrics["temporal_proximity"] = round(max(float(metrics["temporal_proximity"]), 0.55), 4)
-    elif structural_seed_kind == "contract" and candidate_type == "same_contract_cluster":
-        metrics["source_independence"] = round(max(float(metrics["source_independence"]), 0.45), 4)
-        metrics["evidence_overlap"] = round(max(float(metrics["evidence_overlap"]), 0.45), 4)
-        metrics["temporal_proximity"] = round(max(float(metrics["temporal_proximity"]), 0.50), 4)
-    elif structural_seed_kind == "case" and candidate_type == "same_case_cluster":
-        metrics["source_independence"] = round(max(float(metrics["source_independence"]), 0.40), 4)
-        metrics["evidence_overlap"] = round(max(float(metrics["evidence_overlap"]), 0.50), 4)
-        metrics["temporal_proximity"] = round(max(float(metrics["temporal_proximity"]), 0.55), 4)
+        return round(min(1.0, 0.65 + min(0.2, vote_overlap_count / 100.0) + min(0.15, vote_overlap_ratio * 0.15)), 4)
+    if structural_seed_kind == "bill" and candidate_type == "same_bill_cluster":
+        return round(min(1.0, 0.35 + min(0.3, bill_overlap * 0.1)), 4)
+    if structural_seed_kind == "contract" and candidate_type == "same_contract_cluster":
+        return round(min(1.0, 0.40 + min(0.25, contract_overlap * 0.15)), 4)
+    if structural_seed_kind == "case" and candidate_type == "same_case_cluster":
+        return round(min(1.0, 0.35 + min(0.2, case_overlap * 0.08) + min(0.2, risk_overlap * 0.08)), 4)
+    return 0.0
 
-    metrics["score"] = round(
-        _score_value(
-            float(metrics["source_independence"]),
-            float(metrics["evidence_overlap"]),
-            float(metrics["temporal_proximity"]),
-            float(metrics["role_compatibility"]),
-            float(metrics["tag_overlap"]),
-            float(metrics["text_specificity"]),
-        ),
-        4,
+
+def _candidate_state(
+    *,
+    structural_seed_kind: str | None,
+    support_items: int,
+    support_sources: int,
+    support_domains: int,
+    support_claim_cluster_count: int,
+    support_hard_evidence_count: int,
+    semantic_support_score: float,
+    calibrated_score: float,
+    explain_path: list[dict[str, Any]],
+) -> str:
+    has_support_layer = any(
+        (
+            support_items > 0,
+            support_sources > 0,
+            support_domains > 0,
+            support_claim_cluster_count > 0,
+            support_hard_evidence_count > 0,
+            semantic_support_score >= 0.35,
+        )
     )
-    return metrics
+    if structural_seed_kind and not has_support_layer:
+        return "seed_only"
+    if (
+        explain_path
+        and calibrated_score >= PROMOTION_SCORE_THRESHOLD
+        and (
+            (support_items >= 1 and support_sources >= 2)
+            or (support_hard_evidence_count >= 1 and (support_claim_cluster_count >= 1 or support_items >= 1))
+        )
+    ):
+        return "promoted"
+    if has_support_layer:
+        return "review"
+    return "pending"
+
+
+def _build_explain_path(
+    *,
+    shared_content_ids: list[int],
+    shared_claim_cluster_ids: list[int],
+    shared_case_ids: list[int],
+    shared_bill_ids: list[int],
+    shared_contract_ids: list[int],
+    shared_risk_ids: list[int],
+    shared_vote_count: int,
+    entity_semantic_score: float,
+) -> list[dict[str, Any]]:
+    path: list[dict[str, Any]] = []
+    if shared_claim_cluster_ids:
+        path.append({"node_type": "ClaimCluster", "ids": shared_claim_cluster_ids[:5]})
+    if shared_content_ids:
+        path.append({"node_type": "Content", "ids": shared_content_ids[:5]})
+    if shared_case_ids:
+        path.append({"node_type": "Case", "ids": shared_case_ids[:5]})
+    if shared_bill_ids:
+        path.append({"node_type": "Bill", "ids": shared_bill_ids[:5]})
+    if shared_contract_ids:
+        path.append({"node_type": "Contract", "ids": shared_contract_ids[:5]})
+    if shared_risk_ids:
+        path.append({"node_type": "Risk", "ids": shared_risk_ids[:5]})
+    if shared_vote_count:
+        path.append({"node_type": "VotePattern", "same_vote_count": int(shared_vote_count)})
+    if entity_semantic_score >= 0.35:
+        path.append({"node_type": "SemanticNeighbor", "score": round(entity_semantic_score, 4)})
+    return path
 
 
 def _candidate_type(
@@ -424,6 +535,8 @@ def _vote_seed_pairs(
 
 
 def _delete_previous_candidate_state(conn):
+    if _table_exists(conn, "relation_features"):
+        conn.execute("DELETE FROM relation_features")
     conn.execute("DELETE FROM relation_support")
     conn.execute("DELETE FROM relation_candidates WHERE origin LIKE 'candidate_builder:%'")
     conn.execute(
@@ -468,6 +581,8 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
         bill_map = _load_set_map(conn, "SELECT entity_id, bill_id FROM bill_sponsors WHERE entity_id IS NOT NULL") if _table_exists(conn, "bill_sponsors") else defaultdict(set)
         contract_map = _load_set_map(conn, "SELECT entity_id, contract_id FROM contract_parties WHERE entity_id IS NOT NULL") if _table_exists(conn, "contract_parties") else defaultdict(set)
         risk_map = _load_risk_map(conn)
+        claim_cluster_map = _load_claim_cluster_map(conn)
+        entity_semantic_scores = _load_entity_semantic_scores(conn)
         vote_map = _load_vote_map(conn)
 
         pair_rows = defaultdict(list)
@@ -536,6 +651,9 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
                         shared_content_ids,
                     ).fetchone()
                     shared_claims = int(row[0]) if row else 0
+            shared_claim_cluster_ids = sorted(claim_cluster_map.get(entity_a, set()) & claim_cluster_map.get(entity_b, set()))
+            support_claim_cluster_count = len(shared_claim_cluster_ids)
+            entity_semantic_score = float(entity_semantic_scores.get((entity_a, entity_b), 0.0))
 
             vote_seed = vote_seed_pairs.get((entity_a, entity_b), {})
             if vote_seed:
@@ -575,22 +693,91 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
                 structural_seed_kind=structural_seed_kind,
                 shared_claims=shared_claims,
             )
-            metrics = _apply_structural_seed_floor(
-                metrics,
+            structural_score = _structural_score(
                 structural_seed_kind=structural_seed_kind,
                 candidate_type=candidate_type,
+                bill_overlap=bill_overlap,
+                contract_overlap=contract_overlap,
+                case_overlap=case_overlap,
+                risk_overlap=risk_overlap,
+                vote_overlap_count=same_votes,
+                vote_overlap_ratio=vote_overlap_ratio,
             )
-            if metrics["score"] >= PROMOTION_SCORE_THRESHOLD:
-                promotion_state = "promoted"
-            elif structural_seed_kind and not shared_rows:
-                promotion_state = "review"
-            else:
-                promotion_state = "pending"
-            if promotion_state == "promoted":
+            content_support_score = round(
+                min(
+                    1.0,
+                    0.4 * min(1.0, metrics["support_items"] / 3.0)
+                    + 0.35 * min(1.0, metrics["support_sources"] / 2.0)
+                    + 0.25 * min(1.0, metrics["support_domains"] / 2.0),
+                ),
+                4,
+            )
+            source_diversity_score = round(
+                min(1.0, 0.5 * min(1.0, metrics["support_sources"] / 2.0) + 0.5 * min(1.0, metrics["support_domains"] / 2.0)),
+                4,
+            )
+            semantic_support_score = round(max(min(1.0, support_claim_cluster_count / 3.0), entity_semantic_score), 4)
+            evidence_quality_score = round(
+                min(
+                    1.0,
+                    sum(
+                        1.0
+                        for row in shared_rows
+                        if (row.get("source_category") in OFFICIAL_SOURCE_CATEGORIES)
+                    )
+                    / 2.0,
+                ),
+                4,
+            )
+            support_hard_evidence_count = len(
+                {
+                    row["content_item_id"]
+                    for row in shared_rows
+                    if row.get("source_category") in OFFICIAL_SOURCE_CATEGORIES
+                }
+            )
+            calibrated_score = round(
+                min(
+                    1.0,
+                    0.20 * structural_score
+                    + 0.20 * float(metrics["score"])
+                    + 0.20 * content_support_score
+                    + 0.12 * source_diversity_score
+                    + 0.12 * semantic_support_score
+                    + 0.10 * evidence_quality_score
+                    + 0.06 * float(metrics["temporal_proximity"]),
+                ),
+                4,
+            )
+            explain_path = _build_explain_path(
+                shared_content_ids=shared_content_ids,
+                shared_claim_cluster_ids=shared_claim_cluster_ids,
+                shared_case_ids=sorted(case_map.get(entity_a, set()) & case_map.get(entity_b, set())),
+                shared_bill_ids=sorted(bill_map.get(entity_a, set()) & bill_map.get(entity_b, set())),
+                shared_contract_ids=sorted(contract_map.get(entity_a, set()) & contract_map.get(entity_b, set())),
+                shared_risk_ids=sorted(risk_map.get(entity_a, set()) & risk_map.get(entity_b, set())),
+                shared_vote_count=same_votes,
+                entity_semantic_score=entity_semantic_score,
+            )
+            candidate_state = _candidate_state(
+                structural_seed_kind=structural_seed_kind,
+                support_items=metrics["support_items"],
+                support_sources=metrics["support_sources"],
+                support_domains=metrics["support_domains"],
+                support_claim_cluster_count=support_claim_cluster_count,
+                support_hard_evidence_count=support_hard_evidence_count,
+                semantic_support_score=semantic_support_score,
+                calibrated_score=calibrated_score,
+                explain_path=explain_path,
+            )
+            promotion_state = candidate_state
+            if candidate_state == "promoted":
                 promoted_candidates += 1
 
             metadata = {
                 "shared_claims": shared_claims,
+                "shared_claim_cluster_count": support_claim_cluster_count,
+                "entity_semantic_score": entity_semantic_score,
                 "case_overlap": case_overlap,
                 "bill_overlap": bill_overlap,
                 "contract_overlap": contract_overlap,
@@ -602,25 +789,33 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
                 "support_categories_list": sorted({row["source_category"] for row in shared_rows if row["source_category"]}),
                 "structural_seed": bool(structural_seed_kind and not shared_rows),
                 "structural_seed_kind": structural_seed_kind,
+                "explain_path": explain_path,
             }
 
             cur = conn.execute(
                 """
                 INSERT INTO relation_candidates(
-                    entity_a_id, entity_b_id, candidate_type, origin, score,
+                    entity_a_id, entity_b_id, candidate_type, seed_kind, origin, score,
+                    structural_score, semantic_score, support_score, calibrated_score,
                     source_independence, evidence_overlap, temporal_proximity,
                     role_compatibility, tag_overlap, text_specificity,
                     support_items, support_sources, support_domains, support_categories,
-                    first_seen_at, last_seen_at, sample_content_ids, promotion_state,
-                    promoted_relation_type, metadata_json
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    support_claim_cluster_count, support_hard_evidence_count,
+                    first_seen_at, last_seen_at, sample_content_ids, candidate_state, promotion_state,
+                    promoted_relation_type, explain_path_json, metadata_json
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     entity_a,
                     entity_b,
                     candidate_type,
+                    structural_seed_kind,
                     "candidate_builder:hybrid" if structural_seed_kind and not shared_rows else "candidate_builder:co_occurrence",
                     metrics["score"],
+                    structural_score,
+                    semantic_support_score,
+                    content_support_score,
+                    calibrated_score,
                     metrics["source_independence"],
                     metrics["evidence_overlap"],
                     metrics["temporal_proximity"],
@@ -631,16 +826,45 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
                     metrics["support_sources"],
                     metrics["support_domains"],
                     metrics["support_categories"],
+                    support_claim_cluster_count,
+                    support_hard_evidence_count,
                     min((row["seen_at"] for row in shared_rows if row["seen_at"]), default=None),
                     max((row["seen_at"] for row in shared_rows if row["seen_at"]), default=None),
                     json.dumps(shared_content_ids[:20], ensure_ascii=False),
+                    candidate_state,
                     promotion_state,
-                    candidate_type if promotion_state == "promoted" else None,
+                    candidate_type if candidate_state == "promoted" else None,
+                    json.dumps(explain_path, ensure_ascii=False),
                     json.dumps(metadata, ensure_ascii=False),
                 ),
             )
             candidate_id = int(cur.lastrowid)
             created += 1
+
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO relation_features(
+                    candidate_id, structural_score, content_support_score, source_diversity_score,
+                    semantic_support_score, shared_claim_cluster_score, evidence_quality_score,
+                    temporal_score, role_compatibility_score, calibrated_score, explain_path_json, metadata_json, updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    candidate_id,
+                    structural_score,
+                    content_support_score,
+                    source_diversity_score,
+                    semantic_support_score,
+                    round(min(1.0, support_claim_cluster_count / 3.0), 4),
+                    evidence_quality_score,
+                    metrics["temporal_proximity"],
+                    metrics["role_compatibility"],
+                    calibrated_score,
+                    json.dumps(explain_path, ensure_ascii=False),
+                    json.dumps(metadata, ensure_ascii=False),
+                    _now_iso(),
+                ),
+            )
 
             for row in shared_rows:
                 conn.execute(
@@ -657,6 +881,35 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
                         _normalize_domain(row["source_url"], row["source_id"]),
                         row["source_category"],
                         json.dumps({"seen_at": row["seen_at"]}, ensure_ascii=False),
+                    ),
+                )
+                support_rows_created += 1
+
+            for claim_cluster_id in shared_claim_cluster_ids[:10]:
+                conn.execute(
+                    """
+                    INSERT INTO relation_support(candidate_id, support_kind, metadata_json)
+                    VALUES(?,?,?)
+                    """,
+                    (
+                        candidate_id,
+                        "claim_cluster",
+                        json.dumps({"claim_cluster_id": claim_cluster_id}, ensure_ascii=False),
+                    ),
+                )
+                support_rows_created += 1
+
+            if entity_semantic_score >= 0.35:
+                conn.execute(
+                    """
+                    INSERT INTO relation_support(candidate_id, support_kind, metric_value, metadata_json)
+                    VALUES(?,?,?,?)
+                    """,
+                    (
+                        candidate_id,
+                        "semantic_neighbor",
+                        entity_semantic_score,
+                        json.dumps({"pair": [entity_a, entity_b]}, ensure_ascii=False),
                     ),
                 )
                 support_rows_created += 1
@@ -786,27 +1039,38 @@ def promote_relation_candidates(conn_or_settings: Any = None, score_threshold: f
         promoted_relations = 0
         for row in conn.execute(
             """
-            SELECT id, entity_a_id, entity_b_id, candidate_type, score, sample_content_ids, metadata_json, promotion_state
+            SELECT id, entity_a_id, entity_b_id, candidate_type, score, calibrated_score, sample_content_ids, metadata_json, candidate_state, promotion_state
             FROM relation_candidates
             ORDER BY score DESC, id
             """
         ).fetchall():
-            candidate_id, entity_a, entity_b, candidate_type, score, sample_content_ids, metadata_json, promotion_state = row
-            if float(score or 0.0) < score_threshold:
+            (
+                candidate_id,
+                entity_a,
+                entity_b,
+                candidate_type,
+                score,
+                calibrated_score,
+                sample_content_ids,
+                metadata_json,
+                candidate_state,
+                promotion_state,
+            ) = row
+            if candidate_state != "promoted" or float(calibrated_score or 0.0) < score_threshold:
                 conn.execute(
                     """
                     UPDATE relation_candidates
-                    SET promotion_state=?, promoted_relation_type=NULL, promoted_at=NULL
+                    SET promotion_state=?, candidate_state=?, promoted_relation_type=NULL, promoted_at=NULL
                     WHERE id=?
                     """,
-                    ("review" if promotion_state == "review" else "pending", candidate_id),
+                    (candidate_state or promotion_state or "pending", candidate_state or promotion_state or "pending", candidate_id),
                 )
                 continue
 
             sample_ids = _parse_json(sample_content_ids, [])
             evidence_item_id = sample_ids[0] if sample_ids else None
-            strength = "strong" if float(score) >= 0.82 else "moderate" if float(score) >= 0.74 else "weak"
-            detected_by = f"relation_candidate:{candidate_id}:score={float(score):.3f}"
+            strength = "strong" if float(calibrated_score) >= 0.82 else "moderate" if float(calibrated_score) >= 0.74 else "weak"
+            detected_by = f"relation_candidate:{candidate_id}:score={float(calibrated_score):.3f}"
             conn.execute(
                 """
                 INSERT INTO entity_relations(
@@ -827,7 +1091,7 @@ def promote_relation_candidates(conn_or_settings: Any = None, score_threshold: f
             conn.execute(
                 """
                 UPDATE relation_candidates
-                SET promotion_state='promoted', promoted_relation_type=?, promoted_at=?, metadata_json=?
+                SET promotion_state='promoted', candidate_state='promoted', promoted_relation_type=?, promoted_at=?, metadata_json=?
                 WHERE id=?
                 """,
                 (

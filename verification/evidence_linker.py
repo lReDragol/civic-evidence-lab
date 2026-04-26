@@ -40,6 +40,30 @@ STRENGTH_MAP = {
     "deputy_profile": "strong",
 }
 
+SEED_EVIDENCE_TYPES = {
+    "co_entity",
+    "co_mention",
+    "content_similarity",
+    "mentioned_together",
+}
+
+HARD_EVIDENCE_TYPES = {
+    "official_registry",
+    "court_document",
+    "enforcement_record",
+    "procurement_record",
+    "legislative_document",
+    "official_transcript",
+    "official_profile",
+    "registry_record",
+    "court_record",
+    "enforcement",
+    "procurement",
+    "bill",
+    "transcript",
+    "vote_record",
+}
+
 
 def _score_evidence_item(ctype: str, source_category: str, credibility_tier: str,
                          same_entity_count: int) -> float:
@@ -54,6 +78,30 @@ def _score_evidence_item(ctype: str, source_category: str, credibility_tier: str
         score += 0.5
     score += min(same_entity_count, 5) * 0.5
     return score
+
+
+def _evidence_class_for(
+    *,
+    evidence_type: str | None,
+    content_type: str | None,
+    source_category: str | None,
+    strength: str | None,
+) -> str:
+    evidence_type = str(evidence_type or "")
+    content_type = str(content_type or "")
+    source_category = str(source_category or "")
+    strength = str(strength or "")
+
+    if evidence_type in SEED_EVIDENCE_TYPES:
+        return "seed"
+    if (
+        evidence_type in HARD_EVIDENCE_TYPES
+        or content_type in OFFICIAL_CONTENT_TYPES
+        or source_category in OFFICIAL_SOURCE_CATEGORIES
+        or strength == "strong"
+    ):
+        return "hard"
+    return "support"
 
 
 def auto_link_evidence(settings: dict = None, batch_size: int = 200) -> Dict:
@@ -157,9 +205,9 @@ def auto_link_evidence(settings: dict = None, batch_size: int = 200) -> Dict:
                 continue
 
             conn.execute(
-                """INSERT INTO evidence_links(claim_id, evidence_item_id, evidence_type, strength, notes)
-                   VALUES(?,?,?,?,?)""",
-                (claim_id, ev["content_item_id"], ev["type"], ev["strength"], ev["notes"]),
+                """INSERT INTO evidence_links(claim_id, evidence_item_id, evidence_type, evidence_class, strength, notes)
+                   VALUES(?,?,?,?,?,?)""",
+                (claim_id, ev["content_item_id"], ev["type"], "seed", ev["strength"], ev["notes"]),
             )
             links_added += 1
 
@@ -243,9 +291,16 @@ def auto_link_by_content_type(settings: dict = None) -> Dict:
 
         for claim in claim_rows:
             conn.execute(
-                """INSERT OR IGNORE INTO evidence_links(claim_id, evidence_item_id, evidence_type, strength, notes)
-                   VALUES(?,?,?,?,?)""",
-                (claim[0], item_id, ev_type, strength, f"Auto-linked from {ctype}: {str(title or '')[:50]}"),
+                """INSERT OR IGNORE INTO evidence_links(claim_id, evidence_item_id, evidence_type, evidence_class, strength, notes)
+                   VALUES(?,?,?,?,?,?)""",
+                (
+                    claim[0],
+                    item_id,
+                    ev_type,
+                    "hard" if ctype in {"registry_record", "court_record", "enforcement", "procurement", "bill", "transcript"} else "support",
+                    strength,
+                    f"Auto-linked from {ctype}: {str(title or '')[:50]}",
+                ),
             )
             items_linked += 1
 
@@ -256,6 +311,46 @@ def auto_link_by_content_type(settings: dict = None) -> Dict:
     stats = {"items_linked": items_linked}
     conn.close()
     return stats
+
+
+def backfill_evidence_classes(settings: dict = None) -> Dict:
+    if settings is None:
+        settings = load_settings()
+
+    conn = get_db(settings)
+    try:
+        rows = conn.execute(
+            """
+            SELECT
+                el.id,
+                el.evidence_type,
+                el.strength,
+                COALESCE(ci.content_type, '') AS content_type,
+                COALESCE(s.category, '') AS source_category
+            FROM evidence_links el
+            LEFT JOIN content_items ci ON ci.id = el.evidence_item_id
+            LEFT JOIN sources s ON s.id = ci.source_id
+            """
+        ).fetchall()
+
+        updated = 0
+        for evidence_id, evidence_type, strength, content_type, source_category in rows:
+            evidence_class = _evidence_class_for(
+                evidence_type=evidence_type,
+                content_type=content_type,
+                source_category=source_category,
+                strength=strength,
+            )
+            cur = conn.execute(
+                "UPDATE evidence_links SET evidence_class=? WHERE id=? AND COALESCE(evidence_class, '') != ?",
+                (evidence_class, evidence_id, evidence_class),
+            )
+            updated += max(0, int(cur.rowcount or 0))
+
+        conn.commit()
+        return {"evidence_links_scanned": len(rows), "evidence_classes_updated": updated}
+    finally:
+        conn.close()
 
 
 def main():
@@ -274,6 +369,10 @@ def main():
     if args.all or args.official:
         result2 = auto_link_by_content_type()
         print(json.dumps(result2, ensure_ascii=False))
+
+    if args.all:
+        result3 = backfill_evidence_classes()
+        print(json.dumps(result3, ensure_ascii=False))
 
 
 if __name__ == "__main__":

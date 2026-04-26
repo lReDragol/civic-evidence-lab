@@ -51,6 +51,8 @@
     "ner_interval_seconds": 7200,
     "quotes_interval_seconds": 7200,
     "claims_interval_seconds": 21600,
+    "claim_cluster_interval_seconds": 43200,
+    "semantic_index_interval_seconds": 43200,
     "cases_interval_seconds": 86400,
     "deputies_interval_seconds": 604800,
     "deputies_html_pages": 3,

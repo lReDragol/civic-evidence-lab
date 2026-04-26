@@ -13,6 +13,7 @@ if sys_path not in sys.path:
     sys.path.insert(0, sys_path)
 
 from config.db_utils import get_db, load_settings
+from verification.claim_normalizer import canonical_hash, canonicalize_claim_text
 
 log = logging.getLogger(__name__)
 
@@ -297,11 +298,24 @@ def _store_llm_results(conn: sqlite3.Connection, content_id: int, result: Dict):
         )
 
     key_claim = result.get("key_claim", "")
-    if key_claim and len(key_claim) > 10:
+    canonical_claim = canonicalize_claim_text(key_claim, result.get("l1"))
+    if canonical_claim and len(canonical_claim) > 10:
         try:
             conn.execute(
-                "INSERT INTO claims(content_item_id, claim_text, claim_type, status, source_score, needs_review, manipulation_risk) VALUES(?,?,?,'unverified',0.5,1,?)",
-                (content_id, key_claim[:500], result.get("l1") or "unclassified", manip_risk),
+                """
+                INSERT INTO claims(
+                    content_item_id, claim_text, canonical_text, canonical_hash,
+                    claim_type, status, source_score, needs_review, manipulation_risk
+                ) VALUES(?,?,?,?,?,'unverified',0.5,1,?)
+                """,
+                (
+                    content_id,
+                    key_claim[:500],
+                    canonical_claim[:500],
+                    canonical_hash(canonical_claim),
+                    result.get("l1") or "unclassified",
+                    manip_risk,
+                ),
             )
         except Exception:
             pass
@@ -374,11 +388,10 @@ def classify_content(settings: dict = None, batch_size: int = 100):
         result = _call_ollama(text, model=model, host=host)
         if result:
             _store_llm_results(conn, content_id, result)
+            conn.execute("UPDATE content_items SET llm_processed=1 WHERE id=?", (content_id,))
             classified += 1
         else:
             failed += 1
-
-        conn.execute("UPDATE content_items SET llm_processed=1 WHERE id=?", (content_id,))
 
         if (classified + failed) % 10 == 0:
             conn.commit()

@@ -874,20 +874,38 @@ KEYWORD_TAGS = {
     "статус беженца": ["статус беженц", "беженц", "убежищ"],
 }
 
-TAG_REGISTRY = {}
+def _normalize(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").replace("ё", "е").lower()).strip()
 
-for tag_name, patterns in KEYWORD_TAGS.items():
-    compiled = []
-    for p in patterns:
-        compiled.append(re.compile(re.escape(p), re.I))
-    TAG_REGISTRY[tag_name] = compiled
+
+def _contains_exact_word(text: str, word: str) -> bool:
+    return re.search(rf"(?<![а-яёa-z]){re.escape(word)}(?![а-яёa-z])", text) is not None
+
+
+def _contains_word_stem(text: str, stem: str) -> bool:
+    return re.search(rf"(?<![а-яёa-z]){re.escape(stem)}[а-яёa-z-]*(?![а-яёa-z])", text) is not None
+
+
+def _pattern_matches(text: str, pattern: str) -> bool:
+    normalized = _normalize(pattern)
+    if not normalized:
+        return False
+    if " " in normalized or any(ch.isdigit() for ch in normalized):
+        return normalized in text
+    if len(normalized) <= 2:
+        return _contains_exact_word(text, normalized)
+    if len(normalized) <= 4:
+        return _contains_word_stem(text, normalized)
+    return normalized in text
+
+
+TAG_REGISTRY = {
+    tag_name: [_normalize(p) for p in patterns if _normalize(p)]
+    for tag_name, patterns in KEYWORD_TAGS.items()
+}
 
 REGION_TAG_NAMES = [f"регион:{r}" for r in RUSSIAN_REGIONS]
 DEPUTY_TAG_NAMES = [f"депутат:{s}" for s in DEPUTY_SURNAMES]
-
-
-def _normalize(text: str) -> str:
-    return re.sub(r"\s+", " ", (text or "").replace("ё", "е").lower()).strip()
 
 
 def infer_granular_tags(text: str, max_keyword: int = 10, max_region: int = 3, max_deputy: int = 5) -> Dict[str, List[str]]:
@@ -898,8 +916,8 @@ def infer_granular_tags(text: str, max_keyword: int = 10, max_region: int = 3, m
     norm = f" {_normalize(text)} "
 
     for tag_name, patterns in TAG_REGISTRY.items():
-        for pat in patterns:
-            if pat.search(norm):
+        for pattern in patterns:
+            if _pattern_matches(norm, pattern):
                 result["keyword"].append(tag_name)
                 break
         if len(result["keyword"]) >= max_keyword:
@@ -907,13 +925,13 @@ def infer_granular_tags(text: str, max_keyword: int = 10, max_region: int = 3, m
 
     for i, region in enumerate(RUSSIAN_REGIONS):
         region_norm = _normalize(region)
-        if region_norm in norm:
+        if _contains_word_stem(norm, region_norm):
             result["region"].append(f"регион:{region}")
         if len(result["region"]) >= max_region:
             break
 
     for surname in DEPUTY_SURNAMES:
-        if surname in norm:
+        if _contains_word_stem(norm, surname):
             result["deputy"].append(f"депутат:{surname}")
         if len(result["deputy"]) >= max_deputy:
             break

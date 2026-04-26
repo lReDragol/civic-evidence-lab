@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 from classifier.audit import build_classifier_audit
-from runtime.state import get_runtime_metadata
+from runtime.state import get_runtime_metadata, set_runtime_metadata
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -93,8 +93,11 @@ class ClassifierAuditTests(unittest.TestCase):
                 conn.close()
 
             self.assertEqual(sample_counts, [("claim", 2), ("relation_candidate", 2), ("tag_assignment", 2)])
-            self.assertIsInstance(baseline, dict)
+            self.assertEqual(baseline, {})
             self.assertEqual(last_status, "ok")
+            self.assertIn("reviewed_baseline_pending", result["warnings"])
+            self.assertEqual(result["artifacts"]["baseline_kind"], "reviewed_pending")
+            self.assertFalse(result["artifacts"]["reviewed_baseline_ready"])
 
     def test_build_classifier_audit_fails_strict_gate_on_drift(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -118,6 +121,29 @@ class ClassifierAuditTests(unittest.TestCase):
 
             first_result = build_classifier_audit(settings)
             self.assertTrue(first_result["ok"])
+            self.assertIn("reviewed_baseline_pending", first_result["warnings"])
+
+            conn = sqlite3.connect(db_path)
+            try:
+                conn.execute(
+                    """
+                    UPDATE classifier_audit_samples
+                    SET review_status = CASE sample_kind
+                        WHEN 'claim' THEN 'correct'
+                        WHEN 'relation_candidate' THEN 'correct'
+                        ELSE 'correct'
+                    END
+                    """
+                )
+                set_runtime_metadata(conn, "current_pipeline_version", "reviewed-baseline-bootstrap")
+                conn.commit()
+            finally:
+                conn.close()
+
+            second_result = build_classifier_audit(settings)
+            self.assertTrue(second_result["ok"])
+            self.assertTrue(second_result["artifacts"]["reviewed_baseline_ready"])
+            self.assertEqual(second_result["artifacts"]["baseline_kind"], "reviewed")
 
             conn = sqlite3.connect(db_path)
             try:
@@ -146,15 +172,64 @@ class ClassifierAuditTests(unittest.TestCase):
                         (404, 2, 3, 'same_case_cluster', 'candidate_builder:hybrid', 0.51, 0.4, 0.5, 0.6, 0.85, 0.1, 0.2, 0, 0, 0, 0, 'review', '{}');
                     """
                 )
+                set_runtime_metadata(conn, "current_pipeline_version", "reviewed-baseline-drift")
+                conn.commit()
+            finally:
+                conn.close()
+
+            third_result = build_classifier_audit(settings)
+
+            self.assertFalse(third_result["ok"])
+            self.assertIn("classifier_drift_gate_failed", third_result["fatal_errors"])
+            self.assertTrue(any("drift>" in item for item in third_result["warnings"]))
+
+    def test_build_classifier_audit_prefers_reviewed_baseline_when_reviews_exist(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "audit.db"
+            report_path = Path(tmp) / "classifier_audit_latest.json"
+            create_audit_db(db_path)
+            settings = {
+                "db_path": str(db_path),
+                "ensure_schema_on_connect": True,
+                "classifier_audit": {
+                    "gold_claims_target": 2,
+                    "gold_relations_target": 2,
+                    "gold_tags_target": 2,
+                    "report_path": str(report_path),
+                },
+            }
+
+            first_result = build_classifier_audit(settings)
+            self.assertTrue(first_result["ok"])
+
+            conn = sqlite3.connect(db_path)
+            try:
+                conn.execute(
+                    """
+                    UPDATE classifier_audit_samples
+                    SET review_status = CASE sample_kind
+                        WHEN 'claim' THEN 'correct'
+                        WHEN 'relation_candidate' THEN 'partially'
+                        ELSE 'correct'
+                    END
+                    """
+                )
+                set_runtime_metadata(conn, "current_pipeline_version", "reviewed-baseline-followup")
                 conn.commit()
             finally:
                 conn.close()
 
             second_result = build_classifier_audit(settings)
+            self.assertTrue(second_result["ok"])
 
-            self.assertFalse(second_result["ok"])
-            self.assertIn("classifier_drift_gate_failed", second_result["fatal_errors"])
-            self.assertTrue(any("drift>" in item for item in second_result["warnings"]))
+            conn = sqlite3.connect(db_path)
+            try:
+                baseline = get_runtime_metadata(conn, "classifier_audit_baseline")
+            finally:
+                conn.close()
+
+            self.assertEqual(baseline.get("kind"), "reviewed")
+            self.assertIn("claim_status", baseline.get("distributions") or {})
 
 
 if __name__ == "__main__":

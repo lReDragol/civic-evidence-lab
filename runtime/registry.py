@@ -182,11 +182,15 @@ def _executive_directory(settings: dict[str, Any]):
 
 
 def _tagger(settings: dict[str, Any]):
-    return __import__("classifier.tagger_v2", fromlist=["tag_content_items"]).tag_content_items(settings)
+    return __import__("classifier.tagger_v3", fromlist=["classify_content_items"]).classify_content_items(settings)
 
 
 def _llm(settings: dict[str, Any]):
-    return __import__("classifier.llm_classifier", fromlist=["classify_content"]).classify_content(batch_size=20)
+    return __import__("classifier.llm_classifier_v2", fromlist=["classify_content"]).classify_content(settings=settings, batch_size=20)
+
+
+def _semantic_index(settings: dict[str, Any]):
+    return __import__("classifier.semantic_index", fromlist=["build_semantic_index"]).build_semantic_index(settings)
 
 
 def _asr(settings: dict[str, Any]):
@@ -215,11 +219,16 @@ def _claims(settings: dict[str, Any]):
     return __import__("verification.engine", fromlist=["process_claims_for_content"]).process_claims_for_content()
 
 
+def _claim_cluster(settings: dict[str, Any]):
+    return __import__("verification.claim_normalizer", fromlist=["sync_claim_clusters"]).sync_claim_clusters(settings)
+
+
 def _evidence_link(settings: dict[str, Any]):
     module = __import__("verification.evidence_linker", fromlist=["auto_link_evidence"])
     return {
         "auto_link_evidence": module.auto_link_evidence(),
         "auto_link_by_content_type": module.auto_link_by_content_type(),
+        "backfill_evidence_classes": module.backfill_evidence_classes(settings),
     }
 
 
@@ -345,14 +354,16 @@ JOB_SPECS = [
     JobSpec("fas_ach_sk", "ФАС/Счётная/СК", "Сбор", 86400, "fas_ach_sk_interval_seconds", "collect", timeout_seconds=3600, source_keys=("fas", "ach", "sk"), runner=_fas_ach_sk),
     JobSpec("executive_directory", "Руководство органов", "Сбор", 604800, "executive_directory_interval_seconds", "collect", timeout_seconds=3600, source_keys=("executive_directory",), runner=_executive_directory),
     JobSpec("source_health", "Source health", "Система", 1800, "source_health_interval_seconds", "health", timeout_seconds=600, source_keys=("source_health",), runner=_source_health),
-    JobSpec("tagger", "Тегирование", "Анализ", 21600, "classification_interval_seconds", "analysis", timeout_seconds=3600, runner=_tagger),
-    JobSpec("llm", "LLM-классификатор", "Анализ", 43200, "llm_interval_seconds", "analysis", timeout_seconds=7200, runner=_llm),
+    JobSpec("tagger", "Classifier v3", "Анализ", 21600, "classification_interval_seconds", "analysis", timeout_seconds=3600, runner=_tagger),
+    JobSpec("llm", "LLM-классификатор", "Анализ", 43200, "llm_interval_seconds", "analysis", timeout_seconds=7200, scheduled=False, visible=False, runner=_llm),
+    JobSpec("semantic_index", "Semantic index", "Анализ", 43200, "semantic_index_interval_seconds", "analysis", timeout_seconds=7200, runner=_semantic_index),
     JobSpec("asr", "ASR (Whisper)", "Медиа", 3600, None, "media", timeout_seconds=7200, runner=_asr),
     JobSpec("ocr", "OCR (PaddleOCR)", "Медиа", 3600, None, "media", timeout_seconds=7200, runner=_ocr),
     JobSpec("ner", "NER (Natasha)", "Анализ", 7200, "ner_interval_seconds", "analysis", timeout_seconds=3600, runner=_ner),
     JobSpec("entity_resolve", "Разрешение сущностей", "Анализ", 43200, "entity_resolve_interval_seconds", "analysis", timeout_seconds=3600, runner=_entity_resolve),
     JobSpec("quotes", "Извлечение цитат", "Анализ", 7200, "quotes_interval_seconds", "analysis", timeout_seconds=3600, runner=_quotes),
     JobSpec("claims", "Заявления/верификация", "Анализ", 21600, "claims_interval_seconds", "verification", timeout_seconds=7200, runner=_claims),
+    JobSpec("claim_cluster", "Claim clustering", "Анализ", 43200, "claim_cluster_interval_seconds", "verification", timeout_seconds=7200, runner=_claim_cluster),
     JobSpec("evidence_link", "Привязка свидетельств", "Анализ", 43200, "evidence_link_interval_seconds", "verification", timeout_seconds=7200, runner=_evidence_link),
     JobSpec("negation", "Негация/опровержения", "Анализ", 43200, "negation_interval_seconds", "analysis", timeout_seconds=3600, runner=_negation),
     JobSpec("authenticity", "Модель подлинности", "Верификация", 86400, "authenticity_interval_seconds", "verification", timeout_seconds=7200, runner=_authenticity),
@@ -410,11 +421,12 @@ PIPELINE_JOB_IDS = {
         "asr",
         "ocr",
         "tagger",
-        "llm",
         "ner",
         "entity_resolve",
         "quotes",
         "claims",
+        "claim_cluster",
+        "semantic_index",
         "evidence_link",
         "negation",
         "authenticity",
@@ -423,12 +435,14 @@ PIPELINE_JOB_IDS = {
     ],
     "nightly": [
         "source_health",
+        "semantic_index",
         "structural_links",
         "entity_relation_builder",
         "relations",
         "cases",
         "accountability",
         "risk_patterns",
+        "claim_cluster",
         "classifier_audit",
         "analysis_snapshot",
         "obsidian_export",

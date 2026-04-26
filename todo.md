@@ -1995,3 +1995,15 @@ tass.ru (иногда)
 - [ ] Живой scrape `duma.gov.ru/deputies` из этой среды нестабилен: сейчас HTML collector уходит в `ConnectTimeout`, поэтому депутаты добиваются через sponsors/votes fallback.
 - [ ] `council.gov.ru` для `senators` тоже даёт сетевой timeout из текущей среды.
 - [ ] Для полноценного end-to-end smoke Telegram/watch-folder/ASR по-прежнему нужны живые пользовательские session, входные файлы и внешняя сеть без блокировок.
+
+## 23) Classifier v3 и relation engine v3
+
+- [x] Добавить additive schema для `content_tag_votes`, `semantic_neighbors`, `claim_clusters`, `claim_occurrences`, `relation_features` и новых полей `content_tags / claims / relation_candidates / evidence_links`.
+- [x] Перевести runtime на единый путь `Classifier v3` и убрать ложный `llm_processed=1` после failed LLM-pass.
+- [x] Ужесточить granular/rule tags: убрать substring-ложняк для коротких токенов и фамилий (`Распутин -> депутат:путин` больше не допускается).
+- [x] Добавить canonical claim normalization и сворачивание повторов в `claim_clusters / claim_occurrences`; low-signal claims архивируются как `archived_low_signal`.
+- [x] Добавить in-process semantic index (`TF-IDF`) без отдельного сервиса: `semantic_neighbors` для `content / claims / entities`.
+- [x] Перевести relation candidates в feature-driven состояние: `seed_only / pending / review / promoted`, с explainable path и отдельными `relation_features`.
+- [x] Разделить `evidence_links` по `evidence_class = seed / support / hard` и учесть это в authenticity/corroboration scoring.
+- [x] Перевести `classifier_audit` на preferred reviewed-baseline для drift-gate, с fallback на live-distribution до появления review gold set.
+- [ ] Прогнать live rebuild/backfill на всей `news_unified.db` и зафиксировать итоговые метрики precision/drift после полного nightly.

@@ -208,7 +208,7 @@ class RelationLayerTests(unittest.TestCase):
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0][0:3], (1, 2, "likely_association"))
             self.assertEqual(rows[0][3:6], (3, 2, 2))
-            self.assertEqual(rows[0][6], "pending")
+            self.assertEqual(rows[0][6], "review")
             self.assertEqual(promoted, 0)
 
     def test_entity_relation_builder_skips_same_source_only_pair(self):
@@ -237,10 +237,10 @@ class RelationLayerTests(unittest.TestCase):
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0][0:3], (1, 2, "likely_association"))
             self.assertEqual(rows[0][3:6], (3, 2, 2))
-            self.assertEqual(rows[0][6], "pending")
+            self.assertEqual(rows[0][6], "review")
             self.assertEqual(weak_edges, 0)
 
-    def test_relation_candidate_builder_keeps_structural_only_contract_pairs_for_review(self):
+    def test_relation_candidate_builder_keeps_structural_only_contract_pairs_as_seed_only(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "relations.db"
             create_structural_relation_db(db_path)
@@ -251,7 +251,7 @@ class RelationLayerTests(unittest.TestCase):
             try:
                 rows = conn.execute(
                     """
-                    SELECT entity_a_id, entity_b_id, candidate_type, promotion_state, support_items, support_sources, support_domains
+                    SELECT entity_a_id, entity_b_id, candidate_type, promotion_state, candidate_state, support_items, support_sources, support_domains
                     FROM relation_candidates
                     ORDER BY id
                     """
@@ -266,11 +266,58 @@ class RelationLayerTests(unittest.TestCase):
             self.assertEqual(result["promoted_relations"], 0)
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0][0:3], (10, 11, "same_contract_cluster"))
-            self.assertEqual(rows[0][3], "review")
-            self.assertEqual(rows[0][4:7], (0, 0, 0))
+            self.assertEqual(rows[0][3:5], ("seed_only", "seed_only"))
+            self.assertEqual(rows[0][5:8], (0, 0, 0))
             self.assertEqual(promoted, 0)
 
-    def test_relation_candidate_builder_promotes_structural_vote_pattern(self):
+    def test_relation_candidate_builder_moves_structural_seed_to_review_with_semantic_support(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "relations.db"
+            create_structural_relation_db(db_path)
+
+            conn = sqlite3.connect(db_path)
+            try:
+                conn.executescript(
+                    """
+                    INSERT INTO semantic_neighbors(source_kind, source_id, neighbor_kind, neighbor_id, score, method)
+                    VALUES
+                        ('entity', 10, 'entity', 11, 0.71, 'tfidf'),
+                        ('entity', 11, 'entity', 10, 0.71, 'tfidf');
+                    """
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            result = rebuild_relation_candidates({"db_path": str(db_path)})
+
+            conn = sqlite3.connect(db_path)
+            try:
+                row = conn.execute(
+                    """
+                    SELECT candidate_type, promotion_state, candidate_state, semantic_score
+                    FROM relation_candidates
+                    ORDER BY id
+                    LIMIT 1
+                    """
+                ).fetchone()
+                support = conn.execute(
+                    """
+                    SELECT support_kind, metric_value
+                    FROM relation_support
+                    WHERE support_kind='semantic_neighbor'
+                    """
+                ).fetchall()
+            finally:
+                conn.close()
+
+            self.assertEqual(result["relation_candidates_created"], 1)
+            self.assertEqual(row[0], "same_contract_cluster")
+            self.assertEqual(row[1:3], ("review", "review"))
+            self.assertGreaterEqual(float(row[3] or 0.0), 0.71)
+            self.assertTrue(support)
+
+    def test_relation_candidate_builder_keeps_structural_vote_pattern_as_seed_only_without_support(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "relations.db"
             create_vote_pattern_db(db_path)
@@ -281,7 +328,7 @@ class RelationLayerTests(unittest.TestCase):
             try:
                 rows = conn.execute(
                     """
-                    SELECT entity_a_id, entity_b_id, candidate_type, promotion_state
+                    SELECT entity_a_id, entity_b_id, candidate_type, promotion_state, candidate_state
                     FROM relation_candidates
                     ORDER BY id
                     """
@@ -297,12 +344,12 @@ class RelationLayerTests(unittest.TestCase):
                 conn.close()
 
             self.assertEqual(result["relation_candidates_created"], 1)
-            self.assertEqual(result["promoted_relations"], 1)
+            self.assertEqual(result["promoted_relations"], 0)
             self.assertEqual(len(rows), 1)
-            self.assertEqual(rows[0], (20, 21, "same_vote_pattern", "promoted"))
-            self.assertEqual(promoted, [(20, 21, "same_vote_pattern")])
+            self.assertEqual(rows[0], (20, 21, "same_vote_pattern", "seed_only", "seed_only"))
+            self.assertEqual(promoted, [])
 
-    def test_relation_candidate_builder_reviews_structural_bill_cluster(self):
+    def test_relation_candidate_builder_marks_structural_bill_cluster_as_seed_only(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "relations.db"
             create_bill_cluster_db(db_path)
@@ -313,7 +360,7 @@ class RelationLayerTests(unittest.TestCase):
             try:
                 rows = conn.execute(
                     """
-                    SELECT entity_a_id, entity_b_id, candidate_type, promotion_state
+                    SELECT entity_a_id, entity_b_id, candidate_type, promotion_state, candidate_state
                     FROM relation_candidates
                     ORDER BY id
                     """
@@ -326,10 +373,10 @@ class RelationLayerTests(unittest.TestCase):
 
             self.assertEqual(result["relation_candidates_created"], 1)
             self.assertEqual(result["promoted_relations"], 0)
-            self.assertEqual(rows, [(30, 31, "same_bill_cluster", "review")])
+            self.assertEqual(rows, [(30, 31, "same_bill_cluster", "seed_only", "seed_only")])
             self.assertEqual(promoted, 0)
 
-    def test_relation_candidate_builder_reviews_structural_case_cluster(self):
+    def test_relation_candidate_builder_marks_structural_case_cluster_as_seed_only(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "relations.db"
             create_case_cluster_db(db_path)
@@ -340,7 +387,7 @@ class RelationLayerTests(unittest.TestCase):
             try:
                 rows = conn.execute(
                     """
-                    SELECT entity_a_id, entity_b_id, candidate_type, promotion_state
+                    SELECT entity_a_id, entity_b_id, candidate_type, promotion_state, candidate_state
                     FROM relation_candidates
                     ORDER BY id
                     """
@@ -360,7 +407,7 @@ class RelationLayerTests(unittest.TestCase):
 
             self.assertEqual(result["relation_candidates_created"], 1)
             self.assertEqual(result["promoted_relations"], 0)
-            self.assertEqual(rows, [(40, 41, "same_case_cluster", "review")])
+            self.assertEqual(rows, [(40, 41, "same_case_cluster", "seed_only", "seed_only")])
             self.assertTrue(any(kind == "case" and '"case_id": 801' in metadata for kind, metadata in support))
             self.assertEqual(promoted, 0)
 

@@ -23,7 +23,7 @@ DEFAULT_CONFIG = {
     "strict_gate": True,
     "report_path": str(PROJECT_ROOT / "reports" / "classifier_audit_latest.json"),
 }
-AUDIT_BASELINE_VERSION = "2026-04-25-runtime-stability-v2"
+AUDIT_BASELINE_VERSION = "2026-04-26-classifier-v3-reviewed-baseline"
 
 
 def _audit_config(settings: dict[str, Any]) -> dict[str, Any]:
@@ -124,6 +124,18 @@ def _review_precision(rows: Iterable[Any]) -> dict[str, dict[str, Any]]:
     return result
 
 
+def _classifier_v3_tag_predicate(conn) -> tuple[str, tuple[Any, ...]]:
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(content_tags)").fetchall()}
+    if "decision_source" not in columns:
+        return "", ()
+    has_v3 = conn.execute(
+        "SELECT 1 FROM content_tags WHERE COALESCE(decision_source, '')='classifier_v3' LIMIT 1"
+    ).fetchone()
+    if not has_v3:
+        return "", ()
+    return "WHERE COALESCE(ct.decision_source, '')='classifier_v3'", ()
+
+
 def _sample_claim_rows(conn, limit: int) -> list[dict[str, Any]]:
     rows = _row_dicts(
         conn.execute(
@@ -179,9 +191,10 @@ def _sample_relation_rows(conn, limit: int) -> list[dict[str, Any]]:
 def _sample_tag_rows(conn, limit: int) -> list[dict[str, Any]]:
     if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='content_tags'").fetchone() is None:
         return []
+    predicate, params = _classifier_v3_tag_predicate(conn)
     rows = _row_dicts(
         conn.execute(
-            """
+            f"""
             SELECT
                 ct.id,
                 ct.content_item_id,
@@ -193,10 +206,11 @@ def _sample_tag_rows(conn, limit: int) -> list[dict[str, Any]]:
                 COALESCE(ci.published_at, ci.collected_at, '') AS seen_at
             FROM content_tags ct
             JOIN content_items ci ON ci.id = ct.content_item_id
+            {predicate}
             ORDER BY COALESCE(ci.published_at, ci.collected_at, '') DESC, ct.confidence DESC, ct.id DESC
             LIMIT ?
             """,
-            (max(limit * 4, limit),),
+            (*params, max(limit * 4, limit)),
         ).fetchall()
     )
     return _round_robin_sample(rows, limit=limit, group_key=lambda row: row["tag_name"])
@@ -239,6 +253,7 @@ def _insert_samples(conn, *, batch_name: str, sample_kind: str, rows: list[dict[
 
 
 def _current_distributions(conn) -> dict[str, dict[str, int]]:
+    tag_predicate, tag_params = _classifier_v3_tag_predicate(conn)
     return {
         "claim_status": _distribution(
             conn.execute(
@@ -258,17 +273,48 @@ def _current_distributions(conn) -> dict[str, dict[str, int]]:
         else {},
         "top_tags": _distribution(
             conn.execute(
-                """
+                f"""
                 SELECT COALESCE(tag_name, 'unknown') AS tag_name, COUNT(*) AS total
                 FROM content_tags
+                {tag_predicate.replace('ct.', '')}
                 GROUP BY COALESCE(tag_name, 'unknown')
                 ORDER BY total DESC, tag_name
                 LIMIT 50
-                """
+                """,
+                tag_params,
             ).fetchall()
         )
         if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='content_tags'").fetchone()
         else {},
+    }
+
+
+def _reviewed_distributions(conn) -> dict[str, dict[str, int]]:
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='classifier_audit_samples'").fetchone() is None:
+        return {
+            "claim_status": {},
+            "relation_types": {},
+            "top_tags": {},
+        }
+
+    def grouped(sample_kind: str) -> dict[str, int]:
+        return _distribution(
+            conn.execute(
+                """
+                SELECT COALESCE(actual_label, 'unknown') AS actual_label, COUNT(*)
+                FROM classifier_audit_samples
+                WHERE sample_kind=?
+                  AND review_status IN ('correct', 'partially', 'wrong')
+                GROUP BY COALESCE(actual_label, 'unknown')
+                """,
+                (sample_kind,),
+            ).fetchall()
+        )
+
+    return {
+        "claim_status": grouped("claim"),
+        "relation_types": grouped("relation_candidate"),
+        "top_tags": grouped("tag_assignment"),
     }
 
 
@@ -294,7 +340,13 @@ def build_classifier_audit(settings: dict[str, Any] | None = None) -> dict[str, 
         inserted += _insert_samples(conn, batch_name=batch_name, sample_kind="relation_candidate", rows=relations)
         inserted += _insert_samples(conn, batch_name=batch_name, sample_kind="tag_assignment", rows=tags)
 
-        distributions = _current_distributions(conn)
+        live_distributions = _current_distributions(conn)
+        reviewed_distributions = _reviewed_distributions(conn)
+        reviewed_ready = any(
+            reviewed_distributions.get(key) for key in ("claim_status", "relation_types", "top_tags")
+        )
+        preferred_kind = "reviewed" if reviewed_ready else "reviewed_pending"
+        current_distributions = live_distributions
         reviewed_metrics = _review_precision(
             conn.execute(
                 """
@@ -306,22 +358,39 @@ def build_classifier_audit(settings: dict[str, Any] | None = None) -> dict[str, 
         )
 
         baseline_version = get_runtime_metadata(conn, "classifier_audit_baseline_version", None)
-        baseline = get_runtime_metadata(conn, "classifier_audit_baseline", None) or {}
-        baseline_reset = bool(baseline) and baseline_version != AUDIT_BASELINE_VERSION
+        baseline_record = get_runtime_metadata(conn, "classifier_audit_baseline", None) or {}
+        baseline_reset = bool(baseline_record) and baseline_version != AUDIT_BASELINE_VERSION
         if baseline_reset:
+            baseline_record = {}
+
+        if isinstance(baseline_record, dict) and "distributions" in baseline_record:
+            baseline_kind = str(baseline_record.get("kind") or "reviewed_pending")
+            baseline = baseline_record.get("distributions") or {}
+        else:
+            baseline_kind = "reviewed_pending"
+            baseline = baseline_record if isinstance(baseline_record, dict) else {}
+
+        if baseline and baseline_kind != "reviewed":
             baseline = {}
+            baseline_kind = preferred_kind
+            baseline_reset = True
+
+        if not reviewed_ready:
+            baseline = {}
+            baseline_kind = "reviewed_pending"
+
         if baseline:
             drift = {
                 "claim_status": _total_variation_distance(
-                    distributions["claim_status"],
+                    current_distributions["claim_status"],
                     (baseline.get("claim_status") or {}),
                 ),
                 "relation_types": _total_variation_distance(
-                    distributions["relation_types"],
+                    current_distributions["relation_types"],
                     (baseline.get("relation_types") or {}),
                 ),
                 "top_tags": _total_variation_distance(
-                    distributions["top_tags"],
+                    current_distributions["top_tags"],
                     (baseline.get("top_tags") or {}),
                 ),
             }
@@ -357,8 +426,18 @@ def build_classifier_audit(settings: dict[str, Any] | None = None) -> dict[str, 
                 degrade_reasons.append(f"{sample_kind}_precision<{threshold}")
 
         degraded = bool(degrade_reasons)
-        if not baseline or not degraded:
-            set_runtime_metadata(conn, "classifier_audit_baseline", distributions)
+        if reviewed_ready and (not baseline or not degraded):
+            set_runtime_metadata(
+                conn,
+                "classifier_audit_baseline",
+                {
+                "kind": preferred_kind,
+                    "distributions": reviewed_distributions,
+                },
+            )
+            set_runtime_metadata(conn, "classifier_audit_baseline_version", AUDIT_BASELINE_VERSION)
+        elif not reviewed_ready:
+            set_runtime_metadata(conn, "classifier_audit_baseline", {})
             set_runtime_metadata(conn, "classifier_audit_baseline_version", AUDIT_BASELINE_VERSION)
 
         report = {
@@ -371,6 +450,7 @@ def build_classifier_audit(settings: dict[str, Any] | None = None) -> dict[str, 
                 "relation_candidate": int(cfg["gold_relations_target"]),
                 "tag_assignment": int(cfg["gold_tags_target"]),
             },
+            "reviewed_baseline_ready": reviewed_ready,
             "samples_created": {
                 "claim": len(claims),
                 "relation_candidate": len(relations),
@@ -379,11 +459,15 @@ def build_classifier_audit(settings: dict[str, Any] | None = None) -> dict[str, 
             "reviewed_metrics": reviewed_metrics,
             "drift": drift,
             "baseline_exists": bool(baseline),
+            "baseline_kind": baseline_kind if baseline else preferred_kind,
+            "drift_source": "live_vs_reviewed" if baseline else preferred_kind,
             "degraded": degraded,
             "degrade_reasons": degrade_reasons,
             "baseline_version": AUDIT_BASELINE_VERSION,
             "baseline_reset": baseline_reset,
-            "distributions": distributions,
+            "distributions": current_distributions,
+            "live_distributions": live_distributions,
+            "reviewed_distributions": reviewed_distributions,
             "report_path": str(report_path),
         }
 
@@ -394,6 +478,8 @@ def build_classifier_audit(settings: dict[str, Any] | None = None) -> dict[str, 
         conn.commit()
 
         warnings = list(degrade_reasons)
+        if not reviewed_ready:
+            warnings.append("reviewed_baseline_pending")
         fatal_errors = ["classifier_drift_gate_failed"] if degraded and bool(cfg.get("strict_gate", True)) else []
         return {
             "ok": not fatal_errors,

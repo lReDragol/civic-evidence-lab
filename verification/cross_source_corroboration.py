@@ -20,6 +20,10 @@ OFFICIAL_CATEGORIES = {"official_registry", "official_site"}
 STRONG_EVIDENCE_TYPES = {"registry_record", "court_record", "enforcement", "procurement", "bill", "transcript"}
 
 
+def _claims_have_cluster_column(conn) -> bool:
+    return any(row[1] == "claim_cluster_id" for row in conn.execute("PRAGMA table_info(claims)").fetchall())
+
+
 def _extract_key_terms(text: str, limit: int = 8) -> List[str]:
     terms = []
     terms.extend(re.findall(r'\b(\d{10}|\d{12})\b', text))
@@ -51,9 +55,13 @@ def find_corroborating_sources(conn, claim_id: int) -> Dict:
 
     source_content_id, source_id, body_text, title, source_category, source_alignment = claim_row
 
-    claim_row2 = conn.execute("SELECT claim_text, claim_type FROM claims WHERE id=?", (claim_id,)).fetchone()
+    claim_row2 = conn.execute(
+        "SELECT claim_text, claim_type, claim_cluster_id FROM claims WHERE id=?",
+        (claim_id,),
+    ).fetchone()
     claim_text = claim_row2[0] if claim_row2 else ""
     claim_type = claim_row2[1] if claim_row2 else ""
+    claim_cluster_id = claim_row2[2] if claim_row2 and len(claim_row2) >= 3 else None
 
     key_terms = _extract_key_terms(f"{title or ''}\n{claim_text}")
     if not key_terms:
@@ -66,6 +74,34 @@ def find_corroborating_sources(conn, claim_id: int) -> Dict:
     ).fetchall()]
 
     corroborating = []
+
+    if claim_cluster_id and _claims_have_cluster_column(conn):
+        cluster_rows = conn.execute(
+            """
+            SELECT c.id, s.id, s.name, s.category, s.political_alignment, s.credibility_tier,
+                   c.content_type, c.title
+            FROM claims cl
+            JOIN content_items c ON c.id = cl.content_item_id
+            JOIN sources s ON s.id = c.source_id
+            WHERE cl.claim_cluster_id=?
+              AND c.id != ?
+            LIMIT 50
+            """,
+            (claim_cluster_id, source_content_id),
+        ).fetchall()
+        for row in cluster_rows:
+            c_id, s_id, s_name, s_cat, s_align, s_tier, c_type, c_title = row
+            corroborating.append({
+                "content_item_id": c_id,
+                "source_id": s_id,
+                "source_name": s_name,
+                "source_category": s_cat,
+                "political_alignment": s_align,
+                "credibility_tier": s_tier,
+                "content_type": c_type,
+                "title": c_title,
+                "match_method": "claim_cluster_overlap",
+            })
 
     if entity_ids:
         entity_results = conn.execute(
@@ -216,8 +252,13 @@ def run_cross_source_corroboration(settings=None, limit: int = 500, min_status: 
                     if not existing:
                         strength = "strong" if c_source["source_category"] in OFFICIAL_CATEGORIES else "moderate"
                         conn.execute(
-                            "INSERT INTO evidence_links(claim_id, evidence_item_id, evidence_type, strength, notes, linked_by) VALUES(?,?,?,?,?,?)",
-                            (claim_id, c_id, "cross_source_corroboration", strength,
+                            "INSERT INTO evidence_links(claim_id, evidence_item_id, evidence_type, evidence_class, strength, notes, linked_by) VALUES(?,?,?,?,?,?,?)",
+                            (
+                             claim_id,
+                             c_id,
+                             "cross_source_corroboration",
+                             "hard" if c_source["source_category"] in OFFICIAL_CATEGORIES or c_source["content_type"] in STRONG_EVIDENCE_TYPES else "support",
+                             strength,
                              json.dumps({"source_name": c_source["source_name"],
                                          "source_category": c_source["source_category"],
                                          "match_method": c_source["match_method"]},
