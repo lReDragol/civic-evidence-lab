@@ -18,3 +18,4 @@ paddleocr
 rapidocr_onnxruntime
 PyMuPDF
 scikit-learn
+networkx

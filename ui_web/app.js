@@ -46,6 +46,7 @@
 
   function cacheUi() {
     ui.appShell = document.getElementById("app-shell");
+    ui.mainPanel = document.querySelector(".main-panel");
     ui.sourceGroups = document.getElementById("source-groups");
     ui.sourceSearchInput = document.getElementById("source-search-input");
     ui.sidebarPanel = document.getElementById("sidebar-panel");
@@ -404,6 +405,7 @@
 
   function renderSummary() {
     const visible = shouldShowSummaryStrip();
+    ui.mainPanel?.classList.toggle("summary-hidden", !visible);
     ui.summaryStrip.hidden = !visible;
     ui.summaryStrip.classList.toggle("is-hidden", !visible);
     if (!visible) {
@@ -2709,16 +2711,14 @@
     if (!host || !overlay || host.hidden) {
       return;
     }
-    const mainPanelRect = ui.appShell.querySelector(".main-panel")?.getBoundingClientRect();
     const screenPanelRect = ui.appShell.querySelector(".screen-panel")?.getBoundingClientRect();
-    if (!screenPanelRect || !mainPanelRect) {
+    if (!screenPanelRect) {
       return;
     }
     const left = Math.round(screenPanelRect.left);
     const top = Math.round(screenPanelRect.top);
     const width = Math.max(760, Math.round(screenPanelRect.width));
-    const availableHeight = Math.round(mainPanelRect.bottom - screenPanelRect.top);
-    const height = Math.max(620, availableHeight);
+    const height = Math.max(620, Math.round(screenPanelRect.height));
     host.style.left = `${left}px`;
     host.style.top = `${top}px`;
     host.style.width = `${width}px`;

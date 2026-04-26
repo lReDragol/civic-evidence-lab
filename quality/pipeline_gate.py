@@ -27,8 +27,22 @@ DEFAULT_CONFIG = {
     "max_degraded_sources": 0,
     "max_critical_warning_jobs": 0,
     "max_zero_support_review_candidates": 0,
+    "max_generic_promoted_candidates": 0,
+    "max_fake_domain_diversity_candidates": 0,
+    "max_promoted_without_nonseed_bridge": 0,
+    "max_duplicate_amplified_promotions": 0,
     "max_duplicate_leakage": 0,
     "report_path": str(PROJECT_ROOT / "reports" / "qa_quality_latest.json"),
+}
+GENERIC_RELATION_LOCATIONS = {"россии", "россия", "москва", "москвы", "рф"}
+PROMOTION_BRIDGE_TYPES = {
+    "Bill",
+    "Contract",
+    "VotePattern",
+    "RestrictionEvent",
+    "Affiliation",
+    "Disclosure",
+    "Asset",
 }
 
 
@@ -76,6 +90,22 @@ def _append_once(items: list[str], value: str) -> None:
         items.append(value)
 
 
+def _parse_json(raw_text: str | None, default: Any) -> Any:
+    if not raw_text:
+        return default
+    try:
+        return json.loads(raw_text)
+    except (TypeError, json.JSONDecodeError):
+        return default
+
+
+def _is_generic_relation_entity(entity_type: str, canonical_name: str) -> bool:
+    lowered = str(canonical_name or "").strip().lower()
+    if entity_type == "location" and lowered in GENERIC_RELATION_LOCATIONS:
+        return True
+    return False
+
+
 def _review_task_source_links(row: dict[str, Any]) -> list[str]:
     links: list[str] = []
     for value in row.get("primary_urls") or []:
@@ -107,6 +137,29 @@ def _sync_source_review_tasks(conn, rows: list[dict[str, Any]]) -> None:
             confidence=0.99 if row["effective_state"] == "blocked" else 0.91,
             machine_reason=row.get("failure_class") or row.get("quality_issue") or row.get("effective_state"),
             source_links=_review_task_source_links(row),
+        )
+    conn.commit()
+
+
+def _sync_relation_review_tasks(conn, rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        return
+    try:
+        from enrichment.common import ensure_review_task
+    except Exception:
+        return
+    for row in rows:
+        ensure_review_task(
+            conn,
+            task_key=f"relation:{row['candidate_id']}:{row['issue']}",
+            queue_key="relations",
+            subject_type="relation_candidate",
+            subject_id=int(row["candidate_id"]),
+            candidate_payload=row,
+            suggested_action="reject" if row["issue"] != "promoted_without_nonseed_bridge" else "needs_more_docs",
+            confidence=0.97,
+            machine_reason=row["issue"],
+            source_links=[],
         )
     conn.commit()
 
@@ -156,6 +209,123 @@ def build_quality_gate(settings: dict[str, Any] | None = None) -> dict[str, Any]
             LIMIT 100
             """
         ).fetchall()
+        promoted_rows = conn.execute(
+            """
+            SELECT
+                rc.id,
+                rc.entity_a_id,
+                rc.entity_b_id,
+                rc.candidate_type,
+                rc.support_items,
+                rc.support_sources,
+                rc.support_domains,
+                COALESCE(rc.explain_path_json, '[]') AS explain_path_json,
+                COALESCE(rc.evidence_mix_json, '{}') AS evidence_mix_json,
+                COALESCE(ea.entity_type, '') AS entity_a_type,
+                COALESCE(ea.canonical_name, '') AS entity_a_name,
+                COALESCE(eb.entity_type, '') AS entity_b_type,
+                COALESCE(eb.canonical_name, '') AS entity_b_name,
+                COALESCE(rf.dedupe_support_score, 0) AS dedupe_support_score
+            FROM relation_candidates rc
+            LEFT JOIN entities ea ON ea.id = rc.entity_a_id
+            LEFT JOIN entities eb ON eb.id = rc.entity_b_id
+            LEFT JOIN relation_features rf ON rf.candidate_id = rc.id
+            WHERE rc.candidate_state='promoted'
+            ORDER BY rc.id
+            """
+        ).fetchall()
+        fake_domain_rows = conn.execute(
+            """
+            SELECT
+                rc.id,
+                rc.entity_a_id,
+                rc.entity_b_id,
+                rc.candidate_type,
+                SUM(
+                    CASE
+                        WHEN rs.support_class='evidence'
+                         AND COALESCE(rs.domain, '') <> ''
+                         AND (rs.domain LIKE 'source:%' OR instr(rs.domain, '.') = 0)
+                        THEN 1 ELSE 0
+                    END
+                ) AS fake_domain_rows,
+                COUNT(
+                    DISTINCT CASE
+                        WHEN rs.support_class='evidence'
+                         AND COALESCE(rs.domain, '') <> ''
+                         AND rs.domain NOT LIKE 'source:%'
+                         AND instr(rs.domain, '.') > 0
+                        THEN rs.domain
+                    END
+                ) AS real_domain_count
+            FROM relation_candidates rc
+            JOIN relation_support rs ON rs.candidate_id = rc.id
+            WHERE rc.candidate_state IN ('review', 'promoted')
+            GROUP BY rc.id, rc.entity_a_id, rc.entity_b_id, rc.candidate_type
+            HAVING fake_domain_rows > 0 OR (MAX(COALESCE(rc.support_domains, 0)) > 0 AND real_domain_count = 0)
+            ORDER BY rc.id
+            """
+        ).fetchall()
+
+        generic_promoted_rows: list[dict[str, Any]] = []
+        promoted_without_nonseed_bridge: list[dict[str, Any]] = []
+        duplicate_amplified_promotions: list[dict[str, Any]] = []
+        relation_review_rows: list[dict[str, Any]] = []
+        for row in promoted_rows:
+            (
+                candidate_id,
+                entity_a_id,
+                entity_b_id,
+                candidate_type,
+                support_items,
+                support_sources,
+                support_domains,
+                explain_path_json,
+                evidence_mix_json,
+                entity_a_type,
+                entity_a_name,
+                entity_b_type,
+                entity_b_name,
+                dedupe_support_score,
+            ) = row
+            explain_path = _parse_json(explain_path_json, [])
+            evidence_mix = _parse_json(evidence_mix_json, {})
+            bridge_types = {str(node.get("node_type") or "") for node in explain_path if isinstance(node, dict)}
+            if _is_generic_relation_entity(entity_a_type, entity_a_name) or _is_generic_relation_entity(entity_b_type, entity_b_name):
+                payload = {
+                    "candidate_id": int(candidate_id),
+                    "issue": "generic_entity_promotion",
+                    "candidate_type": candidate_type,
+                    "entity_a_id": int(entity_a_id),
+                    "entity_b_id": int(entity_b_id),
+                    "entity_a_name": entity_a_name,
+                    "entity_b_name": entity_b_name,
+                }
+                generic_promoted_rows.append(payload)
+                relation_review_rows.append(payload)
+            if not (bridge_types & PROMOTION_BRIDGE_TYPES):
+                payload = {
+                    "candidate_id": int(candidate_id),
+                    "issue": "promoted_without_nonseed_bridge",
+                    "candidate_type": candidate_type,
+                    "entity_a_id": int(entity_a_id),
+                    "entity_b_id": int(entity_b_id),
+                    "bridge_types": sorted(bridge_types),
+                }
+                promoted_without_nonseed_bridge.append(payload)
+                relation_review_rows.append(payload)
+            if float(dedupe_support_score or 0.0) < 0.5:
+                payload = {
+                    "candidate_id": int(candidate_id),
+                    "issue": "duplicate_amplified_promotion",
+                    "candidate_type": candidate_type,
+                    "entity_a_id": int(entity_a_id),
+                    "entity_b_id": int(entity_b_id),
+                    "dedupe_support_score": float(dedupe_support_score or 0.0),
+                    "evidence_mix": evidence_mix,
+                }
+                duplicate_amplified_promotions.append(payload)
+                relation_review_rows.append(payload)
 
         suppressed_claims = int(
             conn.execute(
@@ -310,6 +480,14 @@ def build_quality_gate(settings: dict[str, Any] | None = None) -> dict[str, Any]
             warnings.append("reviewed_baseline_pending")
         if len(zero_support_rows) > int(cfg["max_zero_support_review_candidates"]):
             _append_once(degrade_reasons, "relation_quality_gate_failed")
+        if len(generic_promoted_rows) > int(cfg["max_generic_promoted_candidates"]):
+            _append_once(degrade_reasons, "relation_quality_gate_failed")
+        if len(fake_domain_rows) > int(cfg["max_fake_domain_diversity_candidates"]):
+            _append_once(degrade_reasons, "relation_quality_gate_failed")
+        if len(promoted_without_nonseed_bridge) > int(cfg["max_promoted_without_nonseed_bridge"]):
+            _append_once(degrade_reasons, "relation_quality_gate_failed")
+        if len(duplicate_amplified_promotions) > int(cfg["max_duplicate_amplified_promotions"]):
+            _append_once(degrade_reasons, "relation_quality_gate_failed")
         if duplicate_leakage > int(cfg["max_duplicate_leakage"]):
             _append_once(degrade_reasons, "dedupe_leak_gate_failed")
         if len(unresolved_blockers) > int(cfg["max_degraded_sources"]):
@@ -319,6 +497,8 @@ def build_quality_gate(settings: dict[str, Any] | None = None) -> dict[str, Any]
 
         if source_review_rows:
             _sync_source_review_tasks(conn, source_review_rows)
+        if relation_review_rows:
+            _sync_relation_review_tasks(conn, relation_review_rows)
 
         report = {
             "ok": not degrade_reasons,
@@ -331,6 +511,10 @@ def build_quality_gate(settings: dict[str, Any] | None = None) -> dict[str, Any]
             ],
             "relation_quality": {
                 "zero_support_review_candidates": len(zero_support_rows),
+                "promoted_with_generic_entity": len(generic_promoted_rows),
+                "promoted_with_fake_domain_diversity": len(fake_domain_rows),
+                "promoted_without_nonseed_bridge": len(promoted_without_nonseed_bridge),
+                "duplicate_amplified_promotions": len(duplicate_amplified_promotions),
                 "rows": [
                     {
                         "candidate_id": int(row[0]),
@@ -344,6 +528,20 @@ def build_quality_gate(settings: dict[str, Any] | None = None) -> dict[str, Any]
                     }
                     for row in zero_support_rows
                 ],
+                "generic_promotions": generic_promoted_rows,
+                "fake_domain_diversity_rows": [
+                    {
+                        "candidate_id": int(row[0]),
+                        "entity_a_id": int(row[1]),
+                        "entity_b_id": int(row[2]),
+                        "candidate_type": row[3],
+                        "fake_domain_rows": int(row[4] or 0),
+                        "real_domain_count": int(row[5] or 0),
+                    }
+                    for row in fake_domain_rows
+                ],
+                "promoted_without_nonseed_bridge_rows": promoted_without_nonseed_bridge,
+                "duplicate_amplified_promotion_rows": duplicate_amplified_promotions,
             },
             "dedupe_leakage": {
                 "suppressed_claims": suppressed_claims,
@@ -386,7 +584,16 @@ def build_quality_gate(settings: dict[str, Any] | None = None) -> dict[str, Any]
         fatal_errors = degrade_reasons[:] if degrade_reasons and bool(cfg.get("strict_gate", True)) else []
         return {
             "ok": not fatal_errors,
-            "items_seen": len(generic_false_positive_rows) + len(zero_support_rows) + len(degraded_rows) + len(ok_with_warning_rows),
+            "items_seen": (
+                len(generic_false_positive_rows)
+                + len(zero_support_rows)
+                + len(generic_promoted_rows)
+                + len(fake_domain_rows)
+                + len(promoted_without_nonseed_bridge)
+                + len(duplicate_amplified_promotions)
+                + len(degraded_rows)
+                + len(ok_with_warning_rows)
+            ),
             "items_new": 0,
             "items_updated": 0,
             "warnings": warnings + degrade_reasons,

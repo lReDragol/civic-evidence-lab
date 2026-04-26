@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import ipaddress
 import logging
+import re
 import statistics
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -9,6 +11,8 @@ from itertools import combinations
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
+
+import networkx as nx
 
 from config.db_utils import get_db, load_settings
 
@@ -27,7 +31,17 @@ PROMOTED_RELATION_TYPES = (
     "same_case_cluster",
 )
 OFFICIAL_SOURCE_CATEGORIES = {"official_registry", "official_site"}
-HARD_CONTENT_TYPES = {"registry_record", "court_record", "enforcement", "procurement", "bill", "transcript"}
+HARD_CONTENT_TYPES = {
+    "registry_record",
+    "court_record",
+    "enforcement",
+    "procurement",
+    "bill",
+    "transcript",
+    "restriction_record",
+    "declaration",
+    "official_document",
+}
 GENERIC_TAGS = {
     "regional",
     "international",
@@ -46,6 +60,38 @@ ROLE_COMPATIBILITY = {
     ("location", "organization"): 0.6,
     ("location", "location"): 0.45,
 }
+GENERIC_LOCATION_TOKENS = {
+    "россии",
+    "россия",
+    "рф",
+    "москва",
+    "москвы",
+    "страна",
+    "страны",
+    "регион",
+    "региона",
+    "город",
+    "область",
+}
+AMBIGUOUS_PERSON_TOKENS = {
+    "кирилл",
+    "светлана",
+    "сергей",
+    "олег",
+    "андрей",
+    "иван",
+    "мария",
+}
+PROMOTION_BRIDGE_TYPES = {
+    "Bill",
+    "Contract",
+    "VotePattern",
+    "RestrictionEvent",
+    "Affiliation",
+    "Disclosure",
+    "Asset",
+}
+NON_CONTENT_PATH_TYPES = PROMOTION_BRIDGE_TYPES | {"OfficialDocument"}
 
 
 def _now_iso() -> str:
@@ -61,15 +107,26 @@ def _parse_json(raw_text: str | None, default: Any):
         return default
 
 
-def _normalize_domain(url: str | None, source_id: int | None) -> str:
-    if url:
-        parsed = urlparse(url)
-        host = parsed.netloc.lower().strip()
-        if host.startswith("www."):
-            host = host[4:]
-        if host:
-            return host
-    return f"source:{source_id or 'unknown'}"
+def _normalize_domain(url: str | None, source_id: int | None = None) -> str | None:
+    if not url:
+        return None
+    raw = str(url).strip()
+    if not raw:
+        return None
+    parsed = urlparse(raw if "://" in raw else f"https://{raw}")
+    host = (parsed.netloc or parsed.path.split("/", 1)[0]).lower().strip()
+    if host.startswith("www."):
+        host = host[4:]
+    if not host or host.startswith("source:"):
+        return None
+    if host in {"telegram-export", "unknown"}:
+        return None
+    if "." not in host:
+        try:
+            ipaddress.ip_address(host)
+        except ValueError:
+            return None
+    return host
 
 
 def _parse_date(value: str | None) -> datetime | None:
@@ -120,6 +177,53 @@ def _specific_tags(tags: set[str]) -> list[str]:
     return result
 
 
+def _tokenize_name(value: str | None) -> list[str]:
+    return re.findall(r"[A-Za-zА-Яа-яЁё0-9]+", (value or "").lower())
+
+
+def _entity_specificity(entity_type: str, canonical_name: str) -> tuple[float, str | None]:
+    tokens = _tokenize_name(canonical_name)
+    if not tokens:
+        return 0.15, "low_entity_specificity"
+    if entity_type == "location":
+        normalized = " ".join(tokens)
+        if normalized in GENERIC_LOCATION_TOKENS or any(token in GENERIC_LOCATION_TOKENS for token in tokens):
+            return 0.1, "low_entity_specificity"
+        if len(tokens) == 1 and len(tokens[0]) <= 12:
+            return 0.25, "low_entity_specificity"
+        return 0.45, None
+    if entity_type == "person":
+        if len(tokens) >= 2:
+            return 1.0, None
+        token = tokens[0]
+        if token in AMBIGUOUS_PERSON_TOKENS or len(token) <= 6:
+            return 0.35, "low_entity_specificity"
+        return 0.65, None
+    if entity_type == "organization":
+        if len("".join(tokens)) <= 4:
+            return 0.45, "low_entity_specificity"
+        return 0.9, None
+    return 0.7, None
+
+
+def _pair_entity_quality(
+    entity_a_type: str,
+    entity_a_name: str,
+    entity_b_type: str,
+    entity_b_name: str,
+    *,
+    bridge_types: set[str],
+) -> tuple[float, str | None]:
+    quality_a, reason_a = _entity_specificity(entity_a_type, entity_a_name)
+    quality_b, reason_b = _entity_specificity(entity_b_type, entity_b_name)
+    quality = round(min(quality_a, quality_b), 4)
+    if quality >= 0.45:
+        return quality, None
+    if bridge_types & PROMOTION_BRIDGE_TYPES:
+        return quality, None
+    return quality, reason_a or reason_b or "low_entity_specificity"
+
+
 def _load_set_map(conn, sql: str) -> dict[int, set[int]]:
     data: dict[int, set[int]] = defaultdict(set)
     for entity_id, value in conn.execute(sql).fetchall():
@@ -161,6 +265,19 @@ def _load_risk_map(conn) -> dict[int, set[int]]:
     return data
 
 
+def _load_direct_pair_map(conn, sql: str) -> dict[tuple[int, int], set[int]]:
+    data: dict[tuple[int, int], set[int]] = defaultdict(set)
+    for left_id, right_id, value in conn.execute(sql).fetchall():
+        if left_id is None or right_id is None or value is None:
+            continue
+        entity_a = min(int(left_id), int(right_id))
+        entity_b = max(int(left_id), int(right_id))
+        if entity_a == entity_b:
+            continue
+        data[(entity_a, entity_b)].add(int(value))
+    return data
+
+
 def _table_exists(conn, table_name: str) -> bool:
     row = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type IN ('table', 'view') AND name=?",
@@ -172,40 +289,74 @@ def _table_exists(conn, table_name: str) -> bool:
 def _shared_content_rows(conn) -> list[dict[str, Any]]:
     rows = conn.execute(
         """
-        SELECT DISTINCT
+        SELECT
             CASE WHEN em1.entity_id < em2.entity_id THEN em1.entity_id ELSE em2.entity_id END AS entity_a,
             CASE WHEN em1.entity_id < em2.entity_id THEN em2.entity_id ELSE em1.entity_id END AS entity_b,
-            em1.content_item_id,
+            ci.id AS content_item_id,
             ci.source_id,
-            COALESCE(s.url, '') AS source_url,
+            COALESCE(NULLIF(ci.url, ''), NULLIF(s.url, ''), '') AS source_url,
             COALESCE(s.category, '') AS source_category,
+            COALESCE(ci.content_type, '') AS content_type,
             COALESCE(ci.published_at, ci.collected_at, '') AS seen_at,
             COALESCE(ci.title, '') AS title,
-            COALESCE(ci.body_text, '') AS body_text
+            COALESCE(ci.body_text, '') AS body_text,
+            cci.cluster_id,
+            cc.canonical_content_id,
+            COALESCE(cc.cluster_type, '') AS cluster_type,
+            COALESCE(cci.is_canonical, 0) AS is_canonical,
+            COALESCE(cc.item_count, 1) AS cluster_item_count
         FROM entity_mentions em1
         JOIN entity_mentions em2
           ON em1.content_item_id = em2.content_item_id
          AND em1.entity_id < em2.entity_id
         JOIN content_items ci ON ci.id = em1.content_item_id
         LEFT JOIN sources s ON s.id = ci.source_id
+        LEFT JOIN content_cluster_items cci ON cci.content_item_id = ci.id
+        LEFT JOIN content_clusters cc ON cc.id = cci.cluster_id
+        WHERE COALESCE(ci.status, '') <> 'suppressed_template'
+        ORDER BY
+            entity_a,
+            entity_b,
+            COALESCE(cci.cluster_id, -ci.id),
+            COALESCE(ci.source_id, -1),
+            COALESCE(cci.is_canonical, 0) DESC,
+            ci.id ASC
         """
     ).fetchall()
-    result = []
+    grouped: dict[tuple[int, int, str, int | None], dict[str, Any]] = {}
     for row in rows:
-        result.append(
-            {
-                "entity_a": int(row[0]),
-                "entity_b": int(row[1]),
-                "content_item_id": int(row[2]),
-                "source_id": int(row[3]) if row[3] is not None else None,
+        entity_a = int(row[0])
+        entity_b = int(row[1])
+        content_item_id = int(row[2])
+        source_id = int(row[3]) if row[3] is not None else None
+        cluster_id = int(row[10]) if row[10] is not None else None
+        canonical_content_id = int(row[11]) if row[11] is not None else None
+        support_unit = f"cluster:{cluster_id}" if cluster_id is not None else f"content:{content_item_id}"
+        group_key = (entity_a, entity_b, support_unit, source_id)
+        record = grouped.get(group_key)
+        if record is None:
+            grouped[group_key] = {
+                "entity_a": entity_a,
+                "entity_b": entity_b,
+                "content_item_id": content_item_id,
+                "source_id": source_id,
                 "source_url": row[4],
                 "source_category": row[5],
-                "seen_at": row[6],
-                "title": row[7],
-                "body_text": row[8],
+                "content_type": row[6],
+                "seen_at": row[7],
+                "title": row[8],
+                "body_text": row[9],
+                "cluster_id": cluster_id,
+                "canonical_content_id": canonical_content_id,
+                "cluster_type": row[12] or None,
+                "cluster_item_count": int(row[14] or 1),
+                "support_unit": support_unit,
+                "duplicate_count": 1,
+                "domain": _normalize_domain(row[4], source_id),
             }
-        )
-    return result
+        else:
+            record["duplicate_count"] += 1
+    return list(grouped.values())
 
 
 def _load_tag_map(conn) -> dict[int, set[str]]:
@@ -288,21 +439,24 @@ def _score_candidate(
     vote_overlap_count: int,
     vote_overlap_ratio: float,
 ) -> dict[str, Any]:
-    support_items = len({row["content_item_id"] for row in shared_rows})
+    support_items = len(shared_rows)
     source_ids = {row["source_id"] for row in shared_rows if row["source_id"] is not None}
     support_sources = len(source_ids)
-    domains = {_normalize_domain(row["source_url"], row["source_id"]) for row in shared_rows}
+    domains = {row["domain"] for row in shared_rows if row.get("domain")}
     support_domains = len(domains)
     categories = {row["source_category"] for row in shared_rows if row["source_category"]}
     support_categories = len(categories)
     dates = [value for value in (_parse_date(row["seen_at"]) for row in shared_rows) if value is not None]
     specific_tags = _specific_tags(shared_tags)
+    duplicate_count_total = sum(max(1, int(row.get("duplicate_count") or 1)) for row in shared_rows)
+    cluster_ids = {int(row["cluster_id"]) for row in shared_rows if row.get("cluster_id") is not None}
+    content_types = {str(row.get("content_type") or "") for row in shared_rows if row.get("content_type")}
     avg_len = statistics.mean(
         max(0, len((row.get("title") or "").strip()) + len((row.get("body_text") or "").strip()))
         for row in shared_rows
     ) if shared_rows else 0.0
 
-    source_independence = min(1.0, 0.6 * min(1.0, support_sources / 4.0) + 0.4 * min(1.0, support_domains / 3.0))
+    source_independence = min(1.0, 0.45 * min(1.0, support_sources / 4.0) + 0.55 * min(1.0, support_domains / 3.0))
     evidence_overlap = min(
         1.0,
         min(0.15, shared_claims * 0.05)
@@ -339,6 +493,9 @@ def _score_candidate(
         "support_domains": support_domains,
         "support_categories": support_categories,
         "specific_tags": specific_tags[:12],
+        "duplicate_count_total": duplicate_count_total,
+        "cluster_ids": sorted(cluster_ids),
+        "content_types": sorted(content_types),
     }
 
 
@@ -379,11 +536,18 @@ def _structural_score(
         return round(min(1.0, 0.40 + min(0.25, contract_overlap * 0.15)), 4)
     if structural_seed_kind == "case" and candidate_type == "same_case_cluster":
         return round(min(1.0, 0.35 + min(0.2, case_overlap * 0.08) + min(0.2, risk_overlap * 0.08)), 4)
+    if structural_seed_kind == "restriction":
+        return 0.55
+    if structural_seed_kind == "affiliation":
+        return 0.5
+    if structural_seed_kind == "disclosure":
+        return 0.45
     return 0.0
 
 
 def _candidate_state(
     *,
+    candidate_type: str,
     structural_seed_kind: str | None,
     support_items: int,
     support_sources: int,
@@ -393,6 +557,8 @@ def _candidate_state(
     semantic_support_score: float,
     calibrated_score: float,
     explain_path: list[dict[str, Any]],
+    shortest_bridge_path: list[dict[str, Any]],
+    promotion_block_reason: str | None,
 ) -> str:
     has_evidence_support = any(
         (
@@ -409,17 +575,39 @@ def _candidate_state(
             semantic_support_score >= 0.35,
         )
     )
+    shortest_bridge_types = {str(node.get("node_type") or "") for node in shortest_bridge_path}
+    has_nonseed_bridge = bool(shortest_bridge_types & PROMOTION_BRIDGE_TYPES)
     if structural_seed_kind and not has_evidence_support:
         return "seed_only"
+    if promotion_block_reason:
+        if promotion_block_reason == "low_entity_specificity":
+            return "seed_only" if structural_seed_kind else "pending"
+        if promotion_block_reason in {"same_case_requires_nonseed_bridge", "same_case_requires_evidence_bridge"}:
+            return "seed_only" if structural_seed_kind else "pending"
+        if has_evidence_support or (not structural_seed_kind and has_support_layer):
+            return "review"
+        if structural_seed_kind:
+            return "seed_only"
+        return "pending"
+    if candidate_type == "same_case_cluster" and not has_nonseed_bridge:
+        return "seed_only" if structural_seed_kind else "pending"
     if (
         explain_path
+        and shortest_bridge_path
         and calibrated_score >= PROMOTION_SCORE_THRESHOLD
+        and has_nonseed_bridge
         and (
-            (support_items >= 1 and support_sources >= 2)
-            or (support_hard_evidence_count >= 1 and (support_claim_cluster_count >= 1 or support_items >= 1))
+            (support_items >= 1 and support_sources >= 2 and support_domains >= 2)
+            or (
+                support_hard_evidence_count >= 1
+                and support_claim_cluster_count >= 1
+                and support_domains >= 1
+            )
         )
     ):
         return "promoted"
+    if candidate_type == "same_case_cluster" and has_evidence_support:
+        return "review"
     if has_evidence_support or (not structural_seed_kind and has_support_layer):
         return "review"
     if structural_seed_kind:
@@ -435,6 +623,11 @@ def _build_explain_path(
     shared_bill_ids: list[int],
     shared_contract_ids: list[int],
     shared_risk_ids: list[int],
+    shared_restriction_ids: list[int],
+    shared_affiliation_ids: list[int],
+    shared_disclosure_ids: list[int],
+    shared_asset_ids: list[int],
+    shared_official_document_ids: list[int],
     shared_vote_count: int,
     entity_semantic_score: float,
 ) -> list[dict[str, Any]]:
@@ -451,11 +644,131 @@ def _build_explain_path(
         path.append({"node_type": "Contract", "ids": shared_contract_ids[:5]})
     if shared_risk_ids:
         path.append({"node_type": "Risk", "ids": shared_risk_ids[:5]})
+    if shared_restriction_ids:
+        path.append({"node_type": "RestrictionEvent", "ids": shared_restriction_ids[:5]})
+    if shared_affiliation_ids:
+        path.append({"node_type": "Affiliation", "ids": shared_affiliation_ids[:5]})
+    if shared_disclosure_ids:
+        path.append({"node_type": "Disclosure", "ids": shared_disclosure_ids[:5]})
+    if shared_asset_ids:
+        path.append({"node_type": "Asset", "ids": shared_asset_ids[:5]})
+    if shared_official_document_ids:
+        path.append({"node_type": "OfficialDocument", "ids": shared_official_document_ids[:5]})
     if shared_vote_count:
         path.append({"node_type": "VotePattern", "same_vote_count": int(shared_vote_count)})
     if entity_semantic_score >= 0.35:
         path.append({"node_type": "SemanticNeighbor", "score": round(entity_semantic_score, 4)})
     return path
+
+
+def _build_shortest_bridge_path(
+    *,
+    entity_a: int,
+    entity_b: int,
+    shared_content_rows: list[dict[str, Any]],
+    shared_claim_cluster_ids: list[int],
+    shared_case_ids: list[int],
+    shared_bill_ids: list[int],
+    shared_contract_ids: list[int],
+    shared_risk_ids: list[int],
+    shared_restriction_ids: list[int],
+    shared_affiliation_ids: list[int],
+    shared_disclosure_ids: list[int],
+    shared_asset_ids: list[int],
+    shared_vote_count: int,
+    entity_semantic_score: float,
+) -> list[dict[str, Any]]:
+    graph = nx.Graph()
+    node_a = ("Entity", int(entity_a))
+    node_b = ("Entity", int(entity_b))
+    graph.add_nodes_from((node_a, node_b))
+
+    def add_bridge(node_type: str, node_id: int | str, weight: float) -> None:
+        bridge = (node_type, node_id)
+        graph.add_edge(node_a, bridge, weight=weight)
+        graph.add_edge(bridge, node_b, weight=weight)
+
+    for claim_cluster_id in shared_claim_cluster_ids[:6]:
+        add_bridge("ClaimCluster", int(claim_cluster_id), 1.35)
+    for row in shared_content_rows[:12]:
+        content_item_id = int(row["content_item_id"])
+        is_hard = (
+            (row.get("source_category") in OFFICIAL_SOURCE_CATEGORIES)
+            or (str(row.get("content_type") or "") in HARD_CONTENT_TYPES)
+        )
+        add_bridge("Content", content_item_id, 1.75 if not is_hard else 1.45)
+        if is_hard:
+            add_bridge("OfficialDocument", content_item_id, 1.0)
+    for case_id in shared_case_ids[:6]:
+        add_bridge("Case", int(case_id), 1.8)
+    for bill_id in shared_bill_ids[:6]:
+        add_bridge("Bill", int(bill_id), 0.95)
+    for contract_id in shared_contract_ids[:6]:
+        add_bridge("Contract", int(contract_id), 0.9)
+    for risk_id in shared_risk_ids[:6]:
+        add_bridge("Risk", int(risk_id), 1.6)
+    for restriction_id in shared_restriction_ids[:6]:
+        add_bridge("RestrictionEvent", int(restriction_id), 0.85)
+    for affiliation_id in shared_affiliation_ids[:6]:
+        add_bridge("Affiliation", int(affiliation_id), 0.95)
+    for disclosure_id in shared_disclosure_ids[:6]:
+        add_bridge("Disclosure", int(disclosure_id), 1.0)
+    for asset_id in shared_asset_ids[:6]:
+        add_bridge("Asset", int(asset_id), 1.05)
+    if shared_vote_count:
+        add_bridge("VotePattern", int(shared_vote_count), 0.95)
+    if entity_semantic_score >= 0.35:
+        add_bridge("SemanticNeighbor", "entity", 1.7)
+
+    try:
+        path_nodes = nx.shortest_path(graph, node_a, node_b, weight="weight")
+    except (nx.NetworkXNoPath, nx.NodeNotFound):
+        return []
+    result: list[dict[str, Any]] = []
+    for node_type, node_id in path_nodes[1:-1]:
+        payload: dict[str, Any] = {"node_type": node_type}
+        if isinstance(node_id, int):
+            payload["ids"] = [node_id]
+        else:
+            payload["value"] = node_id
+        result.append(payload)
+    return result
+
+
+def _node_similarity_score(bridge_membership_a: set[tuple[str, int]], bridge_membership_b: set[tuple[str, int]]) -> float:
+    if not bridge_membership_a and not bridge_membership_b:
+        return 0.0
+    union = bridge_membership_a | bridge_membership_b
+    if not union:
+        return 0.0
+    return round(len(bridge_membership_a & bridge_membership_b) / len(union), 4)
+
+
+def _community_membership(
+    bridge_memberships: dict[str, dict[int, set[int]]],
+    candidate_entities: set[int],
+) -> dict[int, int]:
+    graph = nx.Graph()
+    for bridge_type, membership_map in bridge_memberships.items():
+        for entity_id, bridge_ids in membership_map.items():
+            if entity_id not in candidate_entities:
+                continue
+            entity_node = ("Entity", int(entity_id))
+            graph.add_node(entity_node)
+            for bridge_id in bridge_ids:
+                bridge_node = (bridge_type, int(bridge_id))
+                graph.add_edge(entity_node, bridge_node)
+    if graph.number_of_nodes() == 0:
+        return {}
+    if graph.number_of_nodes() > 15000:
+        return {}
+    communities = list(nx.algorithms.community.greedy_modularity_communities(graph))
+    community_map: dict[int, int] = {}
+    for index, community in enumerate(communities):
+        for node_type, node_id in community:
+            if node_type == "Entity":
+                community_map[int(node_id)] = index
+    return community_map
 
 
 def _candidate_type(
@@ -571,9 +884,12 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
                 "fatal_errors": ["relation_candidate_schema_missing"],
             }
 
-        entity_types = {
-            int(row[0]): str(row[1] or "")
-            for row in conn.execute("SELECT id, entity_type FROM entities").fetchall()
+        entity_records = {
+            int(row[0]): {
+                "type": str(row[1] or ""),
+                "name": str(row[2] or ""),
+            }
+            for row in conn.execute("SELECT id, entity_type, canonical_name FROM entities").fetchall()
         }
         tag_map = _load_tag_map(conn)
         case_map = _load_set_map(
@@ -585,12 +901,70 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
             JOIN entity_mentions em ON em.content_item_id = cl.content_item_id
             """,
         ) if _table_exists(conn, "case_claims") and _table_exists(conn, "claims") else defaultdict(set)
-        bill_map = _load_set_map(conn, "SELECT entity_id, bill_id FROM bill_sponsors WHERE entity_id IS NOT NULL") if _table_exists(conn, "bill_sponsors") else defaultdict(set)
-        contract_map = _load_set_map(conn, "SELECT entity_id, contract_id FROM contract_parties WHERE entity_id IS NOT NULL") if _table_exists(conn, "contract_parties") else defaultdict(set)
+        bill_map = _load_set_map(
+            conn,
+            "SELECT entity_id, bill_id FROM bill_sponsors WHERE entity_id IS NOT NULL",
+        ) if _table_exists(conn, "bill_sponsors") else defaultdict(set)
+        contract_map = _load_set_map(
+            conn,
+            "SELECT entity_id, contract_id FROM contract_parties WHERE entity_id IS NOT NULL",
+        ) if _table_exists(conn, "contract_parties") else defaultdict(set)
         risk_map = _load_risk_map(conn)
         claim_cluster_map = _load_claim_cluster_map(conn)
         entity_semantic_scores = _load_entity_semantic_scores(conn)
         vote_map = _load_vote_map(conn)
+        restriction_map = _load_set_map(
+            conn,
+            """
+            SELECT issuer_entity_id AS entity_id, id FROM restriction_events WHERE issuer_entity_id IS NOT NULL
+            UNION ALL
+            SELECT target_entity_id AS entity_id, id FROM restriction_events WHERE target_entity_id IS NOT NULL
+            """,
+        ) if _table_exists(conn, "restriction_events") else defaultdict(set)
+        restriction_pair_map = _load_direct_pair_map(
+            conn,
+            """
+            SELECT issuer_entity_id, target_entity_id, id
+            FROM restriction_events
+            WHERE issuer_entity_id IS NOT NULL AND target_entity_id IS NOT NULL
+            """,
+        ) if _table_exists(conn, "restriction_events") else defaultdict(set)
+        affiliation_map = _load_set_map(
+            conn,
+            """
+            SELECT entity_id, id FROM company_affiliations WHERE entity_id IS NOT NULL
+            UNION ALL
+            SELECT company_entity_id, id FROM company_affiliations WHERE company_entity_id IS NOT NULL
+            """,
+        ) if _table_exists(conn, "company_affiliations") else defaultdict(set)
+        affiliation_pair_map = _load_direct_pair_map(
+            conn,
+            """
+            SELECT entity_id, company_entity_id, id
+            FROM company_affiliations
+            WHERE entity_id IS NOT NULL AND company_entity_id IS NOT NULL
+            """,
+        ) if _table_exists(conn, "company_affiliations") else defaultdict(set)
+        disclosure_map = _load_set_map(
+            conn,
+            """
+            SELECT entity_id, id FROM compensation_facts WHERE entity_id IS NOT NULL
+            UNION ALL
+            SELECT employer_entity_id, id FROM compensation_facts WHERE employer_entity_id IS NOT NULL
+            """,
+        ) if _table_exists(conn, "compensation_facts") else defaultdict(set)
+        disclosure_pair_map = _load_direct_pair_map(
+            conn,
+            """
+            SELECT entity_id, employer_entity_id, id
+            FROM compensation_facts
+            WHERE entity_id IS NOT NULL AND employer_entity_id IS NOT NULL
+            """,
+        ) if _table_exists(conn, "compensation_facts") else defaultdict(set)
+        asset_map = _load_set_map(
+            conn,
+            "SELECT entity_id, id FROM declared_assets WHERE entity_id IS NOT NULL",
+        ) if _table_exists(conn, "declared_assets") else defaultdict(set)
 
         pair_rows = defaultdict(list)
         for record in _shared_content_rows(conn):
@@ -601,7 +975,7 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
         risk_seed_pairs = _pairs_from_membership_map(risk_map, max_group_size=12, min_shared=1)
         vote_seed_pairs = _vote_seed_pairs(
             vote_map,
-            eligible_entities={entity_id for entity_id, entity_type in entity_types.items() if entity_type == "person"},
+            eligible_entities={entity_id for entity_id, entity in entity_records.items() if entity["type"] == "person"},
         )
         pair_keys = set(pair_rows)
         pair_keys.update(structural_seed_pairs)
@@ -609,6 +983,24 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
         pair_keys.update(case_seed_pairs)
         pair_keys.update(risk_seed_pairs)
         pair_keys.update(vote_seed_pairs)
+        pair_keys.update(restriction_pair_map)
+        pair_keys.update(affiliation_pair_map)
+        pair_keys.update(disclosure_pair_map)
+
+        bridge_memberships = {
+            "Case": case_map,
+            "Bill": bill_map,
+            "Contract": contract_map,
+            "Risk": risk_map,
+            "RestrictionEvent": restriction_map,
+            "Affiliation": affiliation_map,
+            "Disclosure": disclosure_map,
+            "Asset": asset_map,
+        }
+        community_map = _community_membership(
+            bridge_memberships,
+            {entity_id for pair in pair_keys for entity_id in pair},
+        )
 
         created = 0
         support_rows_created = 0
@@ -617,12 +1009,15 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
 
         for entity_a, entity_b in sorted(pair_keys):
             shared_rows = pair_rows.get((entity_a, entity_b), [])
-            support_items = len({row["content_item_id"] for row in shared_rows})
-            support_sources = len({row["source_id"] for row in shared_rows if row["source_id"] is not None})
-            support_domains = len({_normalize_domain(row["source_url"], row["source_id"]) for row in shared_rows})
             structural_seed_kind = None
             if (entity_a, entity_b) in vote_seed_pairs:
                 structural_seed_kind = "vote"
+            elif (entity_a, entity_b) in restriction_pair_map:
+                structural_seed_kind = "restriction"
+            elif (entity_a, entity_b) in affiliation_pair_map:
+                structural_seed_kind = "affiliation"
+            elif (entity_a, entity_b) in disclosure_pair_map:
+                structural_seed_kind = "disclosure"
             elif (entity_a, entity_b) in bill_seed_pairs:
                 structural_seed_kind = "bill"
             elif (entity_a, entity_b) in case_seed_pairs or (entity_a, entity_b) in risk_seed_pairs:
@@ -630,21 +1025,38 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
             elif (entity_a, entity_b) in structural_seed_pairs:
                 structural_seed_kind = "contract"
 
-            entity_a_type = entity_types.get(entity_a, "entity")
-            entity_b_type = entity_types.get(entity_b, "entity")
+            entity_a_type = entity_records.get(entity_a, {}).get("type", "entity")
+            entity_b_type = entity_records.get(entity_b, {}).get("type", "entity")
+            entity_a_name = entity_records.get(entity_a, {}).get("name", "")
+            entity_b_name = entity_records.get(entity_b, {}).get("name", "")
             shared_content_ids = sorted({row["content_item_id"] for row in shared_rows})
             shared_tags = set()
             for content_id in shared_content_ids:
                 shared_tags.update(tag_map.get(content_id, set()))
 
-            case_overlap = len(case_map.get(entity_a, set()) & case_map.get(entity_b, set()))
-            bill_overlap = len(bill_map.get(entity_a, set()) & bill_map.get(entity_b, set()))
-            contract_overlap = len(contract_map.get(entity_a, set()) & contract_map.get(entity_b, set()))
-            risk_overlap = len(risk_map.get(entity_a, set()) & risk_map.get(entity_b, set()))
-            has_structural_signal = structural_seed_kind in {"vote", "bill", "contract"} or (
-                structural_seed_kind == "case" and not shared_rows
-            )
-            if support_items < MIN_SUPPORT_ITEMS or support_sources < MIN_SUPPORT_SOURCES or support_domains < MIN_SUPPORT_DOMAINS:
+            shared_case_ids = sorted(case_map.get(entity_a, set()) & case_map.get(entity_b, set()))
+            shared_bill_ids = sorted(bill_map.get(entity_a, set()) & bill_map.get(entity_b, set()))
+            shared_contract_ids = sorted(contract_map.get(entity_a, set()) & contract_map.get(entity_b, set()))
+            shared_risk_ids = sorted(risk_map.get(entity_a, set()) & risk_map.get(entity_b, set()))
+            shared_restriction_ids = sorted(restriction_pair_map.get((entity_a, entity_b), set()))
+            shared_affiliation_ids = sorted(affiliation_pair_map.get((entity_a, entity_b), set()))
+            shared_disclosure_ids = sorted(disclosure_pair_map.get((entity_a, entity_b), set()))
+            shared_asset_ids = sorted(asset_map.get(entity_a, set()) & asset_map.get(entity_b, set()))
+
+            case_overlap = len(shared_case_ids)
+            bill_overlap = len(shared_bill_ids)
+            contract_overlap = len(shared_contract_ids)
+            risk_overlap = len(shared_risk_ids)
+
+            support_items = len(shared_rows)
+            support_sources = len({row["source_id"] for row in shared_rows if row["source_id"] is not None})
+            support_domains = len({row["domain"] for row in shared_rows if row.get("domain")})
+            has_structural_signal = bool(structural_seed_kind)
+            if (
+                support_items < MIN_SUPPORT_ITEMS
+                or support_sources < MIN_SUPPORT_SOURCES
+                or support_domains < MIN_SUPPORT_DOMAINS
+            ):
                 if not has_structural_signal:
                     skipped_low_support += 1
                     continue
@@ -661,6 +1073,14 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
             shared_claim_cluster_ids = sorted(claim_cluster_map.get(entity_a, set()) & claim_cluster_map.get(entity_b, set()))
             support_claim_cluster_count = len(shared_claim_cluster_ids)
             entity_semantic_score = float(entity_semantic_scores.get((entity_a, entity_b), 0.0))
+            shared_official_document_ids = sorted(
+                {
+                    row["content_item_id"]
+                    for row in shared_rows
+                    if row.get("source_category") in OFFICIAL_SOURCE_CATEGORIES
+                    or str(row.get("content_type") or "") in HARD_CONTENT_TYPES
+                }
+            )
 
             vote_seed = vote_seed_pairs.get((entity_a, entity_b), {})
             if vote_seed:
@@ -700,6 +1120,18 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
                 structural_seed_kind=structural_seed_kind,
                 shared_claims=shared_claims,
             )
+            bridge_membership_a = {
+                (bridge_type, int(value))
+                for bridge_type, membership_map in bridge_memberships.items()
+                for value in membership_map.get(entity_a, set())
+            }
+            bridge_membership_b = {
+                (bridge_type, int(value))
+                for bridge_type, membership_map in bridge_memberships.items()
+                for value in membership_map.get(entity_b, set())
+            }
+            node_similarity_score = _node_similarity_score(bridge_membership_a, bridge_membership_b)
+            same_community_score = 1.0 if community_map.get(entity_a) is not None and community_map.get(entity_a) == community_map.get(entity_b) else 0.0
             structural_score = _structural_score(
                 structural_seed_kind=structural_seed_kind,
                 candidate_type=candidate_type,
@@ -719,54 +1151,150 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
                 ),
                 4,
             )
+            real_host_diversity_score = round(min(1.0, metrics["support_domains"] / 2.0), 4)
             source_diversity_score = round(
-                min(1.0, 0.5 * min(1.0, metrics["support_sources"] / 2.0) + 0.5 * min(1.0, metrics["support_domains"] / 2.0)),
+                min(1.0, 0.35 * min(1.0, metrics["support_sources"] / 2.0) + 0.65 * real_host_diversity_score),
                 4,
             )
-            semantic_support_score = round(max(min(1.0, support_claim_cluster_count / 3.0), entity_semantic_score), 4)
+            semantic_support_score = round(
+                max(
+                    min(1.0, support_claim_cluster_count / 3.0),
+                    entity_semantic_score,
+                    min(1.0, 0.65 * node_similarity_score + 0.35 * same_community_score),
+                ),
+                4,
+            )
             evidence_quality_score = round(
                 min(
                     1.0,
-                    sum(
-                        1.0
-                        for row in shared_rows
-                        if (row.get("source_category") in OFFICIAL_SOURCE_CATEGORIES)
+                    (
+                        0.65
+                        * min(
+                            1.0,
+                            len(shared_official_document_ids) / max(1, metrics["support_items"]),
+                        )
                     )
-                    / 2.0,
+                    + (
+                        0.35
+                        * min(
+                            1.0,
+                            len({row["source_category"] for row in shared_rows if row.get("source_category") in OFFICIAL_SOURCE_CATEGORIES}) / 2.0,
+                        )
+                    ),
                 ),
                 4,
             )
             support_hard_evidence_count = len(
                 {
-                    row["content_item_id"]
+                    row["support_unit"]
                     for row in shared_rows
-                    if row.get("source_category") in OFFICIAL_SOURCE_CATEGORIES
+                    if (
+                        row.get("source_category") in OFFICIAL_SOURCE_CATEGORIES
+                        or str(row.get("content_type") or "") in HARD_CONTENT_TYPES
+                    )
                 }
             )
-            calibrated_score = round(
+            dedupe_support_score = round(
                 min(
                     1.0,
-                    0.20 * structural_score
-                    + 0.20 * float(metrics["score"])
-                    + 0.20 * content_support_score
-                    + 0.12 * source_diversity_score
-                    + 0.12 * semantic_support_score
-                    + 0.10 * evidence_quality_score
-                    + 0.06 * float(metrics["temporal_proximity"]),
+                    metrics["support_items"] / max(1, metrics["duplicate_count_total"]),
                 ),
                 4,
             )
             explain_path = _build_explain_path(
                 shared_content_ids=shared_content_ids,
                 shared_claim_cluster_ids=shared_claim_cluster_ids,
-                shared_case_ids=sorted(case_map.get(entity_a, set()) & case_map.get(entity_b, set())),
-                shared_bill_ids=sorted(bill_map.get(entity_a, set()) & bill_map.get(entity_b, set())),
-                shared_contract_ids=sorted(contract_map.get(entity_a, set()) & contract_map.get(entity_b, set())),
-                shared_risk_ids=sorted(risk_map.get(entity_a, set()) & risk_map.get(entity_b, set())),
+                shared_case_ids=shared_case_ids,
+                shared_bill_ids=shared_bill_ids,
+                shared_contract_ids=shared_contract_ids,
+                shared_risk_ids=shared_risk_ids,
+                shared_restriction_ids=shared_restriction_ids,
+                shared_affiliation_ids=shared_affiliation_ids,
+                shared_disclosure_ids=shared_disclosure_ids,
+                shared_asset_ids=shared_asset_ids,
+                shared_official_document_ids=shared_official_document_ids,
                 shared_vote_count=same_votes,
                 entity_semantic_score=entity_semantic_score,
             )
+            shortest_bridge_path = _build_shortest_bridge_path(
+                entity_a=entity_a,
+                entity_b=entity_b,
+                shared_content_rows=shared_rows,
+                shared_claim_cluster_ids=shared_claim_cluster_ids,
+                shared_case_ids=shared_case_ids,
+                shared_bill_ids=shared_bill_ids,
+                shared_contract_ids=shared_contract_ids,
+                shared_risk_ids=shared_risk_ids,
+                shared_restriction_ids=shared_restriction_ids,
+                shared_affiliation_ids=shared_affiliation_ids,
+                shared_disclosure_ids=shared_disclosure_ids,
+                shared_asset_ids=shared_asset_ids,
+                shared_vote_count=same_votes,
+                entity_semantic_score=entity_semantic_score,
+            )
+            bridge_types = {str(node.get("node_type") or "") for node in shortest_bridge_path}
+            entity_quality_score, entity_block_reason = _pair_entity_quality(
+                entity_a_type,
+                entity_a_name,
+                entity_b_type,
+                entity_b_name,
+                bridge_types=bridge_types,
+            )
+            bridge_diversity_score = round(
+                min(
+                    1.0,
+                    0.45 * min(1.0, len({node.get("node_type") for node in explain_path if node.get("node_type") in NON_CONTENT_PATH_TYPES}) / 3.0)
+                    + 0.35 * node_similarity_score
+                    + 0.20 * same_community_score,
+                ),
+                4,
+            )
+            promotion_block_reason = entity_block_reason
+            if candidate_type == "same_case_cluster":
+                has_nonseed_bridge = bool(bridge_types & PROMOTION_BRIDGE_TYPES)
+                has_evidence_bridge = bool(
+                    bridge_types
+                    & {
+                        "RestrictionEvent",
+                        "Affiliation",
+                        "Disclosure",
+                        "Asset",
+                        "OfficialDocument",
+                        "Bill",
+                        "Contract",
+                    }
+                )
+                if not has_nonseed_bridge:
+                    promotion_block_reason = promotion_block_reason or "same_case_requires_nonseed_bridge"
+                elif not (
+                    metrics["support_domains"] > 0
+                    or support_hard_evidence_count > 0
+                    or has_evidence_bridge
+                ):
+                    promotion_block_reason = promotion_block_reason or "same_case_requires_evidence_bridge"
+            elif metrics["support_items"] > 0 and metrics["support_sources"] >= 2 and metrics["support_domains"] == 0:
+                promotion_block_reason = promotion_block_reason or "fake_domain_diversity"
+            elif metrics["support_items"] > 0 and dedupe_support_score < 0.45 and metrics["support_sources"] < 2:
+                promotion_block_reason = promotion_block_reason or "duplicate_amplified_support"
+            calibrated_score = round(
+                min(
+                    1.0,
+                    0.15 * structural_score
+                    + 0.15 * float(metrics["score"])
+                    + 0.14 * content_support_score
+                    + 0.11 * source_diversity_score
+                    + 0.10 * semantic_support_score
+                    + 0.10 * evidence_quality_score
+                    + 0.07 * float(metrics["temporal_proximity"])
+                    + 0.08 * entity_quality_score
+                    + 0.05 * dedupe_support_score
+                    + 0.05 * real_host_diversity_score
+                    + 0.05 * bridge_diversity_score,
+                ),
+                4,
+            )
             candidate_state = _candidate_state(
+                candidate_type=candidate_type,
                 structural_seed_kind=structural_seed_kind,
                 support_items=metrics["support_items"],
                 support_sources=metrics["support_sources"],
@@ -776,27 +1304,49 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
                 semantic_support_score=semantic_support_score,
                 calibrated_score=calibrated_score,
                 explain_path=explain_path,
+                shortest_bridge_path=shortest_bridge_path,
+                promotion_block_reason=promotion_block_reason,
             )
             promotion_state = candidate_state
             if candidate_state == "promoted":
                 promoted_candidates += 1
 
+            evidence_mix = {
+                "content_types": metrics["content_types"],
+                "source_categories": sorted({row["source_category"] for row in shared_rows if row.get("source_category")}),
+                "domains": sorted({row["domain"] for row in shared_rows if row.get("domain")}),
+                "telegram_only": bool(shared_rows) and all((row.get("source_category") or "") == "telegram" for row in shared_rows),
+                "content_clusters": {
+                    "cluster_ids": metrics["cluster_ids"],
+                    "cluster_count": len(metrics["cluster_ids"]),
+                },
+                "duplicate_count_total": metrics["duplicate_count_total"],
+                "bridge_types": [str(node.get("node_type") or "") for node in explain_path],
+            }
             metadata = {
                 "shared_claims": shared_claims,
                 "shared_claim_cluster_count": support_claim_cluster_count,
                 "entity_semantic_score": entity_semantic_score,
+                "node_similarity_score": node_similarity_score,
+                "same_community_score": same_community_score,
                 "case_overlap": case_overlap,
                 "bill_overlap": bill_overlap,
                 "contract_overlap": contract_overlap,
                 "risk_overlap": risk_overlap,
+                "restriction_overlap": len(shared_restriction_ids),
+                "affiliation_overlap": len(shared_affiliation_ids),
+                "disclosure_overlap": len(shared_disclosure_ids),
+                "asset_overlap": len(shared_asset_ids),
                 "same_vote_count": same_votes,
                 "shared_vote_count": shared_vote_count,
                 "same_vote_ratio": round(vote_overlap_ratio, 4),
-                "support_domains_list": sorted({_normalize_domain(row["source_url"], row["source_id"]) for row in shared_rows}),
+                "support_domains_list": evidence_mix["domains"],
                 "support_categories_list": sorted({row["source_category"] for row in shared_rows if row["source_category"]}),
                 "structural_seed": bool(structural_seed_kind and not shared_rows),
                 "structural_seed_kind": structural_seed_kind,
                 "explain_path": explain_path,
+                "shortest_bridge_path": shortest_bridge_path,
+                "promotion_block_reason": promotion_block_reason,
             }
 
             cur = conn.execute(
@@ -809,8 +1359,8 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
                     support_items, support_sources, support_domains, support_categories,
                     support_claim_cluster_count, support_hard_evidence_count,
                     first_seen_at, last_seen_at, sample_content_ids, candidate_state, promotion_state,
-                    promoted_relation_type, explain_path_json, metadata_json
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    promoted_relation_type, promotion_block_reason, evidence_mix_json, explain_path_json, metadata_json
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     entity_a,
@@ -841,6 +1391,8 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
                     candidate_state,
                     promotion_state,
                     candidate_type if candidate_state == "promoted" else None,
+                    promotion_block_reason,
+                    json.dumps(evidence_mix, ensure_ascii=False),
                     json.dumps(explain_path, ensure_ascii=False),
                     json.dumps(metadata, ensure_ascii=False),
                 ),
@@ -853,8 +1405,9 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
                 INSERT OR REPLACE INTO relation_features(
                     candidate_id, structural_score, content_support_score, source_diversity_score,
                     semantic_support_score, shared_claim_cluster_score, evidence_quality_score,
+                    entity_quality_score, dedupe_support_score, real_host_diversity_score, bridge_diversity_score,
                     temporal_score, role_compatibility_score, calibrated_score, explain_path_json, metadata_json, updated_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     candidate_id,
@@ -864,6 +1417,10 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
                     semantic_support_score,
                     round(min(1.0, support_claim_cluster_count / 3.0), 4),
                     evidence_quality_score,
+                    entity_quality_score,
+                    dedupe_support_score,
+                    real_host_diversity_score,
+                    bridge_diversity_score,
                     metrics["temporal_proximity"],
                     metrics["role_compatibility"],
                     calibrated_score,
@@ -886,9 +1443,34 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
                         "evidence",
                         row["content_item_id"],
                         row["source_id"],
-                        _normalize_domain(row["source_url"], row["source_id"]),
+                        row.get("domain"),
                         row["source_category"],
-                        json.dumps({"seen_at": row["seen_at"]}, ensure_ascii=False),
+                        json.dumps(
+                            {
+                                "seen_at": row["seen_at"],
+                                "cluster_id": row.get("cluster_id"),
+                                "canonical_content_id": row.get("canonical_content_id"),
+                                "duplicate_count": row.get("duplicate_count"),
+                                "content_type": row.get("content_type"),
+                            },
+                            ensure_ascii=False,
+                        ),
+                    ),
+                )
+                support_rows_created += 1
+
+            for content_item_id in shared_official_document_ids[:10]:
+                conn.execute(
+                    """
+                    INSERT INTO relation_support(candidate_id, support_kind, support_class, evidence_item_id, metadata_json)
+                    VALUES(?,?,?,?,?)
+                    """,
+                    (
+                        candidate_id,
+                        "official_document",
+                        "support",
+                        content_item_id,
+                        json.dumps({"content_item_id": content_item_id}, ensure_ascii=False),
                     ),
                 )
                 support_rows_created += 1
@@ -932,11 +1514,11 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
                         VALUES(?,?,?,?)
                         """,
                         (
-                            candidate_id,
-                            "contract",
-                            "seed",
-                            json.dumps({"contract_id": contract_id}, ensure_ascii=False),
-                        ),
+                        candidate_id,
+                        "contract",
+                        "seed",
+                        json.dumps({"contract_id": contract_id}, ensure_ascii=False),
+                    ),
                     )
                     support_rows_created += 1
 
@@ -987,6 +1569,66 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
                         ),
                     )
                     support_rows_created += 1
+
+            for restriction_id in shared_restriction_ids[:10]:
+                conn.execute(
+                    """
+                    INSERT INTO relation_support(candidate_id, support_kind, support_class, metadata_json)
+                    VALUES(?,?,?,?)
+                    """,
+                    (
+                        candidate_id,
+                        "restriction_event",
+                        "support",
+                        json.dumps({"restriction_event_id": restriction_id}, ensure_ascii=False),
+                    ),
+                )
+                support_rows_created += 1
+
+            for affiliation_id in shared_affiliation_ids[:10]:
+                conn.execute(
+                    """
+                    INSERT INTO relation_support(candidate_id, support_kind, support_class, metadata_json)
+                    VALUES(?,?,?,?)
+                    """,
+                    (
+                        candidate_id,
+                        "affiliation",
+                        "support",
+                        json.dumps({"affiliation_id": affiliation_id}, ensure_ascii=False),
+                    ),
+                )
+                support_rows_created += 1
+
+            for disclosure_id in shared_disclosure_ids[:10]:
+                conn.execute(
+                    """
+                    INSERT INTO relation_support(candidate_id, support_kind, support_class, metadata_json)
+                    VALUES(?,?,?,?)
+                    """,
+                    (
+                        candidate_id,
+                        "disclosure",
+                        "support",
+                        json.dumps({"disclosure_id": disclosure_id}, ensure_ascii=False),
+                    ),
+                )
+                support_rows_created += 1
+
+            for asset_id in shared_asset_ids[:10]:
+                conn.execute(
+                    """
+                    INSERT INTO relation_support(candidate_id, support_kind, support_class, metadata_json)
+                    VALUES(?,?,?,?)
+                    """,
+                    (
+                        candidate_id,
+                        "asset",
+                        "support",
+                        json.dumps({"asset_id": asset_id}, ensure_ascii=False),
+                    ),
+                )
+                support_rows_created += 1
 
             for tag_name in metrics["specific_tags"]:
                 conn.execute(

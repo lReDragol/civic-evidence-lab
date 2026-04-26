@@ -222,6 +222,75 @@ class QualityGateTests(unittest.TestCase):
             self.assertTrue(result["artifacts"]["critical_warning_jobs"][0]["resolved_by_source_policy"])
             self.assertEqual(result["artifacts"]["unresolved_warning_jobs"], [])
 
+    def test_quality_gate_flags_generic_promoted_relation_and_fake_domain_diversity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "quality.db"
+            report_path = Path(tmp) / "qa_quality_latest.json"
+            create_quality_db(db_path)
+
+            conn = sqlite3.connect(db_path)
+            try:
+                conn.executescript(
+                    """
+                    INSERT INTO entities(id, entity_type, canonical_name) VALUES
+                        (1, 'location', 'России'),
+                        (2, 'person', 'Василий Пискарёв');
+
+                    INSERT INTO relation_candidates(
+                        id, entity_a_id, entity_b_id, candidate_type, origin, score, support_items,
+                        support_sources, support_domains, candidate_state, promotion_state, explain_path_json, evidence_mix_json
+                    ) VALUES
+                        (
+                            900,
+                            1,
+                            2,
+                            'same_case_cluster',
+                            'candidate_builder:co_occurrence',
+                            0.82,
+                            3,
+                            2,
+                            1,
+                            'promoted',
+                            'promoted',
+                            '[{"node_type":"Case","ids":[801]}]',
+                            '{"domains":["source:28"],"content_clusters":{"cluster_ids":[]}}'
+                        );
+
+                    INSERT INTO relation_features(candidate_id, dedupe_support_score, calibrated_score, updated_at)
+                    VALUES(900, 0.91, 0.82, '2026-04-26T00:00:00');
+
+                    INSERT INTO relation_support(candidate_id, support_kind, support_class, source_id, domain, category)
+                    VALUES
+                        (900, 'content', 'evidence', 28, 'source:28', 'official_registry'),
+                        (900, 'content', 'evidence', 80, 'telegram-export', 'telegram');
+
+                    INSERT INTO job_runs(job_id, trigger_mode, requested_by, owner, attempt_no, status, started_at, warnings_json)
+                    VALUES('tagger', 'manual', 'test', 'owner', 1, 'ok', '2026-04-26T00:00:00', '[]');
+                    """
+                )
+                set_runtime_metadata(conn, "classifier_audit_last_status", "ok")
+                set_runtime_metadata(conn, "classifier_audit_last_report", {"reviewed_baseline_ready": True})
+                conn.commit()
+            finally:
+                conn.close()
+
+            result = build_quality_gate(
+                {
+                    "db_path": str(db_path),
+                    "ensure_schema_on_connect": True,
+                    "quality_gate": {
+                        "report_path": str(report_path),
+                        "strict_gate": True,
+                    },
+                }
+            )
+
+            self.assertFalse(result["ok"])
+            relation_quality = result["artifacts"]["relation_quality"]
+            self.assertEqual(relation_quality["promoted_with_generic_entity"], 1)
+            self.assertEqual(relation_quality["promoted_with_fake_domain_diversity"], 1)
+            self.assertEqual(relation_quality["promoted_without_nonseed_bridge"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

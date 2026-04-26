@@ -42,10 +42,18 @@ ADDITIVE_COLUMNS = {
         "support_claim_cluster_count": "INTEGER DEFAULT 0",
         "support_hard_evidence_count": "INTEGER DEFAULT 0",
         "candidate_state": "TEXT DEFAULT 'pending'",
+        "promotion_block_reason": "TEXT",
+        "evidence_mix_json": "TEXT",
         "explain_path_json": "TEXT",
     },
     "relation_support": {
         "support_class": "TEXT DEFAULT 'seed'",
+    },
+    "relation_features": {
+        "entity_quality_score": "REAL DEFAULT 0",
+        "dedupe_support_score": "REAL DEFAULT 0",
+        "real_host_diversity_score": "REAL DEFAULT 0",
+        "bridge_diversity_score": "REAL DEFAULT 0",
     },
     "source_sync_state": {
         "quality_state": "TEXT DEFAULT 'unknown'",

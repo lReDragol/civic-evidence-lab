@@ -2560,6 +2560,22 @@ class DashboardDataService:
             effective_state = payload.get("effective_state") or "unknown"
             failure_class = payload.get("failure_class") or payload.get("quality_issue") or "—"
             return f"{source_key} · {effective_state} · {failure_class}"
+        if subject_type == "relation_candidate" and subject_id and self._table_exists("relation_candidates"):
+            row = self.db.execute(
+                """
+                SELECT rc.candidate_type,
+                       ea.canonical_name,
+                       eb.canonical_name,
+                       rc.candidate_state
+                FROM relation_candidates rc
+                LEFT JOIN entities ea ON ea.id = rc.entity_a_id
+                LEFT JOIN entities eb ON eb.id = rc.entity_b_id
+                WHERE rc.id=?
+                """,
+                (subject_id,),
+            ).fetchone()
+            if row:
+                return f"{row[1] or '—'} -> {row[2] or '—'} · {row[0] or 'relation'} · {row[3] or 'pending'}"
         return ""
 
     def _count(self, table_name: str) -> int:
