@@ -73,6 +73,56 @@ class UiWebGraphSmokeTests(unittest.TestCase):
             finally:
                 browser.close()
 
+    def test_relation_map_overlay_matches_screen_panel_and_exposes_group_filters(self):
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            try:
+                page = browser.new_page(viewport={"width": 1760, "height": 1040})
+                page.goto(UI_WEB_INDEX)
+                page.wait_for_timeout(700)
+                page.get_by_role("button", name="Аналитика").click()
+                page.get_by_role("button", name="Связи").click()
+                page.get_by_role("button", name="Карта").click()
+                page.wait_for_timeout(450)
+
+                overlay_box = page.locator("#relation-map-overlay-host").bounding_box()
+                main_panel_box = page.locator(".main-panel").bounding_box()
+                screen_panel_box = page.locator(".screen-panel").bounding_box()
+                self.assertIsNotNone(overlay_box)
+                self.assertIsNotNone(main_panel_box)
+                self.assertIsNotNone(screen_panel_box)
+                self.assertLessEqual(abs((overlay_box or {})["x"] - (screen_panel_box or {})["x"]), 4)
+                self.assertLessEqual(abs((overlay_box or {})["y"] - (screen_panel_box or {})["y"]), 4)
+                self.assertLessEqual(abs((overlay_box or {})["width"] - (screen_panel_box or {})["width"]), 4)
+                expected_height = ((main_panel_box or {})["y"] + (main_panel_box or {})["height"]) - (screen_panel_box or {})["y"]
+                self.assertLessEqual(abs((overlay_box or {})["height"] - expected_height), 6)
+
+                chips = page.locator("[data-map-group]")
+                self.assertGreaterEqual(chips.count(), 3)
+                self.assertTrue(page.locator("[data-map-group='documents']").first.is_visible())
+            finally:
+                browser.close()
+
+    def test_entity_drawer_uses_wide_overlay(self):
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            try:
+                page = browser.new_page(viewport={"width": 1760, "height": 1040})
+                page.goto(UI_WEB_INDEX)
+                page.wait_for_timeout(700)
+                page.get_by_role("button", name="Аналитика").click()
+                page.get_by_role("button", name="Сущности").click()
+                page.wait_for_timeout(250)
+                page.locator("[data-row-id]").first.click()
+                page.wait_for_timeout(350)
+
+                drawer_box = page.locator("[data-detail-drawer]").bounding_box()
+                viewport_width = page.viewport_size["width"]
+                self.assertIsNotNone(drawer_box)
+                self.assertGreater((drawer_box or {})["width"], viewport_width * 0.47)
+            finally:
+                browser.close()
+
 
 if __name__ == "__main__":
     unittest.main()

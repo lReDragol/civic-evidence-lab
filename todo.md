@@ -2012,4 +2012,4 @@ tass.ru (иногда)
 - [x] Перевести relation candidates в feature-driven состояние: `seed_only / pending / review / promoted`, с explainable path и отдельными `relation_features`.
 - [x] Разделить `evidence_links` по `evidence_class = seed / support / hard` и учесть это в authenticity/corroboration scoring.
 - [x] Перевести `classifier_audit` на preferred reviewed-baseline для drift-gate, с fallback на live-distribution до появления review gold set.
-- [ ] Прогнать live rebuild/backfill на всей `news_unified.db` и зафиксировать итоговые метрики precision/drift после полного nightly.
+- [x] Прогнать live rebuild/backfill на всей `news_unified.db` и зафиксировать итоговые метрики после полного nightly: `pipeline_version=nightly-20260426200549`, `quality_gate.ok=true`, `relation_candidates=858`, `review=130`, `promoted=21`, `content_clusters=1143`, `fixture_backed_sources=10`, `archive_backed_sources=6`, `source_health unresolved_blockers=0`.

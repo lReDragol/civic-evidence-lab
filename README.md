@@ -1,89 +1,309 @@
 # Civic Evidence Lab
 
-Локальная система для сбора публичных сигналов, файлов, фото, документов и последующей сборки проверяемых утверждений, доказательств и кейсов.
+Windows-first evidence pipeline for collecting public signals, documents, files, images, official records, and building explainable dossiers, relations, and review workflows on top of them.
 
-## Быстрый старт
+> Status: actively maintained local research system with green `nightly -> quality_gate -> analysis_snapshot -> obsidian_export` pipeline.
+
+## Contents
+
+- [Overview](#overview)
+- [What the project does](#what-the-project-does)
+- [Core principles](#core-principles)
+- [Architecture](#architecture)
+- [Pipeline](#pipeline)
+- [Data model](#data-model)
+- [Source health and quality gates](#source-health-and-quality-gates)
+- [Validated local status](#validated-local-status)
+- [Repository structure](#repository-structure)
+- [Quick start](#quick-start)
+- [Configuration](#configuration)
+- [Runtime and operations](#runtime-and-operations)
+- [Review Ops](#review-ops)
+- [Obsidian export](#obsidian-export)
+- [Verification](#verification)
+- [Known limits](#known-limits)
+- [Next development priorities](#next-development-priorities)
+
+## Overview
+
+`Civic Evidence Lab` is not a news re-poster and not a flat parser of random feeds.
+
+It is a local dossier-building system that:
+
+- ingests public signals from official sites, registries, Telegram exports, watch-folders, and uploaded files;
+- normalizes them into canonical content, entities, claims, evidence, and enrichment facts;
+- keeps the original files on disk and the canonical metadata in SQLite;
+- builds relation candidates, explainable bridge-paths, and review queues instead of publishing raw assumptions as facts;
+- runs a 24/7 daemon outside the UI and publishes analysis snapshots only after quality gates pass;
+- exports the knowledge graph and supporting archive into Obsidian.
+
+The project is optimized for local Windows execution, long-running collection, and evidence-first review rather than “maximum recall at any cost”.
+
+## What the project does
+
+### Collection and normalization
+
+- Telegram, watch-folder, YouTube/manual media, official registries, official sites, state-company reports, executive directories.
+- Canonical file storage via `raw_blobs` and `attachments`.
+- OCR/ASR/document extraction for images, PDFs, and video/audio-derived materials.
+
+### Enrichment
+
+- Official positions and leadership directories.
+- Personal profiles, photos, disclosures, compensation, declared assets.
+- Company affiliations and state-company management data.
+- Restriction events, justifications, and source-linked evidence.
+
+### Relation engine
+
+- Structural edges for official roles and formal ties.
+- Candidate relations with support-layer accounting.
+- Bridge-node graph for explainable paths through claims, cases, bills, contracts, disclosures, assets, restrictions, and documents.
+
+### Review and publication
+
+- `Review Ops` queues for duplicates, affiliations, restrictions, and source-health issues.
+- `quality_gate` before `analysis_snapshot` and `obsidian_export`.
+- Obsidian graph export with canonical notes instead of source-hub spam.
+
+## Core principles
+
+1. **Source is not fact.**
+   A post, page, or video is a signal. A registry entry, contract, vote record, court document, or official profile is evidence.
+
+2. **Precision first.**
+   The pipeline prefers abstaining or sending something to review over promoting weak or noisy output.
+
+3. **Canonical storage, derived projections.**
+   Raw content, files, facts, relations, review queues, dashboard cards, and Obsidian notes are treated as different layers with different purposes.
+
+4. **Explainability is mandatory.**
+   Promoted relations and dossier views must be explainable through bridge-paths and evidence references.
+
+5. **Fallbacks must be explicit.**
+   Archive-derived and fixture-backed sources are allowed, but they must be marked as such and never silently presented as fresh live data.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    A["Collectors and Watch Folders"] --> B["raw_source_items"]
+    B --> C["raw_blobs + attachments"]
+    B --> D["content_items"]
+    D --> E["entities + mentions"]
+    D --> F["claims + evidence_links"]
+    E --> G["enrichment layer<br/>profiles, disclosures, assets, affiliations, restrictions"]
+    F --> H["relation_support + relation_candidates + entity_relations"]
+    G --> H
+    D --> I["content_clusters + review_tasks"]
+    H --> J["db/news_analysis.db"]
+    J --> K["Obsidian graph export"]
+    D --> L["PySide6 + Web dashboard"]
+    I --> L
+    H --> L
+```
+
+### Runtime split
+
+- **Daemon/runtime** owns long-running jobs, leases, schedules, state, and nightly orchestration.
+- **Desktop UI** is an operator shell: it monitors state, launches jobs, renders review queues, and visualizes the graph.
+- **SQLite** is the canonical store for live operations.
+- **`db/news_analysis.db`** is the derived analysis snapshot.
+- **Obsidian export** is a derived archive/view, not the source of truth.
+
+## Pipeline
+
+```mermaid
+flowchart LR
+    SH["source_health"] --> EN["collect and enrich"]
+    EN --> DD["content_dedupe"]
+    DD --> CL["classifier_v3"]
+    CL --> CN["claim normalization"]
+    CN --> SI["semantic index"]
+    SI --> RB["relation rebuild"]
+    RB --> QA["quality_gate and audits"]
+    QA --> AS["analysis_snapshot"]
+    AS --> OE["obsidian_export"]
+```
+
+### Current nightly semantics
+
+- `source_health` resolves sources into `healthy_live`, `healthy_archive`, `healthy_fixture`, `degraded_live`, `degraded_parser`, or `blocked`.
+- `quality_gate` blocks `analysis_snapshot/export` only when unresolved blockers remain.
+- `reviewed_baseline_pending` from `classifier_audit` is currently a warning, not a blocker.
+- Non-required degraded sources are redirected into review queues instead of killing the pipeline.
+
+## Data model
+
+### Canonical live database
+
+Primary database: `db/news_unified.db`
+
+Important layers:
+
+| Layer | Purpose |
+| --- | --- |
+| `raw_source_items` | original signal and raw metadata |
+| `raw_blobs` | canonical file registry on disk |
+| `attachments` | link between files and normalized content |
+| `content_items` | normalized materials |
+| `entities`, `entity_mentions` | canonical actors and mentions |
+| `claims`, `claim_clusters`, `claim_occurrences` | canonical statements and duplicates |
+| `evidence_links` | support/hard evidence for claims |
+| `content_clusters` | document/story deduplication |
+| `person_disclosures`, `declared_assets`, `compensation_facts` | disclosure and income layer |
+| `company_affiliations` | company/person ties |
+| `restriction_events` | structured restrictions and justifications |
+| `relation_support`, `relation_candidates`, `relation_features`, `entity_relations` | graph and promotion pipeline |
+| `review_tasks` | manual and semi-automatic review queues |
+| `job_runs`, `job_leases`, `pipeline_runs`, `runtime_metadata` | runtime/orchestration state |
+| `source_sync_state`, `source_health_checks`, `source_fixtures` | source-health and fallback tracking |
+
+### Derived databases and projections
+
+- `db/news_analysis.db` — materialized analysis graph for export/reporting.
+- Obsidian vault — note-based graph archive with copied attachments/media.
+- Dashboard cards, maps, and dossiers — UI projections over canonical live and derived layers.
+
+## Source health and quality gates
+
+Source-health policy is tracked in:
+
+- `config/source_health_manifest.json`
+- `processed/source_fixtures/<source_key>/...`
+- `tests/fixtures/source_health/...`
+
+Quality semantics:
+
+| State | Meaning |
+| --- | --- |
+| `healthy_live` | live source works directly |
+| `healthy_archive` | live source is unavailable, but archive-derived path is valid and explicitly marked |
+| `healthy_fixture` | parser/shape is validated via local fixture fallback |
+| `degraded_live` | source is currently failing live transport |
+| `degraded_parser` | parser/fallback path is not acceptable |
+| `blocked` | required source unresolved; pipeline must stop |
+
+The current design intentionally allows **archive-backed** and **fixture-backed** official/documentary sources when they are explicitly tracked and marked as fallback-derived.
+
+## Validated local status
+
+Latest validated local state in this repository:
+
+- latest successful pipeline: `nightly-20260426200549`
+- latest QA report: `reports/qa_quality_latest.json`
+- `quality_gate.ok = true`
+- tests: `111/111`
+
+### Current validated metrics
+
+These values were validated against the live local database during the latest repository pass and will drift as the next nightly runs.
+
+| Metric | Value |
+| --- | ---: |
+| `content_items` | 20,671 |
+| active claims | 908 |
+| `relation_candidates` | 858 |
+| relation candidates in `review` | 130 |
+| promoted relations | 21 |
+| `content_clusters` | 1,143 |
+| active official positions | 1,019 |
+| `entity_media` | 434 |
+| `person_disclosures` | 652 |
+| `declared_assets` | 4,307 |
+| `restriction_events` | 515 |
+| source review tasks | 6 |
+| fixture-backed sources | 10 |
+| archive-backed sources | 6 |
+
+### Current review queues
+
+| Queue | Open items |
+| --- | ---: |
+| `content_duplicates` | 1,143 |
+| `assets_affiliations` | 664 |
+| `restrictions_justifications` | 515 |
+| `sources` | 6 |
+
+## Repository structure
+
+```text
+F:\новости
+├── classifier/               # tagger, semantic index, classifier audit
+├── collectors/               # Telegram, watch-folder, YouTube, official and directory collectors
+├── config/                   # settings, manifests, DB helpers, source-health policy
+├── db/                       # schema, migration, canonical SQLite databases
+├── enrichment/               # disclosures, affiliations, restrictions, state-company and profile enrichment
+├── graph/                    # relation candidates, support, explainable graph logic
+├── investigation/            # dossier and investigation graph engine
+├── media_pipeline/           # OCR, ASR, media extraction
+├── quality/                  # gates and QA reports
+├── runtime/                  # daemon, job runner, healthcheck, recovery, scheduler bootstrap
+├── tests/                    # unit and regression tests
+├── tools/                    # export, snapshot, audit, corpus/build helpers
+├── ui/                       # PySide6 bridge and controller
+├── ui_web/                   # HTML/CSS/JS dashboard bundle
+├── processed/                # local file store, fixtures, derived media
+├── reports/                  # QA reports, review packs, runtime logs
+└── todo.md                   # long-form implementation ledger
+```
+
+## Quick start
+
+### 1. Install dependencies
+
+```powershell
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+### 2. Create local settings
+
+```powershell
+Copy-Item config\settings.example.json config\settings.json
+```
+
+Edit local paths and machine-specific parameters in `config/settings.json`.
+
+### 3. Initialize the database
 
 ```powershell
 python db\migrate.py
+```
+
+### 4. Launch the UI
+
+```powershell
 python main.py
 ```
 
-Основная SQLite-БД: `db/news_unified.db`.
-Старый импорт Telegram хранится в корневой `news_unified.db` и используется миграцией как источник легаси-данных.
+## Configuration
 
-Локальные машинные настройки хранятся в `config/settings.json`.
-В репозитории лежит шаблон `config/settings.example.json` без абсолютных путей и локальных секретов.
+Key local config files:
 
-## 24/7 runtime
+- `config/settings.json` — machine-specific settings, local paths, intervals, vault location.
+- `config/settings.example.json` — safe template without absolute personal paths.
+- `config/executive_sources.json` — official directory and leadership sources.
+- `config/source_health_manifest.json` — source-health policy, transport and fallback expectations.
 
-Фоновый сбор и nightly pipeline теперь живут вне UI в отдельном daemon-процессе.
-Desktop dashboard только показывает состояние и вручную запускает job'ы; владельцем long-running scheduler больше не является.
+Typical settings domains:
 
-Полезные команды:
+- storage paths
+- runtime intervals
+- review pack import/export
+- Obsidian vault destination
+- OCR/ASR preferences
+- source-health manifest override path
+
+## Runtime and operations
+
+### Main entrypoints
 
 ```powershell
 python -m runtime.healthcheck
-python -m runtime.run_job --job relations
-python -m runtime.run_job --job profiles_enrichment
-python -m runtime.run_job --job photo_backfill
-python -m runtime.run_job --job anticorruption_disclosures
-python -m runtime.run_job --job company_registry_enrichment
-python -m runtime.run_job --job restriction_corpus
-python -m runtime.run_job --job content_dedupe
-python -m runtime.run_job --job relation_rebuild_enriched
-python -m runtime.run_job --job classifier_audit
-python -m runtime.run_pipeline --mode nightly
-python -m runtime.daemon
-python -m runtime.recover --request-daemon-stop
-python -m runtime.task_scheduler
-```
-
-Runtime пишет состояние прямо в `db/news_unified.db`:
-- `job_runs`, `job_leases`, `pipeline_runs`
-- `source_health_checks`, `source_sync_state`, `dead_letter_items`
-- `relation_candidates`, `relation_support`, `classifier_audit_samples`, `runtime_metadata`
-- `content_clusters`, `person_disclosures`, `declared_assets`, `company_affiliations`
-- `compensation_facts`, `restriction_events`, `entity_media`, `review_tasks`
-
-Nightly pipeline собирает `pipeline_version`, прогоняет `classifier_audit`/drift gate, пересобирает `db/news_analysis.db` и затем запускает Obsidian export.
-Локальный путь выгрузки берётся из `config/settings.json` через `obsidian_export_dir`; шаблон в `config/settings.example.json` по умолчанию указывает на `obsidian_export_graph`.
-
-Для автозапуска daemon при логоне есть bootstrap:
-
-```powershell
-python -m runtime.task_scheduler
-python -m runtime.task_scheduler --query
-python -m runtime.task_scheduler --remove
-```
-
-Скрипт сначала пытается зарегистрировать задачу в Windows Task Scheduler. Если текущая сессия не имеет прав на `schtasks /Create`, он автоматически пишет launcher в user Startup folder и сообщает это в результате (`install_mode=startup_folder`).
-
-## UI
-
-`main.py` запускает встроенный HTML/CSS/JS dashboard внутри PySide6 через `QWebEngineView + QWebChannel`.
-Web bundle лежит в `ui_web/`, bridge и controller-логика — в `ui/web_bridge.py` и `ui/web_window.py`.
-
-## Executive directories
-
-Официальный сбор руководителей и заместителей госорганов живёт в `collectors/executive_directory_scraper.py`.
-Активные leadership sources сейчас описаны в `config/executive_sources.json`.
-
-Быстрый ручной прогон:
-
-```powershell
-python -m collectors.executive_directory_scraper
-```
-
-## Enrichment contour
-
-Отдельный enrichment-контур строит персональные профили, фото, декларации,
-имущественные факты, аффилиации, ограничения и review packs поверх уже
-нормализованных `content_items/raw_blobs/attachments`.
-
-Основные enrichment job'ы:
-
-```powershell
+python -m runtime.run_job --job source_health
+python -m runtime.run_job --job quality_gate
 python -m runtime.run_job --job profiles_enrichment
 python -m runtime.run_job --job photo_backfill
 python -m runtime.run_job --job anticorruption_disclosures
@@ -91,56 +311,117 @@ python -m runtime.run_job --job company_registry_enrichment
 python -m runtime.run_job --job state_company_reports
 python -m runtime.run_job --job restriction_corpus
 python -m runtime.run_job --job content_dedupe
-python -m runtime.run_job --job review_pack_export
-python -m runtime.run_job --job review_pack_import
 python -m runtime.run_job --job relation_rebuild_enriched
+python -m runtime.run_pipeline --mode nightly
+python -m runtime.daemon
+python -m runtime.recover --request-daemon-stop
 ```
 
-Новый UI-раздел `Проверка -> Review Ops` читает `review_tasks` и показывает
-очереди `content_duplicates`, `entity_duplicates`, `assets_affiliations`,
-`restrictions_justifications`.
-
-CSV review packs пишутся в каталог из `review_export_dir` / `review_import_dir`
-(`reports/review_packs` по умолчанию).
-
-## Файловая модель
-
-- `raw_source_items` хранит исходный сигнал и сырой JSON.
-- `raw_blobs` хранит канонический реестр файлов на диске: путь, имя, MIME, размер, SHA-256 и служебные метаданные.
-- `attachments` связывает файлы из `raw_blobs` с нормализованными `content_items`.
-- Файлы физически лежат в `processed/*`; БД хранит метаданные и связи, а не только плоский список SQL-записей.
-
-## Экспорт в Obsidian
-
-Smoke-test:
+### Windows autostart
 
 ```powershell
-python tools\export_obsidian.py --limit 5 --vault .\obsidian_export_smoke
+python -m runtime.task_scheduler
+python -m runtime.task_scheduler --query
+python -m runtime.task_scheduler --remove
 ```
 
-Полный graph-export:
+If `schtasks /Create` is unavailable in the current session, the project falls back to a launcher in the user Startup folder.
+
+## Review Ops
+
+`Проверка -> Review Ops` is the central operator queue in the dashboard.
+
+Current queue families:
+
+- `content_duplicates`
+- `assets_affiliations`
+- `restrictions_justifications`
+- `sources`
+
+Each review task carries:
+
+- `candidate_payload`
+- suggested action
+- confidence
+- machine reason
+- source links
+- subject summary
+
+Batch review is supported through CSV packs in `reports/review_packs`.
+
+## Obsidian export
+
+### Full export through the canonical nightly
 
 ```powershell
 python -m runtime.run_pipeline --mode nightly
 ```
 
-Ручной вариант по-прежнему доступен:
+### Manual export path
 
 ```powershell
 python tools\build_analysis_snapshot.py
 python tools\export_obsidian.py --db .\db\news_analysis.db --vault .\obsidian_export_graph --mode graph
 ```
 
-Экспорт создаёт разделы `Sources`, `Content`, `Claims`, `Cases`, `Entities`, `Bills`, `VoteSessions`, `Contracts`, `Risks`, `Profiles`, `Disclosures`, `Assets`, `Affiliations`, `Restrictions`, `ReviewPacks`, `WeakLinks`, `Tags`, `Files` и копирует медиа в `Attachments`. В `graph`-режиме index note также хранит `built_from_pipeline_version`.
+The export produces note groups such as:
 
-## OCR fallback
+- `Sources`
+- `Content`
+- `Claims`
+- `Cases`
+- `Entities`
+- `Bills`
+- `VoteSessions`
+- `Contracts`
+- `Risks`
+- `Profiles`
+- `Disclosures`
+- `Assets`
+- `Affiliations`
+- `Restrictions`
+- `ReviewPacks`
+- `WeakLinks`
+- `Tags`
+- `Files`
+- `Attachments`
 
-`media_pipeline/ocr.py` теперь работает в режиме `auto`: сначала пробует `PaddleOCR`, но при несовместимостях вида `oneDNN/PIR` автоматически переключается на `RapidOCR + ONNXRuntime`.
-После первого успешного fallback backend фиксируется в `source_sync_state.metadata_json`, и следующий batch с `ocr_engine=auto` стартует уже с `rapidocr`, не прогревая снова сломанный Paddle runtime.
+## Verification
 
-## Проверка
+### Main verification commands
 
 ```powershell
 python -m unittest discover -s tests -v
 python -m py_compile main.py ui\web_window.py ui\web_bridge.py runtime\daemon.py runtime\runner.py runtime\state.py runtime\task_scheduler.py graph\relation_candidates.py classifier\audit.py media_pipeline\ocr.py tools\build_analysis_snapshot.py tools\export_obsidian.py tools\export_obsidian_graph.py
 ```
+
+### Runtime QA artifacts
+
+- `reports/qa_quality_latest.json`
+- `reports/analysis_snapshot_latest.json`
+- `reports/source_health_latest.json`
+- `reports/runtime_logs/`
+
+## Known limits
+
+Current non-blocking quality debt:
+
+- `classifier_audit` still runs in `reviewed_baseline_pending` mode until a fully reviewed gold baseline is completed.
+- Some sources are intentionally allowed as non-blocking degraded live sources and are surfaced in `Review Ops -> sources`.
+- Public-facing dossier views must still avoid presenting `seed_only` or fallback-derived hypotheses as established fact.
+
+Current external/source limits:
+
+- some sites remain unstable over live HTTPS/TLS and are currently accepted through archive/fixture policy;
+- `Газпром` and `РЖД` management pages are non-required degraded live sources at the moment;
+- `senators` remains a follow-up source and does not block nightly publication.
+
+## Next development priorities
+
+The next high-value tranche is no longer runtime stabilization. It is quality depth:
+
+1. complete a fully reviewed classifier and relation baseline;
+2. improve promotion from `review` to `promoted` using richer non-seed support;
+3. continue canonical temporal modeling for roles, disclosures, assets, restrictions, and affiliations;
+4. expand fixture/archive coverage for secondary problematic sources;
+5. compress duplicate story clusters further so dossier views show canonical documents, not repetition tails.

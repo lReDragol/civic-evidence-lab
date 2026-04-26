@@ -339,6 +339,30 @@ class DashboardDataServiceTests(unittest.TestCase):
             self.assertIn("official_document", edge_labels)
             self.assertTrue(all(node.get("description") for node in graph["nodes"]))
 
+    def test_relation_map_nodes_expose_group_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "bridge.db"
+            create_db(db_path)
+
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            try:
+                service = DashboardDataService(conn, {})
+                payload = service.screen_payload("relations", {"selected_id": 41})
+            finally:
+                conn.close()
+
+            graph = payload["map_graph"]
+            self.assertTrue(graph["nodes"])
+            group_keys = {node.get("group_key") for node in graph["nodes"]}
+            self.assertIn("people", group_keys)
+            self.assertIn("organizations", group_keys)
+            self.assertIn("claims", group_keys)
+            self.assertIn("documents", group_keys)
+            for node in graph["nodes"]:
+                self.assertIn("group_label", node)
+                self.assertIn("group_tone", node)
+
     def test_relation_detail_contains_evidence_graph(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "bridge.db"

@@ -185,8 +185,9 @@ button {
 }
 
 .screen-panel {
-  display: flex;
-  flex-direction: column;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  height: 100%;
   min-height: 0;
   padding: var(--space-3);
 }
@@ -2664,7 +2665,7 @@ button:disabled {
 }
 
 .relation-map-stage {
-  position: fixed;
+  position: relative;
   min-height: 0;
   min-width: 0;
   overflow: hidden;
@@ -2687,10 +2688,11 @@ button:disabled {
 }
 
 .detail-drawer.map-variant {
-  top: 18px;
-  right: 18px;
-  bottom: 18px;
-  width: min(42%, 760px);
+  top: 12px;
+  right: 12px;
+  bottom: 12px;
+  width: clamp(780px, 62vw, 1480px);
+  max-width: calc(100% - 24px);
   z-index: 14;
 }
 
@@ -2718,7 +2720,8 @@ button:disabled {
   top: 10px;
   right: 10px;
   bottom: 10px;
-  width: min(72%, 1180px);
+  width: clamp(720px, 54vw, 1360px);
+  max-width: calc(100% - 20px);
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
   gap: 10px;
@@ -2882,6 +2885,69 @@ button:disabled {
   display: flex;
   align-items: center;
   gap: 8px;
+}
+
+.relation-map-group-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.map-group-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.map-group-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  display: inline-block;
+  flex: 0 0 auto;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.12);
+}
+
+.map-group-dot.tone-people {
+  background: rgba(255, 255, 255, 0.78);
+}
+
+.map-group-dot.tone-organizations,
+.map-group-dot.tone-entities {
+  background: rgba(108, 207, 246, 0.90);
+}
+
+.map-group-dot.tone-claims {
+  background: rgba(108, 207, 246, 0.92);
+}
+
+.map-group-dot.tone-cases {
+  background: rgba(255, 203, 108, 0.92);
+}
+
+.map-group-dot.tone-bills {
+  background: rgba(123, 194, 255, 0.90);
+}
+
+.map-group-dot.tone-contracts {
+  background: rgba(255, 151, 122, 0.92);
+}
+
+.map-group-dot.tone-affiliations {
+  background: rgba(190, 154, 255, 0.92);
+}
+
+.map-group-dot.tone-restrictions {
+  background: rgba(255, 126, 170, 0.92);
+}
+
+.map-group-dot.tone-documents {
+  background: rgba(78, 242, 178, 0.92);
+}
+
+.map-group-dot.tone-other {
+  background: rgba(255, 255, 255, 0.42);
 }
 
 .node-graph-scene {
@@ -3089,6 +3155,8 @@ button:disabled {
   position: fixed;
   z-index: 18;
   display: block;
+  overflow: hidden;
+  border-radius: 18px;
   opacity: 0;
   pointer-events: none;
   transition: opacity 160ms ease;

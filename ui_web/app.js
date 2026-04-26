@@ -17,7 +17,7 @@
       cases: { query: "" },
       review_ops: { query: "", queue: "", status: "open" },
       entities: { query: "", entity_type: "" },
-      relations: { query: "", layer: "", view: "cards" },
+      relations: { query: "", layer: "", view: "cards", map_group: "" },
       officials: { query: "", active_only: true, view: "cards" },
       settings: {},
     },
@@ -54,6 +54,7 @@
     ui.navSectionRow = document.getElementById("nav-section-row");
     ui.breadcrumbLine = document.getElementById("breadcrumb-line");
     ui.summaryStrip = document.getElementById("summary-strip");
+    ui.screenPanel = document.querySelector(".screen-panel");
     ui.screenRoot = document.getElementById("screen-root");
     ui.screenEyebrow = document.getElementById("screen-eyebrow");
     ui.screenTitle = document.getElementById("screen-title");
@@ -667,6 +668,8 @@
     }
     ui.appShell.dataset.group = state.group;
     ui.appShell.dataset.section = state.section;
+    ui.screenPanel?.classList.remove("relation-map-host");
+    ui.screenRoot.classList.remove("relation-map-host");
     clearRelationMapOverlay();
     renderSummary();
     ui.screenRoot.classList.remove("screen-root-enter");
@@ -1299,6 +1302,7 @@
     const query = state.filters.relations.query || "";
     const layer = state.filters.relations.layer || "";
     const view = state.filters.relations.view || "cards";
+    const mapGroup = state.filters.relations.map_group || "";
     const drawerOpen = isDetailDrawerOpen("relations", payload.detail);
     const filtersMarkup = `
       <div class="screen-filters relation-filters">
@@ -1348,6 +1352,8 @@
           `
         : emptyState("Нет выбранной связи", "Выберите relation слева.");
     if (view === "map") {
+      ui.screenPanel?.classList.add("relation-map-host");
+      ui.screenRoot.classList.add("relation-map-host");
       ui.screenRoot.innerHTML = "";
       if (ui.relationMapOverlayHost) {
         ui.relationMapOverlayHost.hidden = false;
@@ -1355,7 +1361,7 @@
         ui.relationMapOverlayHost.classList.add("open");
         ui.relationMapOverlayHost.innerHTML = renderRelationMapScreen({
           filters: filtersMarkup,
-          graph: renderRelationMapSection(payload.map_graph),
+          graph: renderRelationMapSection(payload.map_graph, mapGroup),
           detail: detailMarkup,
           detailOpen: drawerOpen,
         });
@@ -1409,6 +1415,12 @@
     });
     bindViewSwitch("relations");
     bindRowSelection("relations");
+    queryInteractiveAll("[data-map-group]").forEach((button) => {
+      button.addEventListener("click", () => {
+        state.filters.relations.map_group = button.dataset.mapGroup || "";
+        renderScreen();
+      });
+    });
   }
 
   function renderOfficialsScreen(payload) {
@@ -1713,6 +1725,115 @@
     return "cyan";
   }
 
+  function relationMapNodeGroup(node) {
+    if (!node) {
+      return { key: "other", label: "Прочее", tone: "other" };
+    }
+    if (node.group_key) {
+      return {
+        key: String(node.group_key),
+        label: String(node.group_label || node.group_key),
+        tone: String(node.group_tone || node.group_key || "other"),
+      };
+    }
+    const role = String(node.role || "");
+    const label = String(node.label || "").toLowerCase();
+    if (role === "map_entity" || role === "entity" || role === "entity_from" || role === "entity_to") {
+      if (label === "person") {
+        return { key: "people", label: "Персоны", tone: "people" };
+      }
+      if (label === "organization") {
+        return { key: "organizations", label: "Организации", tone: "organizations" };
+      }
+      return { key: "entities", label: "Сущности", tone: "entities" };
+    }
+    if (role === "claim" || role === "bridge_claim" || role === "relation") {
+      return { key: "claims", label: "Заявления", tone: "claims" };
+    }
+    if (role === "case" || role === "bridge_case") {
+      return { key: "cases", label: "Дела", tone: "cases" };
+    }
+    if (role === "bridge_bill") {
+      return { key: "bills", label: "Законопроекты", tone: "bills" };
+    }
+    if (role === "bridge_contract") {
+      return { key: "contracts", label: "Контракты", tone: "contracts" };
+    }
+    if (role === "bridge_affiliation") {
+      return { key: "affiliations", label: "Аффилиации", tone: "affiliations" };
+    }
+    if (role === "bridge_restriction") {
+      return { key: "restrictions", label: "Ограничения", tone: "restrictions" };
+    }
+    if (role === "content_origin" || role === "bridge_content" || role === "bridge_evidence" || role === "evidence" || role === "context") {
+      return { key: "documents", label: "Документы", tone: "documents" };
+    }
+    return { key: "other", label: "Прочее", tone: "other" };
+  }
+
+  function relationMapGroups(graph) {
+    const priority = [
+      "people",
+      "organizations",
+      "entities",
+      "claims",
+      "cases",
+      "bills",
+      "contracts",
+      "affiliations",
+      "restrictions",
+      "documents",
+      "other",
+    ];
+    const buckets = new Map();
+    (graph?.nodes || []).forEach((node) => {
+      const group = relationMapNodeGroup(node);
+      const bucket = buckets.get(group.key) || { ...group, count: 0 };
+      bucket.count += 1;
+      buckets.set(group.key, bucket);
+    });
+    return [...buckets.values()].sort((a, b) => {
+      const aIndex = priority.indexOf(a.key);
+      const bIndex = priority.indexOf(b.key);
+      return (aIndex === -1 ? 999 : aIndex) - (bIndex === -1 ? 999 : bIndex);
+    });
+  }
+
+  function filterRelationMapGraph(graph, activeGroup) {
+    if (!graph || !activeGroup) {
+      return graph;
+    }
+    const focusIds = new Set();
+    (graph.nodes || []).forEach((node) => {
+      if (relationMapNodeGroup(node).key === activeGroup) {
+        focusIds.add(node.id);
+      }
+    });
+    if (!focusIds.size) {
+      return graph;
+    }
+    const visibleIds = new Set(focusIds);
+    (graph.edges || []).forEach((edge) => {
+      if (focusIds.has(edge.from) || focusIds.has(edge.to)) {
+        visibleIds.add(edge.from);
+        visibleIds.add(edge.to);
+      }
+    });
+    const nodes = (graph.nodes || []).filter((node) => visibleIds.has(node.id));
+    const nodeIds = new Set(nodes.map((node) => node.id));
+    const edges = (graph.edges || []).filter((edge) => nodeIds.has(edge.from) && nodeIds.has(edge.to));
+    return {
+      ...graph,
+      nodes,
+      edges,
+      stats: {
+        ...(graph.stats || {}),
+        filtered_nodes: nodes.length,
+        filtered_edges: edges.length,
+      },
+    };
+  }
+
   function relationPeerName(item, currentEntityId) {
     if (!item) {
       return "—";
@@ -1860,15 +1981,17 @@
     `;
   }
 
-  function renderRelationMapSection(graph) {
+  function renderRelationMapSection(graph, activeGroup = "") {
     if (!graph || !Array.isArray(graph.nodes) || graph.nodes.length < 2 || !Array.isArray(graph.edges) || !graph.edges.length) {
       return emptyState("Карта пока пуста", "Измените фильтр или дождитесь новых связей.");
     }
-    const layout = layoutRelationMapGraph(graph);
+    const groups = relationMapGroups(graph);
+    const focusedGraph = filterRelationMapGraph(graph, activeGroup);
+    const layout = layoutRelationMapGraph(focusedGraph);
     if (!layout.nodes.length || !layout.edges.length) {
       return emptyState("Карта пока пуста", "Измените фильтр или дождитесь новых связей.");
     }
-    const stats = graph.stats || {};
+    const stats = focusedGraph.stats || graph.stats || {};
     return `
       <div class="relation-map-block">
         <div class="graph-section-head relation-map-head">
@@ -1877,8 +2000,8 @@
             <div class="node-graph-hint">Большая карта текущего фильтра: общие узлы показывают, как связи переплетаются между собой. Click по линии открывает связь, click по ноде показывает полный контекст.</div>
           </div>
           <div class="relation-map-stats">
-            <span class="badge cyan">${escapeHtml(String(stats.nodes || layout.nodes.length))} nodes</span>
-            <span class="badge emerald">${escapeHtml(String(stats.edges || layout.edges.length))} edges</span>
+            <span class="badge cyan">${escapeHtml(String(stats.filtered_nodes || stats.nodes || layout.nodes.length))}${stats.nodes && stats.filtered_nodes && stats.filtered_nodes !== stats.nodes ? ` / ${escapeHtml(String(stats.nodes))}` : ""} nodes</span>
+            <span class="badge emerald">${escapeHtml(String(stats.filtered_edges || stats.edges || layout.edges.length))}${stats.edges && stats.filtered_edges && stats.filtered_edges !== stats.edges ? ` / ${escapeHtml(String(stats.edges))}` : ""} edges</span>
             ${
               stats.bridge_nodes
                 ? `<span class="badge amber">${escapeHtml(String(stats.bridge_nodes))} bridges</span>`
@@ -1886,6 +2009,25 @@
             }
           </div>
         </div>
+        ${
+          groups.length
+            ? `
+              <div class="relation-map-group-row">
+                <button class="filter-chip map-group-chip ${activeGroup ? "" : "active"}" data-map-group="" type="button">Все</button>
+                ${groups
+                  .map(
+                    (group) => `
+                      <button class="filter-chip map-group-chip tone-${escapeHtml(group.tone)} ${activeGroup === group.key ? "active" : ""}" data-map-group="${escapeHtml(group.key)}" type="button">
+                        <span class="map-group-dot tone-${escapeHtml(group.tone)}"></span>
+                        ${escapeHtml(group.label)} · ${escapeHtml(String(group.count))}
+                      </button>
+                    `
+                  )
+                  .join("")}
+              </div>
+            `
+            : ""
+        }
         ${renderInteractiveGraphShell({
           title: "",
           hint: "",
@@ -1973,14 +2115,16 @@
 
   function renderEvidenceNode(node) {
     const roleClass = escapeHtml(node.role || "generic");
+    const group = relationMapNodeGroup(node);
     const style = `left:${node.x}px; top:${node.y}px; --node-w:${node.width}px; --node-h:${node.height}px;`;
     return `
       <button
-        class="node-graph-node role-${roleClass}"
+        class="node-graph-node role-${roleClass} group-${escapeHtml(group.tone || group.key || "other")}"
         style="${style}"
         type="button"
         data-node-id="${escapeHtml(node.id)}"
         data-node-role="${roleClass}"
+        data-node-group="${escapeHtml(group.key || "other")}"
         data-node-label="${escapeHtml(node.label || "Node")}"
         data-node-title="${escapeHtml(node.title || "—")}"
         data-node-meta="${escapeHtml(node.meta || "")}"
@@ -2566,14 +2710,15 @@
       return;
     }
     const mainPanelRect = ui.appShell.querySelector(".main-panel")?.getBoundingClientRect();
-    const topPanelRect = ui.appShell.querySelector(".top-panel")?.getBoundingClientRect();
-    if (!mainPanelRect || !topPanelRect) {
+    const screenPanelRect = ui.appShell.querySelector(".screen-panel")?.getBoundingClientRect();
+    if (!screenPanelRect || !mainPanelRect) {
       return;
     }
-    const left = Math.round(mainPanelRect.left);
-    const top = Math.round(topPanelRect.bottom + 10);
-    const width = Math.max(760, Math.round(mainPanelRect.width));
-    const height = Math.max(620, Math.round(window.innerHeight - top - 14));
+    const left = Math.round(screenPanelRect.left);
+    const top = Math.round(screenPanelRect.top);
+    const width = Math.max(760, Math.round(screenPanelRect.width));
+    const availableHeight = Math.round(mainPanelRect.bottom - screenPanelRect.top);
+    const height = Math.max(620, availableHeight);
     host.style.left = `${left}px`;
     host.style.top = `${top}px`;
     host.style.width = `${width}px`;

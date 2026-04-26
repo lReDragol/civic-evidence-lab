@@ -602,6 +602,7 @@ class DashboardDataService:
         jump_screen: str | None = None,
         jump_id: int | None = None,
     ) -> dict[str, Any]:
+        group_key, group_label, group_tone = self._graph_group_meta(role, label)
         node = {
             "id": str(node_id),
             "role": role,
@@ -609,11 +610,40 @@ class DashboardDataService:
             "title": self._compact_text(title, 112) or "—",
             "meta": self._compact_text(meta, 84),
             "description": self._full_text(description),
+            "group_key": group_key,
+            "group_label": group_label,
+            "group_tone": group_tone,
         }
         if jump_screen and jump_id:
             node["jump_screen"] = jump_screen
             node["jump_id"] = int(jump_id)
         return node
+
+    @staticmethod
+    def _graph_group_meta(role: Any, label: Any) -> tuple[str, str, str]:
+        role_text = str(role or "")
+        label_text = str(label or "").casefold()
+        if role_text in {"entity", "entity_from", "entity_to", "map_entity"}:
+            if label_text == "person":
+                return ("people", "Персоны", "people")
+            if label_text == "organization":
+                return ("organizations", "Организации", "organizations")
+            return ("entities", "Сущности", "entities")
+        if role_text in {"claim", "bridge_claim", "relation"}:
+            return ("claims", "Заявления", "claims")
+        if role_text in {"case", "bridge_case"}:
+            return ("cases", "Дела", "cases")
+        if role_text == "bridge_bill":
+            return ("bills", "Законопроекты", "bills")
+        if role_text == "bridge_contract":
+            return ("contracts", "Контракты", "contracts")
+        if role_text == "bridge_affiliation":
+            return ("affiliations", "Аффилиации", "affiliations")
+        if role_text == "bridge_restriction":
+            return ("restrictions", "Ограничения", "restrictions")
+        if role_text in {"content_origin", "bridge_content", "bridge_evidence", "evidence", "context"}:
+            return ("documents", "Документы", "documents")
+        return ("other", "Прочее", "other")
 
     def _content_entities(self, content_item_id: int | None, limit: int = 3) -> list[dict[str, Any]]:
         if not content_item_id or not self._table_exists("entity_mentions"):
