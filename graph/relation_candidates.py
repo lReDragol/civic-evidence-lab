@@ -91,6 +91,14 @@ PROMOTION_BRIDGE_TYPES = {
     "Disclosure",
     "Asset",
 }
+OFFICIAL_PROMOTION_BRIDGE_TYPES = {
+    "RestrictionEvent",
+    "Affiliation",
+    "Disclosure",
+    "Asset",
+}
+OFFICIAL_SEED_KINDS = {"restriction", "affiliation", "disclosure"}
+OFFICIAL_CANDIDATE_CONTENT_TYPES = {"restriction_record", "declaration", "official_document"}
 NON_CONTENT_PATH_TYPES = PROMOTION_BRIDGE_TYPES | {"OfficialDocument"}
 
 
@@ -181,6 +189,22 @@ def _tokenize_name(value: str | None) -> list[str]:
     return re.findall(r"[A-Za-zА-Яа-яЁё0-9]+", (value or "").lower())
 
 
+def _normalized_name_key(value: str | None) -> str:
+    return " ".join(_tokenize_name(value))
+
+
+def _name_key_variants(value: str | None) -> set[str]:
+    base = _normalized_name_key(value)
+    if not base:
+        return set()
+    variants = {base}
+    if " рф" in base:
+        variants.add(base.replace(" рф", " российской федерации"))
+    if " российской федерации" in base:
+        variants.add(base.replace(" российской федерации", " рф"))
+    return {variant.strip() for variant in variants if variant.strip()}
+
+
 def _entity_specificity(entity_type: str, canonical_name: str) -> tuple[float, str | None]:
     tokens = _tokenize_name(canonical_name)
     if not tokens:
@@ -231,6 +255,33 @@ def _load_set_map(conn, sql: str) -> dict[int, set[int]]:
             continue
         data[int(entity_id)].add(int(value))
     return data
+
+
+def _organization_entity_lookup(conn) -> dict[str, set[int]]:
+    lookup: dict[str, set[int]] = defaultdict(set)
+    if not _table_exists(conn, "entities"):
+        return lookup
+    for entity_id, entity_type, canonical_name in conn.execute(
+        """
+        SELECT id, entity_type, canonical_name
+        FROM entities
+        WHERE entity_type='organization' AND canonical_name IS NOT NULL AND TRIM(canonical_name) <> ''
+        """
+    ).fetchall():
+        if entity_id is None:
+            continue
+        for key in _name_key_variants(canonical_name):
+            lookup[key].add(int(entity_id))
+    return lookup
+
+
+def _resolve_organization_entity_id(organization_name: str | None, lookup: dict[str, set[int]]) -> int | None:
+    candidates: set[int] = set()
+    for key in _name_key_variants(organization_name):
+        candidates.update(lookup.get(key, set()))
+    if len(candidates) != 1:
+        return None
+    return next(iter(candidates))
 
 
 def _load_vote_map(conn) -> dict[int, dict[int, str]]:
@@ -357,6 +408,439 @@ def _shared_content_rows(conn) -> list[dict[str, Any]]:
         else:
             record["duplicate_count"] += 1
     return list(grouped.values())
+
+
+def _load_content_context_map(conn) -> dict[int, dict[str, Any]]:
+    if not _table_exists(conn, "content_items"):
+        return {}
+    rows = conn.execute(
+        """
+        SELECT
+            ci.id AS content_item_id,
+            ci.source_id,
+            COALESCE(NULLIF(ci.url, ''), NULLIF(s.url, ''), '') AS source_url,
+            COALESCE(s.category, '') AS source_category,
+            COALESCE(ci.content_type, '') AS content_type,
+            COALESCE(ci.published_at, ci.collected_at, '') AS seen_at,
+            COALESCE(ci.title, '') AS title,
+            COALESCE(ci.body_text, '') AS body_text,
+            cci.cluster_id,
+            cc.canonical_content_id,
+            COALESCE(cc.cluster_type, '') AS cluster_type,
+            COALESCE(cci.is_canonical, 0) AS is_canonical,
+            COALESCE(cc.item_count, 1) AS cluster_item_count
+        FROM content_items ci
+        LEFT JOIN sources s ON s.id = ci.source_id
+        LEFT JOIN content_cluster_items cci ON cci.content_item_id = ci.id
+        LEFT JOIN content_clusters cc ON cc.id = cci.cluster_id
+        """
+    ).fetchall()
+    data: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        content_item_id = int(row[0])
+        source_id = int(row[1]) if row[1] is not None else None
+        cluster_id = int(row[8]) if row[8] is not None else None
+        canonical_content_id = int(row[9]) if row[9] is not None else None
+        data[content_item_id] = {
+            "content_item_id": content_item_id,
+            "source_id": source_id,
+            "source_url": row[2],
+            "source_category": row[3],
+            "content_type": row[4],
+            "seen_at": row[5],
+            "title": row[6],
+            "body_text": row[7],
+            "cluster_id": cluster_id,
+            "canonical_content_id": canonical_content_id,
+            "cluster_type": row[10] or None,
+            "is_canonical": bool(row[11]),
+            "cluster_item_count": int(row[12] or 1),
+        }
+    return data
+
+
+def _official_support_unit(bridge_kind: str, bridge_id: int, content_context: dict[str, Any] | None) -> str:
+    if content_context:
+        cluster_id = content_context.get("cluster_id")
+        if cluster_id is not None:
+            return f"cluster:{int(cluster_id)}"
+        content_item_id = content_context.get("content_item_id")
+        if content_item_id is not None:
+            return f"content:{int(content_item_id)}"
+    return f"{bridge_kind}:{int(bridge_id)}"
+
+
+def _official_bridge_row(
+    *,
+    bridge_kind: str,
+    bridge_id: int,
+    entity_a: int,
+    entity_b: int,
+    default_content_type: str,
+    source_content_id: int | None,
+    source_url: str | None,
+    source_category: str | None,
+    seen_at: str | None,
+    title: str | None,
+    body_text: str | None,
+    evidence_class: str | None,
+    content_context: dict[str, Any] | None,
+) -> dict[str, Any]:
+    context = content_context or {}
+    resolved_source_id = context.get("source_id")
+    resolved_source_url = str(context.get("source_url") or source_url or "").strip()
+    resolved_source_category = str(context.get("source_category") or source_category or "").strip()
+    resolved_content_type = str(context.get("content_type") or default_content_type or "").strip()
+    resolved_seen_at = str(context.get("seen_at") or seen_at or "").strip()
+    resolved_title = str(context.get("title") or title or "").strip()
+    resolved_body_text = str(context.get("body_text") or body_text or "").strip()
+    cluster_id = context.get("cluster_id")
+    canonical_content_id = context.get("canonical_content_id")
+    duplicate_count = int(context.get("cluster_item_count") or 1)
+    support_unit = _official_support_unit(bridge_kind, bridge_id, context if context else None)
+    lowered_evidence_class = str(evidence_class or "").strip().lower()
+    is_hard = bool(
+        lowered_evidence_class == "hard"
+        or resolved_source_category in OFFICIAL_SOURCE_CATEGORIES
+        or resolved_content_type in HARD_CONTENT_TYPES
+        or bridge_kind in {"restriction_event", "affiliation", "disclosure", "asset"}
+    )
+    return {
+        "entity_a": int(entity_a),
+        "entity_b": int(entity_b),
+        "content_item_id": int(source_content_id) if source_content_id is not None else None,
+        "source_id": int(resolved_source_id) if resolved_source_id is not None else None,
+        "source_url": resolved_source_url,
+        "source_category": resolved_source_category or "official_site",
+        "content_type": resolved_content_type or default_content_type,
+        "seen_at": resolved_seen_at,
+        "title": resolved_title,
+        "body_text": resolved_body_text,
+        "cluster_id": int(cluster_id) if cluster_id is not None else None,
+        "canonical_content_id": int(canonical_content_id) if canonical_content_id is not None else None,
+        "cluster_type": context.get("cluster_type"),
+        "cluster_item_count": duplicate_count,
+        "support_unit": support_unit,
+        "duplicate_count": max(1, duplicate_count),
+        "domain": _normalize_domain(resolved_source_url, resolved_source_id),
+        "bridge_kind": bridge_kind,
+        "bridge_id": int(bridge_id),
+        "bridge_support_unit": f"{bridge_kind}:{int(bridge_id)}",
+        "is_official_bridge": True,
+        "is_hard_evidence": is_hard,
+        "evidence_class": lowered_evidence_class or None,
+    }
+
+
+def _append_bridge_support_row(
+    target_map: dict[tuple[int, int], list[dict[str, Any]]],
+    *,
+    bridge_kind: str,
+    bridge_id: int,
+    entity_left: int | None,
+    entity_right: int | None,
+    default_content_type: str,
+    source_content_id: int | None,
+    source_url: str | None,
+    source_category: str | None,
+    seen_at: str | None,
+    title: str | None,
+    body_text: str | None,
+    evidence_class: str | None,
+    content_context_map: dict[int, dict[str, Any]],
+) -> None:
+    if entity_left is None or entity_right is None:
+        return
+    entity_a = min(int(entity_left), int(entity_right))
+    entity_b = max(int(entity_left), int(entity_right))
+    if entity_a == entity_b:
+        return
+    content_context = content_context_map.get(int(source_content_id)) if source_content_id is not None else None
+    target_map[(entity_a, entity_b)].append(
+        _official_bridge_row(
+            bridge_kind=bridge_kind,
+            bridge_id=int(bridge_id),
+            entity_a=entity_a,
+            entity_b=entity_b,
+            default_content_type=default_content_type,
+            source_content_id=int(source_content_id) if source_content_id is not None else None,
+            source_url=source_url,
+            source_category=source_category,
+            seen_at=seen_at,
+            title=title,
+            body_text=body_text,
+            evidence_class=evidence_class,
+            content_context=content_context,
+        )
+    )
+
+
+def _load_official_bridge_support_rows(
+    conn,
+    *,
+    content_context_map: dict[int, dict[str, Any]],
+    organization_lookup: dict[str, set[int]] | None = None,
+) -> dict[tuple[int, int], list[dict[str, Any]]]:
+    support_rows: dict[tuple[int, int], list[dict[str, Any]]] = defaultdict(list)
+    if _table_exists(conn, "restriction_events"):
+        for row in conn.execute(
+            """
+            SELECT
+                id,
+                issuer_entity_id,
+                target_entity_id,
+                source_content_id,
+                COALESCE(source_url, '') AS source_url,
+                COALESCE(event_date, '') AS seen_at,
+                COALESCE(restriction_type, '') AS title,
+                COALESCE(stated_justification, '') AS body_text,
+                COALESCE(evidence_class, 'support') AS evidence_class
+            FROM restriction_events
+            WHERE issuer_entity_id IS NOT NULL AND target_entity_id IS NOT NULL
+            """
+        ).fetchall():
+            _append_bridge_support_row(
+                support_rows,
+                bridge_kind="restriction_event",
+                bridge_id=int(row[0]),
+                entity_left=row[1],
+                entity_right=row[2],
+                default_content_type="restriction_record",
+                source_content_id=int(row[3]) if row[3] is not None else None,
+                source_url=row[4],
+                source_category="official_site",
+                seen_at=row[5],
+                title=row[6],
+                body_text=row[7],
+                evidence_class=row[8],
+                content_context_map=content_context_map,
+            )
+    if _table_exists(conn, "company_affiliations"):
+        for row in conn.execute(
+            """
+            SELECT
+                id,
+                entity_id,
+                company_entity_id,
+                source_content_id,
+                COALESCE(source_url, '') AS source_url,
+                COALESCE(period_end, period_start, '') AS seen_at,
+                COALESCE(role_title, role_type, company_name, '') AS title,
+                COALESCE(metadata_json, '') AS body_text,
+                COALESCE(evidence_class, 'support') AS evidence_class
+            FROM company_affiliations
+            WHERE entity_id IS NOT NULL AND company_entity_id IS NOT NULL
+            """
+        ).fetchall():
+            _append_bridge_support_row(
+                support_rows,
+                bridge_kind="affiliation",
+                bridge_id=int(row[0]),
+                entity_left=row[1],
+                entity_right=row[2],
+                default_content_type="official_document",
+                source_content_id=int(row[3]) if row[3] is not None else None,
+                source_url=row[4],
+                source_category="official_registry",
+                seen_at=row[5],
+                title=row[6],
+                body_text=row[7],
+                evidence_class=row[8],
+                content_context_map=content_context_map,
+            )
+    if _table_exists(conn, "compensation_facts"):
+        for row in conn.execute(
+            """
+            SELECT
+                id,
+                entity_id,
+                employer_entity_id,
+                source_content_id,
+                COALESCE(source_url, '') AS source_url,
+                COALESCE(compensation_year, '') AS seen_at,
+                COALESCE(role_title, amount_text, '') AS title,
+                COALESCE(metadata_json, '') AS body_text,
+                COALESCE(evidence_class, 'support') AS evidence_class
+            FROM compensation_facts
+            WHERE entity_id IS NOT NULL AND employer_entity_id IS NOT NULL
+            """
+        ).fetchall():
+            _append_bridge_support_row(
+                support_rows,
+                bridge_kind="disclosure",
+                bridge_id=int(row[0]),
+                entity_left=row[1],
+                entity_right=row[2],
+                default_content_type="declaration",
+                source_content_id=int(row[3]) if row[3] is not None else None,
+                source_url=row[4],
+                source_category="official_site",
+                seen_at=str(row[5]) if row[5] is not None else "",
+                title=row[6],
+                body_text=row[7],
+                evidence_class=row[8],
+                content_context_map=content_context_map,
+            )
+    org_lookup = organization_lookup or {}
+    if org_lookup and _table_exists(conn, "person_disclosures") and _table_exists(conn, "official_positions"):
+        seen_pairs: set[tuple[int, int]] = set()
+        for row in conn.execute(
+            """
+            SELECT
+                pd.id,
+                pd.entity_id,
+                pd.source_content_id,
+                COALESCE(pd.source_url, '') AS source_url,
+                COALESCE(pd.disclosure_year, '') AS seen_at,
+                COALESCE(pd.raw_income_text, '') AS title,
+                COALESCE(pd.metadata_json, '') AS body_text,
+                COALESCE(pd.evidence_class, 'support') AS evidence_class,
+                COALESCE(pd.source_type, '') AS source_type,
+                COALESCE(op.organization, '') AS organization_name
+            FROM person_disclosures pd
+            JOIN official_positions op ON op.entity_id = pd.entity_id
+            WHERE pd.entity_id IS NOT NULL
+              AND op.organization IS NOT NULL
+              AND TRIM(op.organization) <> ''
+            ORDER BY pd.id, CASE COALESCE(op.is_active, 0) WHEN 1 THEN 0 ELSE 1 END, op.id DESC
+            """
+        ).fetchall():
+            disclosure_id = int(row[0])
+            organization_entity_id = _resolve_organization_entity_id(row[9], org_lookup)
+            if organization_entity_id is None:
+                continue
+            dedupe_key = (disclosure_id, int(organization_entity_id))
+            if dedupe_key in seen_pairs:
+                continue
+            seen_pairs.add(dedupe_key)
+            source_type = str(row[8] or "").strip().lower()
+            source_category = "official_site" if source_type.startswith("official") else "official_site"
+            _append_bridge_support_row(
+                support_rows,
+                bridge_kind="disclosure",
+                bridge_id=disclosure_id,
+                entity_left=row[1],
+                entity_right=organization_entity_id,
+                default_content_type="declaration",
+                source_content_id=int(row[2]) if row[2] is not None else None,
+                source_url=row[3],
+                source_category=source_category,
+                seen_at=str(row[4]) if row[4] is not None else "",
+                title=row[5] or f"Disclosure #{disclosure_id}",
+                body_text=row[6],
+                evidence_class=row[7],
+                content_context_map=content_context_map,
+            )
+    return support_rows
+
+
+def _merge_membership_map(target: dict[int, set[int]], source: dict[int, set[int]]) -> dict[int, set[int]]:
+    for entity_id, values in source.items():
+        target[int(entity_id)].update(int(value) for value in values)
+    return target
+
+
+def _merge_pair_map(target: dict[tuple[int, int], set[int]], source: dict[tuple[int, int], set[int]]) -> dict[tuple[int, int], set[int]]:
+    for pair, values in source.items():
+        entity_a, entity_b = pair
+        target[(int(entity_a), int(entity_b))].update(int(value) for value in values)
+    return target
+
+
+def _bridge_rows_to_maps(
+    rows_map: dict[tuple[int, int], list[dict[str, Any]]],
+    *,
+    bridge_kind: str,
+) -> tuple[dict[int, set[int]], dict[tuple[int, int], set[int]]]:
+    membership_map: dict[int, set[int]] = defaultdict(set)
+    pair_map: dict[tuple[int, int], set[int]] = defaultdict(set)
+    for pair, rows in rows_map.items():
+        entity_a, entity_b = pair
+        for row in rows:
+            if row.get("bridge_kind") != bridge_kind:
+                continue
+            bridge_id = row.get("bridge_id")
+            if bridge_id is None:
+                continue
+            bridge_id_int = int(bridge_id)
+            membership_map[int(entity_a)].add(bridge_id_int)
+            membership_map[int(entity_b)].add(bridge_id_int)
+            pair_map[(int(entity_a), int(entity_b))].add(bridge_id_int)
+    return membership_map, pair_map
+
+
+def _has_existing_non_candidate_relation(conn, entity_a: int, entity_b: int) -> bool:
+    row = conn.execute(
+        """
+        SELECT 1
+        FROM entity_relations
+        WHERE COALESCE(detected_by, '') NOT LIKE 'relation_candidate:%'
+          AND (
+            (from_entity_id=? AND to_entity_id=?)
+            OR
+            (from_entity_id=? AND to_entity_id=?)
+          )
+        LIMIT 1
+        """,
+        (entity_a, entity_b, entity_b, entity_a),
+    ).fetchone()
+    return bool(row)
+
+
+def _merge_support_rows(
+    shared_rows: list[dict[str, Any]],
+    official_bridge_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    merged: dict[tuple[str, int | None, str | None], dict[str, Any]] = {}
+
+    def upsert(row: dict[str, Any]) -> None:
+        key = (
+            str(row.get("support_unit") or f"content:{row.get('content_item_id') or 0}"),
+            int(row["source_id"]) if row.get("source_id") is not None else None,
+            str(row.get("domain") or "") or None,
+        )
+        existing = merged.get(key)
+        if existing is None:
+            cloned = dict(row)
+            cloned["_bridge_types"] = set()
+            cloned["_bridge_units"] = set()
+            if row.get("bridge_kind"):
+                cloned["_bridge_types"].add(str(row["bridge_kind"]))
+                cloned["_bridge_units"].add(str(row.get("bridge_support_unit") or f"{row['bridge_kind']}:{row.get('bridge_id')}"))
+            merged[key] = cloned
+            return
+        existing["duplicate_count"] = max(
+            int(existing.get("duplicate_count") or 1),
+            int(row.get("duplicate_count") or 1),
+        )
+        if row.get("is_official_bridge"):
+            existing["is_official_bridge"] = True
+        if row.get("is_hard_evidence"):
+            existing["is_hard_evidence"] = True
+        if row.get("bridge_kind"):
+            existing["_bridge_types"].add(str(row["bridge_kind"]))
+            existing["_bridge_units"].add(str(row.get("bridge_support_unit") or f"{row['bridge_kind']}:{row.get('bridge_id')}"))
+        for field in ("content_type", "source_category", "source_url", "seen_at", "title", "body_text"):
+            if not existing.get(field) and row.get(field):
+                existing[field] = row[field]
+        if existing.get("content_item_id") is None and row.get("content_item_id") is not None:
+            existing["content_item_id"] = row["content_item_id"]
+        if existing.get("canonical_content_id") is None and row.get("canonical_content_id") is not None:
+            existing["canonical_content_id"] = row["canonical_content_id"]
+        if existing.get("cluster_id") is None and row.get("cluster_id") is not None:
+            existing["cluster_id"] = row["cluster_id"]
+
+    for row in shared_rows:
+        upsert(row)
+    for row in official_bridge_rows:
+        upsert(row)
+
+    result: list[dict[str, Any]] = []
+    for row in merged.values():
+        row["bridge_types"] = sorted(row.pop("_bridge_types", set()))
+        row["bridge_units"] = sorted(row.pop("_bridge_units", set()))
+        result.append(row)
+    return result
 
 
 def _load_tag_map(conn) -> dict[int, set[str]]:
@@ -575,14 +1059,25 @@ def _candidate_state(
             semantic_support_score >= 0.35,
         )
     )
-    shortest_bridge_types = {str(node.get("node_type") or "") for node in shortest_bridge_path}
-    has_nonseed_bridge = bool(shortest_bridge_types & PROMOTION_BRIDGE_TYPES)
+    bridge_types = {
+        str(node.get("node_type") or "")
+        for node in (shortest_bridge_path or [])
+    } | {
+        str(node.get("node_type") or "")
+        for node in (explain_path or [])
+    }
+    has_nonseed_bridge = bool(bridge_types & PROMOTION_BRIDGE_TYPES)
+    has_official_bridge = bool(bridge_types & OFFICIAL_PROMOTION_BRIDGE_TYPES)
     if structural_seed_kind and not has_evidence_support:
         return "seed_only"
     if promotion_block_reason:
         if promotion_block_reason == "low_entity_specificity":
             return "seed_only" if structural_seed_kind else "pending"
-        if promotion_block_reason in {"same_case_requires_nonseed_bridge", "same_case_requires_evidence_bridge"}:
+        if promotion_block_reason in {
+            "same_case_requires_nonseed_bridge",
+            "same_case_requires_evidence_bridge",
+            "official_bridge_missing",
+        }:
             return "seed_only" if structural_seed_kind else "pending"
         if has_evidence_support or (not structural_seed_kind and has_support_layer):
             return "review"
@@ -599,9 +1094,11 @@ def _candidate_state(
         and (
             (support_items >= 1 and support_sources >= 2 and support_domains >= 2)
             or (
-                support_hard_evidence_count >= 1
-                and support_claim_cluster_count >= 1
+                candidate_type != "same_case_cluster"
+                and support_hard_evidence_count >= 1
+                and support_items >= 1
                 and support_domains >= 1
+                and has_official_bridge
             )
         )
     ):
@@ -691,6 +1188,8 @@ def _build_shortest_bridge_path(
     for claim_cluster_id in shared_claim_cluster_ids[:6]:
         add_bridge("ClaimCluster", int(claim_cluster_id), 1.35)
     for row in shared_content_rows[:12]:
+        if row.get("content_item_id") is None:
+            continue
         content_item_id = int(row["content_item_id"])
         is_hard = (
             (row.get("source_category") in OFFICIAL_SOURCE_CATEGORIES)
@@ -966,9 +1465,22 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
             "SELECT entity_id, id FROM declared_assets WHERE entity_id IS NOT NULL",
         ) if _table_exists(conn, "declared_assets") else defaultdict(set)
 
+        content_context_map = _load_content_context_map(conn)
+        organization_lookup = _organization_entity_lookup(conn)
         pair_rows = defaultdict(list)
         for record in _shared_content_rows(conn):
             pair_rows[(record["entity_a"], record["entity_b"])].append(record)
+        official_bridge_support_map = _load_official_bridge_support_rows(
+            conn,
+            content_context_map=content_context_map,
+            organization_lookup=organization_lookup,
+        )
+        disclosure_bridge_membership_map, disclosure_bridge_pair_map = _bridge_rows_to_maps(
+            official_bridge_support_map,
+            bridge_kind="disclosure",
+        )
+        disclosure_map = _merge_membership_map(disclosure_map, disclosure_bridge_membership_map)
+        disclosure_pair_map = _merge_pair_map(disclosure_pair_map, disclosure_bridge_pair_map)
         structural_seed_pairs = _pairs_from_membership_map(contract_map, max_group_size=6)
         bill_seed_pairs = _pairs_from_membership_map(bill_map, max_group_size=24, min_shared=3)
         case_seed_pairs = _pairs_from_membership_map(case_map, max_group_size=16, min_shared=1)
@@ -1009,6 +1521,8 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
 
         for entity_a, entity_b in sorted(pair_keys):
             shared_rows = pair_rows.get((entity_a, entity_b), [])
+            official_bridge_rows = official_bridge_support_map.get((entity_a, entity_b), [])
+            support_rows = _merge_support_rows(shared_rows, official_bridge_rows)
             structural_seed_kind = None
             if (entity_a, entity_b) in vote_seed_pairs:
                 structural_seed_kind = "vote"
@@ -1029,7 +1543,13 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
             entity_b_type = entity_records.get(entity_b, {}).get("type", "entity")
             entity_a_name = entity_records.get(entity_a, {}).get("name", "")
             entity_b_name = entity_records.get(entity_b, {}).get("name", "")
-            shared_content_ids = sorted({row["content_item_id"] for row in shared_rows})
+            shared_content_ids = sorted(
+                {
+                    int(row["content_item_id"])
+                    for row in support_rows
+                    if row.get("content_item_id") is not None
+                }
+            )
             shared_tags = set()
             for content_id in shared_content_ids:
                 shared_tags.update(tag_map.get(content_id, set()))
@@ -1048,9 +1568,9 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
             contract_overlap = len(shared_contract_ids)
             risk_overlap = len(shared_risk_ids)
 
-            support_items = len(shared_rows)
-            support_sources = len({row["source_id"] for row in shared_rows if row["source_id"] is not None})
-            support_domains = len({row["domain"] for row in shared_rows if row.get("domain")})
+            support_items = len(support_rows)
+            support_sources = len({row["source_id"] for row in support_rows if row["source_id"] is not None})
+            support_domains = len({row["domain"] for row in support_rows if row.get("domain")})
             has_structural_signal = bool(structural_seed_kind)
             if (
                 support_items < MIN_SUPPORT_ITEMS
@@ -1075,10 +1595,14 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
             entity_semantic_score = float(entity_semantic_scores.get((entity_a, entity_b), 0.0))
             shared_official_document_ids = sorted(
                 {
-                    row["content_item_id"]
-                    for row in shared_rows
-                    if row.get("source_category") in OFFICIAL_SOURCE_CATEGORIES
-                    or str(row.get("content_type") or "") in HARD_CONTENT_TYPES
+                    int(row["content_item_id"])
+                    for row in support_rows
+                    if row.get("content_item_id") is not None
+                    and (
+                        row.get("source_category") in OFFICIAL_SOURCE_CATEGORIES
+                        or str(row.get("content_type") or "") in HARD_CONTENT_TYPES
+                        or bool(row.get("is_official_bridge"))
+                    )
                 }
             )
 
@@ -1100,7 +1624,7 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
             metrics = _score_candidate(
                 entity_a_type,
                 entity_b_type,
-                shared_rows,
+                support_rows,
                 shared_tags,
                 case_overlap=case_overlap,
                 bill_overlap=bill_overlap,
@@ -1178,7 +1702,7 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
                         0.35
                         * min(
                             1.0,
-                            len({row["source_category"] for row in shared_rows if row.get("source_category") in OFFICIAL_SOURCE_CATEGORIES}) / 2.0,
+                            len({row["source_category"] for row in support_rows if row.get("source_category") in OFFICIAL_SOURCE_CATEGORIES}) / 2.0,
                         )
                     ),
                 ),
@@ -1187,9 +1711,10 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
             support_hard_evidence_count = len(
                 {
                     row["support_unit"]
-                    for row in shared_rows
+                    for row in support_rows
                     if (
-                        row.get("source_category") in OFFICIAL_SOURCE_CATEGORIES
+                        row.get("is_hard_evidence")
+                        or row.get("source_category") in OFFICIAL_SOURCE_CATEGORIES
                         or str(row.get("content_type") or "") in HARD_CONTENT_TYPES
                     )
                 }
@@ -1219,7 +1744,7 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
             shortest_bridge_path = _build_shortest_bridge_path(
                 entity_a=entity_a,
                 entity_b=entity_b,
-                shared_content_rows=shared_rows,
+                shared_content_rows=support_rows,
                 shared_claim_cluster_ids=shared_claim_cluster_ids,
                 shared_case_ids=shared_case_ids,
                 shared_bill_ids=shared_bill_ids,
@@ -1232,7 +1757,14 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
                 shared_vote_count=same_votes,
                 entity_semantic_score=entity_semantic_score,
             )
-            bridge_types = {str(node.get("node_type") or "") for node in shortest_bridge_path}
+            bridge_types = {
+                str(node.get("node_type") or "")
+                for node in shortest_bridge_path
+            } | {
+                str(node.get("node_type") or "")
+                for node in explain_path
+            }
+            official_bridge_types = bridge_types & OFFICIAL_PROMOTION_BRIDGE_TYPES
             entity_quality_score, entity_block_reason = _pair_entity_quality(
                 entity_a_type,
                 entity_a_name,
@@ -1272,10 +1804,20 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
                     or has_evidence_bridge
                 ):
                     promotion_block_reason = promotion_block_reason or "same_case_requires_evidence_bridge"
+            elif (
+                support_hard_evidence_count > 0
+                and (
+                    structural_seed_kind in OFFICIAL_SEED_KINDS
+                    or any(str(content_type or "") in OFFICIAL_CANDIDATE_CONTENT_TYPES for content_type in metrics["content_types"])
+                )
+                and not official_bridge_types
+            ):
+                promotion_block_reason = promotion_block_reason or "official_bridge_missing"
             elif metrics["support_items"] > 0 and metrics["support_sources"] >= 2 and metrics["support_domains"] == 0:
                 promotion_block_reason = promotion_block_reason or "fake_domain_diversity"
             elif metrics["support_items"] > 0 and dedupe_support_score < 0.45 and metrics["support_sources"] < 2:
                 promotion_block_reason = promotion_block_reason or "duplicate_amplified_support"
+            official_bridge_bonus = 0.03 * min(1.0, len(official_bridge_types))
             calibrated_score = round(
                 min(
                     1.0,
@@ -1289,7 +1831,8 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
                     + 0.08 * entity_quality_score
                     + 0.05 * dedupe_support_score
                     + 0.05 * real_host_diversity_score
-                    + 0.05 * bridge_diversity_score,
+                    + 0.05 * bridge_diversity_score
+                    + official_bridge_bonus
                 ),
                 4,
             )
@@ -1313,13 +1856,29 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
 
             evidence_mix = {
                 "content_types": metrics["content_types"],
-                "source_categories": sorted({row["source_category"] for row in shared_rows if row.get("source_category")}),
-                "domains": sorted({row["domain"] for row in shared_rows if row.get("domain")}),
-                "telegram_only": bool(shared_rows) and all((row.get("source_category") or "") == "telegram" for row in shared_rows),
+                "official_content_types": sorted(
+                    {
+                        str(row.get("content_type") or "")
+                        for row in support_rows
+                        if row.get("is_official_bridge")
+                        or row.get("source_category") in OFFICIAL_SOURCE_CATEGORIES
+                        or str(row.get("content_type") or "") in HARD_CONTENT_TYPES
+                    }
+                ),
+                "source_categories": sorted({row["source_category"] for row in support_rows if row.get("source_category")}),
+                "domains": sorted({row["domain"] for row in support_rows if row.get("domain")}),
+                "telegram_only": bool(support_rows) and all((row.get("source_category") or "") == "telegram" for row in support_rows),
                 "content_clusters": {
                     "cluster_ids": metrics["cluster_ids"],
                     "cluster_count": len(metrics["cluster_ids"]),
                 },
+                "official_bridge_count": len(
+                    {
+                        bridge_unit
+                        for row in support_rows
+                        for bridge_unit in row.get("bridge_units", [])
+                    }
+                ),
                 "duplicate_count_total": metrics["duplicate_count_total"],
                 "bridge_types": [str(node.get("node_type") or "") for node in explain_path],
             }
@@ -1341,7 +1900,7 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
                 "shared_vote_count": shared_vote_count,
                 "same_vote_ratio": round(vote_overlap_ratio, 4),
                 "support_domains_list": evidence_mix["domains"],
-                "support_categories_list": sorted({row["source_category"] for row in shared_rows if row["source_category"]}),
+                "support_categories_list": sorted({row["source_category"] for row in support_rows if row["source_category"]}),
                 "structural_seed": bool(structural_seed_kind and not shared_rows),
                 "structural_seed_kind": structural_seed_kind,
                 "explain_path": explain_path,
@@ -1430,7 +1989,14 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
                 ),
             )
 
-            for row in shared_rows:
+            for row in support_rows:
+                if not (
+                    row.get("content_item_id") is not None
+                    or row.get("source_id") is not None
+                    or row.get("domain")
+                    or row.get("source_category")
+                ):
+                    continue
                 conn.execute(
                     """
                     INSERT INTO relation_support(
@@ -1439,9 +2005,9 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
                     """,
                     (
                         candidate_id,
-                        "content",
+                        row.get("bridge_kind") or "content",
                         "evidence",
-                        row["content_item_id"],
+                        row.get("content_item_id"),
                         row["source_id"],
                         row.get("domain"),
                         row["source_category"],
@@ -1452,6 +2018,9 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
                                 "canonical_content_id": row.get("canonical_content_id"),
                                 "duplicate_count": row.get("duplicate_count"),
                                 "content_type": row.get("content_type"),
+                                "bridge_kind": row.get("bridge_kind"),
+                                "bridge_id": row.get("bridge_id"),
+                                "is_official_bridge": bool(row.get("is_official_bridge")),
                             },
                             ensure_ascii=False,
                         ),
@@ -1728,23 +2297,24 @@ def promote_relation_candidates(conn_or_settings: Any = None, score_threshold: f
             evidence_item_id = sample_ids[0] if sample_ids else None
             strength = "strong" if float(calibrated_score) >= 0.82 else "moderate" if float(calibrated_score) >= 0.74 else "weak"
             detected_by = f"relation_candidate:{candidate_id}:score={float(calibrated_score):.3f}"
-            conn.execute(
-                """
-                INSERT INTO entity_relations(
-                    from_entity_id, to_entity_id, relation_type, evidence_item_id, strength, detected_by
-                ) VALUES(?,?,?,?,?,?)
-                """,
-                (
-                    entity_a,
-                    entity_b,
-                    candidate_type,
-                    evidence_item_id,
-                    strength,
-                    detected_by,
-                ),
-            )
             promoted_candidates += 1
-            promoted_relations += 1
+            if not _has_existing_non_candidate_relation(conn, int(entity_a), int(entity_b)):
+                conn.execute(
+                    """
+                    INSERT INTO entity_relations(
+                        from_entity_id, to_entity_id, relation_type, evidence_item_id, strength, detected_by
+                    ) VALUES(?,?,?,?,?,?)
+                    """,
+                    (
+                        entity_a,
+                        entity_b,
+                        candidate_type,
+                        evidence_item_id,
+                        strength,
+                        detected_by,
+                    ),
+                )
+                promoted_relations += 1
             conn.execute(
                 """
                 UPDATE relation_candidates

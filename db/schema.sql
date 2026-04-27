@@ -357,6 +357,8 @@ CREATE TABLE IF NOT EXISTS content_tag_votes (
     namespace       TEXT,
     normalized_tag  TEXT,
     vote_value      TEXT NOT NULL,
+    signal_layer    TEXT DEFAULT 'raw',
+    abstain_reason  TEXT,
     confidence_raw  REAL DEFAULT 0,
     evidence_text   TEXT,
     metadata_json   TEXT,
@@ -377,6 +379,11 @@ CREATE TABLE IF NOT EXISTS entity_relations (
     strength        TEXT DEFAULT 'moderate',
     detected_at     TEXT DEFAULT (datetime('now')),
     detected_by     TEXT,
+    valid_from      TEXT,
+    valid_to        TEXT,
+    observed_at     TEXT,
+    recorded_at     TEXT,
+    superseded_at   TEXT,
     FOREIGN KEY (from_entity_id) REFERENCES entities(id) ON DELETE CASCADE,
     FOREIGN KEY (to_entity_id) REFERENCES entities(id) ON DELETE CASCADE,
     FOREIGN KEY (evidence_item_id) REFERENCES content_items(id) ON DELETE SET NULL
@@ -411,6 +418,9 @@ CREATE TABLE IF NOT EXISTS official_positions (
     faction         TEXT,
     started_at      TEXT,
     ended_at        TEXT,
+    valid_from      TEXT,
+    valid_to        TEXT,
+    observed_at     TEXT,
     source_url      TEXT,
     source_type     TEXT,
     is_active       INTEGER DEFAULT 1,
@@ -696,6 +706,144 @@ CREATE TABLE IF NOT EXISTS source_fixtures (
 CREATE INDEX IF NOT EXISTS idx_source_fixtures_key ON source_fixtures(source_key);
 CREATE INDEX IF NOT EXISTS idx_source_fixtures_active ON source_fixtures(is_active);
 
+CREATE TABLE IF NOT EXISTS content_derivations (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    content_item_id INTEGER NOT NULL,
+    derivation_type TEXT NOT NULL,
+    model_provider  TEXT NOT NULL DEFAULT 'deterministic',
+    model_name      TEXT NOT NULL DEFAULT 'event-pipeline-v1',
+    prompt_version  TEXT NOT NULL DEFAULT 'event-pipeline-v1',
+    input_hash      TEXT NOT NULL,
+    output_text     TEXT,
+    output_json     TEXT,
+    confidence      REAL DEFAULT 0,
+    status          TEXT DEFAULT 'ready',
+    created_at      TEXT DEFAULT (datetime('now')),
+    updated_at      TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (content_item_id) REFERENCES content_items(id) ON DELETE CASCADE,
+    UNIQUE(content_item_id, derivation_type, model_provider, model_name, prompt_version, input_hash)
+);
+
+CREATE INDEX IF NOT EXISTS idx_content_derivations_item ON content_derivations(content_item_id);
+CREATE INDEX IF NOT EXISTS idx_content_derivations_type ON content_derivations(derivation_type);
+
+CREATE TABLE IF NOT EXISTS events (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    canonical_title TEXT NOT NULL,
+    event_type      TEXT,
+    summary_short   TEXT,
+    summary_long    TEXT,
+    status          TEXT DEFAULT 'active',
+    event_date_start TEXT,
+    event_date_end  TEXT,
+    first_observed_at TEXT,
+    last_observed_at TEXT,
+    importance_score REAL DEFAULT 0,
+    confidence      REAL DEFAULT 0,
+    metadata_json   TEXT,
+    created_at      TEXT DEFAULT (datetime('now')),
+    updated_at      TEXT DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type);
+CREATE INDEX IF NOT EXISTS idx_events_status ON events(status);
+CREATE INDEX IF NOT EXISTS idx_events_date_start ON events(event_date_start);
+
+CREATE TABLE IF NOT EXISTS event_items (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id        INTEGER NOT NULL,
+    content_item_id INTEGER,
+    content_cluster_id INTEGER,
+    item_role       TEXT NOT NULL DEFAULT 'origin',
+    source_strength TEXT DEFAULT 'support',
+    added_at        TEXT DEFAULT (datetime('now')),
+    metadata_json   TEXT,
+    FOREIGN KEY (event_id) REFERENCES events(id) ON DELETE CASCADE,
+    FOREIGN KEY (content_item_id) REFERENCES content_items(id) ON DELETE CASCADE,
+    FOREIGN KEY (content_cluster_id) REFERENCES content_clusters(id) ON DELETE SET NULL,
+    UNIQUE(event_id, content_item_id, item_role)
+);
+
+CREATE INDEX IF NOT EXISTS idx_event_items_event ON event_items(event_id);
+CREATE INDEX IF NOT EXISTS idx_event_items_content ON event_items(content_item_id);
+
+CREATE TABLE IF NOT EXISTS event_entities (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id        INTEGER NOT NULL,
+    entity_id       INTEGER NOT NULL,
+    role            TEXT NOT NULL,
+    confidence      REAL DEFAULT 0,
+    valid_from      TEXT,
+    valid_to        TEXT,
+    observed_at     TEXT,
+    metadata_json   TEXT,
+    FOREIGN KEY (event_id) REFERENCES events(id) ON DELETE CASCADE,
+    FOREIGN KEY (entity_id) REFERENCES entities(id) ON DELETE CASCADE,
+    UNIQUE(event_id, entity_id, role)
+);
+
+CREATE INDEX IF NOT EXISTS idx_event_entities_event ON event_entities(event_id);
+CREATE INDEX IF NOT EXISTS idx_event_entities_entity ON event_entities(entity_id);
+CREATE INDEX IF NOT EXISTS idx_event_entities_role ON event_entities(role);
+
+CREATE TABLE IF NOT EXISTS event_timeline (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id        INTEGER NOT NULL,
+    timeline_date   TEXT,
+    title           TEXT NOT NULL,
+    description     TEXT,
+    content_item_id INTEGER,
+    document_content_id INTEGER,
+    sort_order      INTEGER DEFAULT 0,
+    metadata_json   TEXT,
+    FOREIGN KEY (event_id) REFERENCES events(id) ON DELETE CASCADE,
+    FOREIGN KEY (content_item_id) REFERENCES content_items(id) ON DELETE SET NULL,
+    FOREIGN KEY (document_content_id) REFERENCES content_items(id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_event_timeline_event ON event_timeline(event_id);
+CREATE INDEX IF NOT EXISTS idx_event_timeline_date ON event_timeline(timeline_date);
+
+CREATE TABLE IF NOT EXISTS event_facts (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id        INTEGER NOT NULL,
+    claim_id        INTEGER,
+    fact_type       TEXT NOT NULL,
+    canonical_text  TEXT NOT NULL,
+    polarity        TEXT DEFAULT 'neutral',
+    valid_from      TEXT,
+    valid_to        TEXT,
+    observed_at     TEXT,
+    recorded_at     TEXT DEFAULT (datetime('now')),
+    superseded_at   TEXT,
+    confidence      REAL DEFAULT 0,
+    metadata_json   TEXT,
+    FOREIGN KEY (event_id) REFERENCES events(id) ON DELETE CASCADE,
+    FOREIGN KEY (claim_id) REFERENCES claims(id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_event_facts_event ON event_facts(event_id);
+CREATE INDEX IF NOT EXISTS idx_event_facts_type ON event_facts(fact_type);
+
+CREATE TABLE IF NOT EXISTS fact_evidence (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    fact_id         INTEGER NOT NULL,
+    content_item_id INTEGER,
+    document_content_id INTEGER,
+    evidence_type   TEXT,
+    evidence_class  TEXT DEFAULT 'support',
+    source_strength TEXT DEFAULT 'support',
+    added_at        TEXT DEFAULT (datetime('now')),
+    metadata_json   TEXT,
+    FOREIGN KEY (fact_id) REFERENCES event_facts(id) ON DELETE CASCADE,
+    FOREIGN KEY (content_item_id) REFERENCES content_items(id) ON DELETE SET NULL,
+    FOREIGN KEY (document_content_id) REFERENCES content_items(id) ON DELETE SET NULL,
+    UNIQUE(fact_id, content_item_id, document_content_id, evidence_type)
+);
+
+CREATE INDEX IF NOT EXISTS idx_fact_evidence_fact ON fact_evidence(fact_id);
+CREATE INDEX IF NOT EXISTS idx_fact_evidence_content ON fact_evidence(content_item_id);
+
 CREATE TABLE IF NOT EXISTS dead_letter_items (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     source_key      TEXT,
@@ -756,6 +904,11 @@ CREATE TABLE IF NOT EXISTS relation_candidates (
     promotion_block_reason TEXT,
     evidence_mix_json TEXT,
     explain_path_json TEXT,
+    valid_from      TEXT,
+    valid_to        TEXT,
+    observed_at     TEXT,
+    recorded_at     TEXT,
+    superseded_at   TEXT,
     metadata_json   TEXT,
     FOREIGN KEY (entity_a_id) REFERENCES entities(id) ON DELETE CASCADE,
     FOREIGN KEY (entity_b_id) REFERENCES entities(id) ON DELETE CASCADE,
@@ -1006,6 +1159,11 @@ CREATE TABLE IF NOT EXISTS company_affiliations (
     role_title      TEXT,
     period_start    TEXT,
     period_end      TEXT,
+    valid_from      TEXT,
+    valid_to        TEXT,
+    observed_at     TEXT,
+    recorded_at     TEXT,
+    superseded_at   TEXT,
     source_content_id INTEGER,
     source_url      TEXT,
     evidence_class  TEXT DEFAULT 'support',
@@ -1058,6 +1216,11 @@ CREATE TABLE IF NOT EXISTS restriction_events (
     legal_basis     TEXT,
     stated_justification TEXT,
     event_date      TEXT,
+    valid_from      TEXT,
+    valid_to        TEXT,
+    observed_at     TEXT,
+    recorded_at     TEXT,
+    superseded_at   TEXT,
     source_content_id INTEGER,
     source_url      TEXT,
     evidence_class  TEXT DEFAULT 'support',

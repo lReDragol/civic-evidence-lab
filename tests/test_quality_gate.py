@@ -291,6 +291,85 @@ class QualityGateTests(unittest.TestCase):
             self.assertEqual(relation_quality["promoted_with_fake_domain_diversity"], 1)
             self.assertEqual(relation_quality["promoted_without_nonseed_bridge"], 1)
 
+    def test_quality_gate_creates_relation_review_task_for_blocked_official_candidate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "quality.db"
+            report_path = Path(tmp) / "qa_quality_latest.json"
+            create_quality_db(db_path)
+
+            conn = sqlite3.connect(db_path)
+            try:
+                conn.executescript(
+                    """
+                    INSERT INTO entities(id, entity_type, canonical_name) VALUES
+                        (10, 'organization', 'Министерство юстиции Российской Федерации'),
+                        (11, 'person', 'Панферов Константин Юрьевич');
+
+                    INSERT INTO relation_candidates(
+                        id, entity_a_id, entity_b_id, candidate_type, origin, score, support_items,
+                        support_sources, support_domains, support_hard_evidence_count,
+                        candidate_state, promotion_state, promotion_block_reason, evidence_mix_json, explain_path_json
+                    ) VALUES
+                        (
+                            901,
+                            10,
+                            11,
+                            'likely_association',
+                            'candidate_builder:hybrid',
+                            0.72,
+                            1,
+                            1,
+                            1,
+                            1,
+                            'review',
+                            'review',
+                            'official_bridge_missing',
+                            '{"official_bridge_count":1,"official_content_types":["restriction_record"],"bridge_types":["Content","OfficialDocument"]}',
+                            '[{"node_type":"Content","ids":[17395]},{"node_type":"OfficialDocument","ids":[17395]}]'
+                        );
+
+                    INSERT INTO relation_features(
+                        candidate_id, dedupe_support_score, bridge_diversity_score, calibrated_score, updated_at
+                    ) VALUES(901, 1.0, 0.82, 0.72, '2026-04-26T00:00:00');
+
+                    INSERT INTO job_runs(job_id, trigger_mode, requested_by, owner, attempt_no, status, started_at, warnings_json)
+                    VALUES('tagger', 'manual', 'test', 'owner', 1, 'ok', '2026-04-26T00:00:00', '[]');
+                    """
+                )
+                set_runtime_metadata(conn, "classifier_audit_last_status", "ok")
+                set_runtime_metadata(conn, "classifier_audit_last_report", {"reviewed_baseline_ready": True})
+                conn.commit()
+            finally:
+                conn.close()
+
+            result = build_quality_gate(
+                {
+                    "db_path": str(db_path),
+                    "ensure_schema_on_connect": True,
+                    "quality_gate": {
+                        "report_path": str(report_path),
+                        "strict_gate": True,
+                    },
+                }
+            )
+
+            self.assertTrue(result["ok"])
+            conn = sqlite3.connect(db_path)
+            try:
+                row = conn.execute(
+                    """
+                    SELECT queue_key, subject_type, subject_id, suggested_action, machine_reason
+                    FROM review_tasks
+                    WHERE queue_key='relations'
+                    ORDER BY id
+                    LIMIT 1
+                    """
+                ).fetchone()
+            finally:
+                conn.close()
+
+            self.assertEqual(row, ("relations", "relation_candidate", 901, "needs_more_docs", "blocked_official_bridge"))
+
 
 if __name__ == "__main__":
     unittest.main()

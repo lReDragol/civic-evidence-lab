@@ -31,7 +31,7 @@ Windows-first evidence pipeline for collecting public signals, documents, files,
 It is a local dossier-building system that:
 
 - ingests public signals from official sites, registries, Telegram exports, watch-folders, and uploaded files;
-- normalizes them into canonical content, entities, claims, evidence, and enrichment facts;
+- normalizes them into canonical content, entities, claims, events, facts, evidence, and enrichment facts;
 - keeps the original files on disk and the canonical metadata in SQLite;
 - builds relation candidates, explainable bridge-paths, and review queues instead of publishing raw assumptions as facts;
 - runs a 24/7 daemon outside the UI and publishes analysis snapshots only after quality gates pass;
@@ -92,15 +92,21 @@ flowchart LR
     B --> D["content_items"]
     D --> E["entities + mentions"]
     D --> F["claims + evidence_links"]
+    D --> M["content_derivations"]
+    M --> N["events + event_items + event_entities"]
+    N --> O["event_facts + fact_evidence + timelines"]
     E --> G["enrichment layer<br/>profiles, disclosures, assets, affiliations, restrictions"]
     F --> H["relation_support + relation_candidates + entity_relations"]
     G --> H
+    O --> H
     D --> I["content_clusters + review_tasks"]
     H --> J["db/news_analysis.db"]
+    O --> J
     J --> K["Obsidian graph export"]
     D --> L["PySide6 + Web dashboard"]
     I --> L
     H --> L
+    N --> L
 ```
 
 ### Runtime split
@@ -120,7 +126,8 @@ flowchart LR
     DD --> CL["classifier_v3"]
     CL --> CN["claim normalization"]
     CN --> SI["semantic index"]
-    SI --> RB["relation rebuild"]
+    SI --> EP["event_pipeline"]
+    EP --> RB["relation rebuild"]
     RB --> QA["quality_gate and audits"]
     QA --> AS["analysis_snapshot"]
     AS --> OE["obsidian_export"]
@@ -132,6 +139,7 @@ flowchart LR
 - `quality_gate` blocks `analysis_snapshot/export` only when unresolved blockers remain.
 - `reviewed_baseline_pending` from `classifier_audit` is currently a warning, not a blocker.
 - Non-required degraded sources are redirected into review queues instead of killing the pipeline.
+- `event_pipeline` creates immutable derived layers (`content_derivations`, `events`, `event_facts`) without rewriting raw source text.
 
 ## Data model
 
@@ -149,6 +157,9 @@ Important layers:
 | `content_items` | normalized materials |
 | `entities`, `entity_mentions` | canonical actors and mentions |
 | `claims`, `claim_clusters`, `claim_occurrences` | canonical statements and duplicates |
+| `content_derivations` | cleaned factual text, structured extraction, and model outputs |
+| `events`, `event_items`, `event_entities`, `event_timeline` | event-centric layer, participants, and timeline |
+| `event_facts`, `fact_evidence` | canonical facts inside events and their evidence |
 | `evidence_links` | support/hard evidence for claims |
 | `content_clusters` | document/story deduplication |
 | `person_disclosures`, `declared_assets`, `compensation_facts` | disclosure and income layer |
@@ -193,28 +204,42 @@ Latest validated local state in this repository:
 - latest successful pipeline: `nightly-20260426200549`
 - latest QA report: `reports/qa_quality_latest.json`
 - `quality_gate.ok = true`
-- tests: `111/111`
+- tests: `136/136`
 
 ### Current validated metrics
 
-These values were validated against the live local database during the latest repository pass and will drift as the next nightly runs.
+These values were validated against the live local database during the latest repository pass. The nightly pipeline version above is still the latest full end-to-end pipeline, but the relation layer below was later rebuilt live via `relation_rebuild_enriched`, so these metrics may drift before the next full nightly.
 
 | Metric | Value |
 | --- | ---: |
 | `content_items` | 20,671 |
 | active claims | 908 |
-| `relation_candidates` | 858 |
-| relation candidates in `review` | 130 |
-| promoted relations | 21 |
+| `relation_candidates` | 6,905 |
+| relation candidates in `seed_only` | 5,973 |
+| relation candidates in `review` | 907 |
+| relation candidates in `pending` | 2 |
+| promoted relation candidates | 23 |
+| materialized promoted relation edges | 0 |
+| `events` | 1,141 |
+| `event_facts` | 44 |
 | `content_clusters` | 1,143 |
 | active official positions | 1,019 |
 | `entity_media` | 434 |
 | `person_disclosures` | 652 |
 | `declared_assets` | 4,307 |
 | `restriction_events` | 515 |
+| relation review tasks | 407 |
 | source review tasks | 6 |
 | fixture-backed sources | 10 |
 | archive-backed sources | 6 |
+
+Relation Engine Phase 2 currently runs in **precision-first official-bridge promotion** mode:
+
+- `same_case_cluster` remains a seed mechanism and does not promote on Telegram/story overlap alone;
+- promoted relations require a valid non-content bridge through official dossier tables such as `RestrictionEvent`, `Affiliation`, `Disclosure`, `Asset`, or `OfficialDocument`;
+- fake domain diversity and generic location/entity hubs are blocked before promotion and checked again in `quality_gate`;
+- if a promoted candidate is already covered by an existing structural edge, the candidate still remains promoted internally, but no duplicate `entity_relations` edge is materialized on top of the structural layer.
+- UI and export layers now surface these promoted overlays on top of structural relations, so official-bridge evidence is visible without duplicating the underlying edge.
 
 ### Current review queues
 
@@ -223,12 +248,14 @@ These values were validated against the live local database during the latest re
 | `content_duplicates` | 1,143 |
 | `assets_affiliations` | 664 |
 | `restrictions_justifications` | 515 |
+| `relations` | 407 |
 | `sources` | 6 |
 
 ## Repository structure
 
 ```text
 F:\новости
+├── analysis/                 # event pipeline and temporal/event-centric synthesis
 ├── classifier/               # tagger, semantic index, classifier audit
 ├── collectors/               # Telegram, watch-folder, YouTube, official and directory collectors
 ├── config/                   # settings, manifests, DB helpers, source-health policy
@@ -336,6 +363,7 @@ Current queue families:
 - `content_duplicates`
 - `assets_affiliations`
 - `restrictions_justifications`
+- `relations`
 - `sources`
 
 Each review task carries:
@@ -348,6 +376,13 @@ Each review task carries:
 - subject summary
 
 Batch review is supported through CSV packs in `reports/review_packs`.
+
+The dashboard now also includes an event-centric screen where one canonical event can group:
+
+- multiple content clusters and official documents;
+- timeline entries and factual milestones;
+- participants by role;
+- related restrictions, disclosures, assets, affiliations, and supporting evidence.
 
 ## Obsidian export
 
@@ -369,6 +404,8 @@ The export produces note groups such as:
 - `Sources`
 - `Content`
 - `Claims`
+- `Events`
+- `Facts`
 - `Cases`
 - `Entities`
 - `Bills`

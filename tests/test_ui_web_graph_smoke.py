@@ -31,6 +31,36 @@ def cubic_is_monotonic(path_d: str) -> bool:
 
 
 class UiWebGraphSmokeTests(unittest.TestCase):
+    def test_events_screen_uses_full_height_and_split_drawer(self):
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            try:
+                page = browser.new_page(viewport={"width": 1920, "height": 1040})
+                page.goto(UI_WEB_INDEX)
+                page.wait_for_timeout(700)
+                page.get_by_role("button", name="Аналитика").click()
+                page.get_by_role("button", name="События").click()
+                page.wait_for_timeout(350)
+                page.locator("[data-row-id]").first.click()
+                page.wait_for_timeout(350)
+
+                main_panel_box = page.locator(".main-panel").bounding_box()
+                screen_panel_box = page.locator(".screen-panel").bounding_box()
+                list_wrap_box = page.locator(".master-list-wrap").bounding_box()
+                drawer_box = page.locator("[data-detail-drawer]").bounding_box()
+
+                self.assertIsNotNone(main_panel_box)
+                self.assertIsNotNone(screen_panel_box)
+                self.assertIsNotNone(list_wrap_box)
+                self.assertIsNotNone(drawer_box)
+
+                self.assertGreater((screen_panel_box or {})["height"], (main_panel_box or {})["height"] * 0.68)
+                self.assertGreater((list_wrap_box or {})["height"], (screen_panel_box or {})["height"] * 0.68)
+                self.assertGreater((drawer_box or {})["width"], (list_wrap_box or {})["width"] * 0.46)
+                self.assertLess((drawer_box or {})["width"], (list_wrap_box or {})["width"] * 0.60)
+            finally:
+                browser.close()
+
     def test_claims_screen_uses_full_height_and_split_drawer(self):
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(headless=True)

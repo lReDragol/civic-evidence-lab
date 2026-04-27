@@ -398,6 +398,8 @@ def collect_summary(conn: sqlite3.Connection) -> dict[str, Any]:
         "content_items": query_count(conn, "content_items"),
         "entities": query_count(conn, "entities"),
         "claims": query_count(conn, "claims"),
+        "events": query_count(conn, "events"),
+        "event_facts": query_count(conn, "event_facts"),
         "cases": query_count(conn, "cases"),
         "bills": query_count(conn, "bills"),
         "vote_sessions": query_count(conn, "bill_vote_sessions"),
@@ -428,9 +430,18 @@ def collect_summary(conn: sqlite3.Connection) -> dict[str, Any]:
     if table_exists(conn, "relation_candidates"):
         weak_rows = conn.execute(
             """
-            SELECT promotion_state, COUNT(*)
+            SELECT CASE
+                       WHEN candidate_state IS NULL THEN promotion_state
+                       WHEN promotion_state IS NOT NULL AND candidate_state='pending' AND promotion_state!='pending' THEN promotion_state
+                       ELSE candidate_state
+                   END AS candidate_state,
+                   COUNT(*)
             FROM relation_candidates
-            GROUP BY promotion_state
+            GROUP BY CASE
+                         WHEN candidate_state IS NULL THEN promotion_state
+                         WHEN promotion_state IS NOT NULL AND candidate_state='pending' AND promotion_state!='pending' THEN promotion_state
+                         ELSE candidate_state
+                     END
             """
         ).fetchall()
         for state, count in weak_rows:

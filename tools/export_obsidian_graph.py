@@ -334,6 +334,20 @@ def case_note_path(row: dict) -> str:
     return f"Cases/{case_id}-{slugify(title, fallback)}.md"
 
 
+def event_note_path(row: dict) -> str:
+    event_id = row["id"]
+    fallback = f"event-{event_id}"
+    title = row.get("canonical_title") or fallback
+    return f"Events/{event_id}-{slugify(title, fallback)}.md"
+
+
+def fact_note_path(row: dict) -> str:
+    fact_id = row["id"]
+    fallback = f"fact-{fact_id}"
+    title = row.get("canonical_text") or fallback
+    return f"Facts/{fact_id}-{slugify(title, fallback)}.md"
+
+
 def entity_note_path(row: dict) -> str:
     entity_id = row["id"]
     entity_type = row.get("entity_type") or "entity"
@@ -381,6 +395,49 @@ def weak_note_path(entity_row: dict) -> str:
     return f"WeakLinks/{entity_type}/{entity_id}-{slugify(title, fallback)}.md"
 
 
+def relation_candidate_state_expr(alias: str = "rc") -> str:
+    return (
+        f"CASE "
+        f"WHEN {alias}.candidate_state IS NULL THEN {alias}.promotion_state "
+        f"WHEN {alias}.promotion_state IS NOT NULL "
+        f" AND {alias}.candidate_state='pending' "
+        f" AND {alias}.promotion_state!='pending' "
+        f"THEN {alias}.promotion_state "
+        f"ELSE {alias}.candidate_state END"
+    )
+
+
+def relation_pair_key(entity_a_id: Any, entity_b_id: Any) -> tuple[int, int] | None:
+    try:
+        left = int(entity_a_id)
+        right = int(entity_b_id)
+    except (TypeError, ValueError):
+        return None
+    if left == right:
+        return None
+    return (left, right) if left < right else (right, left)
+
+
+def json_object(raw_value: Any) -> dict[str, Any]:
+    if not raw_value:
+        return {}
+    try:
+        payload = json.loads(str(raw_value))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def json_list(raw_value: Any) -> list[Any]:
+    if not raw_value:
+        return []
+    try:
+        payload = json.loads(str(raw_value))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
+    return payload if isinstance(payload, list) else []
+
+
 @dataclass
 class GraphContext:
     pipeline_version: str | None
@@ -389,6 +446,8 @@ class GraphContext:
     entity_rows: list[dict]
     claim_rows: list[dict]
     case_rows: list[dict]
+    event_rows: list[dict]
+    fact_rows: list[dict]
     bill_rows: list[dict]
     vote_rows: list[dict]
     contract_rows: list[dict]
@@ -398,6 +457,8 @@ class GraphContext:
     entity_paths: dict[int, str]
     claim_paths: dict[int, str]
     case_paths: dict[int, str]
+    event_paths: dict[int, str]
+    fact_paths: dict[int, str]
     bill_paths: dict[int, str]
     vote_paths: dict[int, str]
     contract_paths: dict[int, str]
@@ -435,6 +496,8 @@ class GraphContext:
     entity_rows_by_id: dict[int, dict]
     claim_rows_by_id: dict[int, dict]
     case_rows_by_id: dict[int, dict]
+    event_rows_by_id: dict[int, dict]
+    fact_rows_by_id: dict[int, dict]
     bill_rows_by_id: dict[int, dict]
     vote_rows_by_id: dict[int, dict]
     contract_rows_by_id: dict[int, dict]
@@ -490,6 +553,26 @@ def build_graph_context(conn: sqlite3.Connection) -> GraphContext:
     case_rows = []
     if table_exists(conn, "cases"):
         case_rows = [dict(r) for r in rows(conn, "SELECT * FROM cases ORDER BY id")]
+
+    event_rows = []
+    if table_exists(conn, "events"):
+        event_rows = [
+            dict(r)
+            for r in rows(
+                conn,
+                "SELECT * FROM events ORDER BY COALESCE(event_date_start, first_observed_at, created_at, id), id",
+            )
+        ]
+
+    fact_rows = []
+    if table_exists(conn, "event_facts"):
+        fact_rows = [
+            dict(r)
+            for r in rows(
+                conn,
+                "SELECT * FROM event_facts ORDER BY COALESCE(observed_at, recorded_at, id), id",
+            )
+        ]
 
     bill_rows = []
     if table_exists(conn, "bills"):
@@ -602,6 +685,8 @@ def build_graph_context(conn: sqlite3.Connection) -> GraphContext:
     entity_paths = {row["id"]: entity_note_path(row) for row in entity_rows}
     claim_paths = {row["id"]: claim_note_path(row) for row in claim_rows}
     case_paths = {row["id"]: case_note_path(row) for row in case_rows}
+    event_paths = {row["id"]: event_note_path(row) for row in event_rows}
+    fact_paths = {row["id"]: fact_note_path(row) for row in fact_rows}
     bill_paths = {row["id"]: bill_note_path(row) for row in bill_rows}
     vote_paths = {row["id"]: vote_note_path(row) for row in vote_rows}
     contract_paths = {row["id"]: contract_note_path(row) for row in contract_rows}
@@ -707,6 +792,35 @@ def build_graph_context(conn: sqlite3.Connection) -> GraphContext:
     strong_relations_by_entity: dict[int, list[dict]] = defaultdict(list)
     weak_relations_by_entity: dict[int, list[dict]] = defaultdict(list)
     weak_paths: dict[int, str] = {}
+    promoted_overlays_by_pair: defaultdict[tuple[int, int], list[dict]] = defaultdict(list)
+    if table_exists(conn, "relation_candidates") and table_exists(conn, "entities"):
+        state_expr = relation_candidate_state_expr("rc")
+        for row in rows(
+            conn,
+            f"""
+            SELECT rc.*, e1.canonical_name AS entity_a_name, e1.entity_type AS entity_a_type,
+                   e2.canonical_name AS entity_b_name, e2.entity_type AS entity_b_type
+            FROM relation_candidates rc
+            JOIN entities e1 ON e1.id = rc.entity_a_id
+            JOIN entities e2 ON e2.id = rc.entity_b_id
+            WHERE {state_expr}='promoted'
+            ORDER BY rc.score DESC, rc.id DESC
+            """,
+        ):
+            record = dict(row)
+            pair_key = relation_pair_key(record.get("entity_a_id"), record.get("entity_b_id"))
+            if pair_key:
+                promoted_overlays_by_pair[pair_key].append(record)
+        for pair_key in list(promoted_overlays_by_pair.keys()):
+            promoted_overlays_by_pair[pair_key].sort(
+                key=lambda item: (
+                    float(item.get("score") or 0.0),
+                    int(item.get("support_hard_evidence_count") or 0),
+                    int(item.get("support_items") or 0),
+                    int(item.get("id") or 0),
+                ),
+                reverse=True,
+            )
     if table_exists(conn, "entity_relations") and table_exists(conn, "entities"):
         entity_rows_by_id = {row["id"]: row for row in entity_rows}
         for row in rows(
@@ -726,6 +840,10 @@ def build_graph_context(conn: sqlite3.Connection) -> GraphContext:
                 record["evidence_item_id"],
                 record.get("detected_by"),
             )
+            pair_key = relation_pair_key(record.get("from_entity_id"), record.get("to_entity_id"))
+            overlay = promoted_overlays_by_pair.get(pair_key, [None])[0]
+            overlay_mix = json_object(overlay.get("evidence_mix_json")) if overlay else {}
+            overlay_bridge_types = [str(value) for value in overlay_mix.get("bridge_types") or []]
             support_count = relation_support_count(record.get("detected_by"))
             for entity_id, other_id, other_name, other_type, outgoing in (
                 (record["from_entity_id"], record["to_entity_id"], record["to_name"], record["to_type"], True),
@@ -743,6 +861,15 @@ def build_graph_context(conn: sqlite3.Connection) -> GraphContext:
                     "support_count": support_count,
                     "layer": layer,
                 }
+                if overlay:
+                    item["promoted_candidate_id"] = overlay.get("id")
+                    item["promoted_candidate_type"] = overlay.get("candidate_type")
+                    item["bridge_types"] = overlay_bridge_types
+                    item["evidence_mix_json"] = overlay.get("evidence_mix_json")
+                    item["explain_path_json"] = overlay.get("explain_path_json")
+                    item["support_count"] = max(int(item.get("support_count") or 0), int(overlay.get("support_items") or 0))
+                    if layer != "weak_similarity":
+                        item["layer"] = "evidence"
                 if layer == "weak_similarity":
                     weak_relations_by_entity[entity_id].append(item)
                     entity_row = entity_rows_by_id.get(entity_id)
@@ -761,7 +888,7 @@ def build_graph_context(conn: sqlite3.Connection) -> GraphContext:
             FROM relation_candidates rc
             JOIN entities e1 ON e1.id = rc.entity_a_id
             JOIN entities e2 ON e2.id = rc.entity_b_id
-            WHERE rc.promotion_state IN ('pending', 'review')
+            WHERE COALESCE(rc.candidate_state, rc.promotion_state) IN ('pending', 'review')
             ORDER BY rc.score DESC, rc.id DESC
             """,
         ):
@@ -788,6 +915,43 @@ def build_graph_context(conn: sqlite3.Connection) -> GraphContext:
                 entity_row = entity_rows_by_id.get(entity_id)
                 if entity_row is not None:
                     weak_paths[entity_id] = weak_note_path(entity_row)
+        existing_promoted_pairs: set[tuple[int, int]] = set()
+        for entity_id, items in strong_relations_by_entity.items():
+            for item in items:
+                pair_key = relation_pair_key(entity_id, item.get("other_entity_id"))
+                if pair_key and item.get("promoted_candidate_id"):
+                    existing_promoted_pairs.add(pair_key)
+        for pair_key, overlays in promoted_overlays_by_pair.items():
+            if pair_key in existing_promoted_pairs:
+                continue
+            overlay = overlays[0]
+            overlay_mix = json_object(overlay.get("evidence_mix_json"))
+            bridge_types = [str(value) for value in overlay_mix.get("bridge_types") or []]
+            for entity_id, other_id, other_name, other_type in (
+                (overlay["entity_a_id"], overlay["entity_b_id"], overlay["entity_b_name"], overlay["entity_b_type"]),
+                (overlay["entity_b_id"], overlay["entity_a_id"], overlay["entity_a_name"], overlay["entity_a_type"]),
+            ):
+                strong_relations_by_entity[entity_id].append(
+                    {
+                        "relation_type": overlay.get("promoted_relation_type") or overlay.get("candidate_type"),
+                        "label": relation_label(
+                            overlay.get("promoted_relation_type") or overlay.get("candidate_type")
+                        ),
+                        "other_entity_id": other_id,
+                        "other_name": other_name,
+                        "other_type": other_type,
+                        "strength": "promoted",
+                        "detected_by": overlay.get("origin") or "relation_candidate:promoted",
+                        "evidence_item_id": None,
+                        "support_count": int(overlay.get("support_items") or 0),
+                        "layer": "evidence",
+                        "promoted_candidate_id": overlay.get("id"),
+                        "promoted_candidate_type": overlay.get("candidate_type"),
+                        "bridge_types": bridge_types,
+                        "evidence_mix_json": overlay.get("evidence_mix_json"),
+                        "explain_path_json": overlay.get("explain_path_json"),
+                    }
+                )
 
     positions_by_entity: dict[int, list[dict]] = defaultdict(list)
     if table_exists(conn, "official_positions"):
@@ -885,6 +1049,8 @@ def build_graph_context(conn: sqlite3.Connection) -> GraphContext:
         entity_rows=entity_rows,
         claim_rows=claim_rows,
         case_rows=case_rows,
+        event_rows=event_rows,
+        fact_rows=fact_rows,
         bill_rows=bill_rows,
         vote_rows=vote_rows,
         contract_rows=contract_rows,
@@ -894,6 +1060,8 @@ def build_graph_context(conn: sqlite3.Connection) -> GraphContext:
         entity_paths=entity_paths,
         claim_paths=claim_paths,
         case_paths=case_paths,
+        event_paths=event_paths,
+        fact_paths=fact_paths,
         bill_paths=bill_paths,
         vote_paths=vote_paths,
         contract_paths=contract_paths,
@@ -931,6 +1099,8 @@ def build_graph_context(conn: sqlite3.Connection) -> GraphContext:
         entity_rows_by_id={row["id"]: row for row in entity_rows},
         claim_rows_by_id={row["id"]: row for row in claim_rows},
         case_rows_by_id={row["id"]: row for row in case_rows},
+        event_rows_by_id={row["id"]: row for row in event_rows},
+        fact_rows_by_id={row["id"]: row for row in fact_rows},
         bill_rows_by_id={row["id"]: row for row in bill_rows},
         vote_rows_by_id={row["id"]: row for row in vote_rows},
         contract_rows_by_id={row["id"]: row for row in contract_rows},
@@ -959,6 +1129,8 @@ def export_graph_index(vault: Path, ctx: GraphContext, generated_at: str):
         "- [[Content/index|Content]]",
         "- [[Claims/index|Claims]]",
         "- [[Cases/index|Cases]]",
+        "- [[Events/index|Events]]",
+        "- [[Facts/index|Facts]]",
         "- [[Entities/index|Entities]]",
         "- [[Bills/index|Bills]]",
         "- [[VoteSessions/index|Vote Sessions]]",
@@ -980,6 +1152,8 @@ def export_graph_index(vault: Path, ctx: GraphContext, generated_at: str):
         f"- Content: `{len(ctx.content_rows)}`",
         f"- Claims: `{len(ctx.claim_rows)}`",
         f"- Cases: `{len(ctx.case_rows)}`",
+        f"- Events: `{len(ctx.event_rows)}`",
+        f"- Facts: `{len(ctx.fact_rows)}`",
         f"- Entities: `{len(ctx.entity_rows)}`",
         f"- Bills: `{len(ctx.bill_rows)}`",
         f"- Vote sessions: `{len(ctx.vote_rows)}`",
@@ -1406,6 +1580,11 @@ def export_graph_entities(vault: Path, ctx: GraphContext):
                     meta.append(item["strength"])
                 if item.get("detected_by"):
                     meta.append(item["detected_by"])
+                if item.get("promoted_candidate_id"):
+                    meta.append("promoted official bridge")
+                    bridge_types = [str(value) for value in item.get("bridge_types") or []]
+                    if bridge_types:
+                        meta.append(f"bridges {', '.join(bridge_types)}")
                 evidence_id = item.get("evidence_item_id")
                 if evidence_id in ctx.content_paths:
                     evidence_content = ctx.content_rows_by_id.get(evidence_id)
@@ -1499,6 +1678,200 @@ def export_graph_entities(vault: Path, ctx: GraphContext):
         write_note(vault, rel, "\n".join(body))
 
     write_note(vault, "Entities/index.md", "\n".join(index_lines))
+
+
+def export_graph_events(vault: Path, conn: sqlite3.Connection, ctx: GraphContext):
+    index_lines = ["# Events", "", "| ID | Type | Date | Event |", "|---:|---|---|---|"]
+    for event in ctx.event_rows:
+        rel = ctx.event_paths[event["id"]]
+        title = event.get("canonical_title") or f"Event {event['id']}"
+        index_lines.append(
+            f"| {event['id']} | {md_escape(event.get('event_type'))} | {md_escape((event.get('event_date_start') or '')[:10])} | {note_link(rel, md_escape(title))} |"
+        )
+
+        entity_rows = rows(
+            conn,
+            """
+            SELECT ee.entity_id, ee.role, ee.confidence, e.canonical_name, e.entity_type
+            FROM event_entities ee
+            JOIN entities e ON e.id = ee.entity_id
+            WHERE ee.event_id=?
+            ORDER BY ee.role, e.canonical_name, ee.id
+            """,
+            (event["id"],),
+        ) if table_exists(conn, "event_entities") else []
+        timeline_rows = rows(
+            conn,
+            """
+            SELECT timeline_date, title, description, content_item_id, document_content_id, sort_order
+            FROM event_timeline
+            WHERE event_id=?
+            ORDER BY sort_order, id
+            """,
+            (event["id"],),
+        ) if table_exists(conn, "event_timeline") else []
+        fact_rows = rows(
+            conn,
+            """
+            SELECT id, fact_type, canonical_text
+            FROM event_facts
+            WHERE event_id=?
+            ORDER BY id
+            """,
+            (event["id"],),
+        ) if table_exists(conn, "event_facts") else []
+        item_rows = rows(
+            conn,
+            """
+            SELECT ei.content_item_id, ei.item_role, ei.source_strength,
+                   ci.title AS content_title, ci.content_type, ci.published_at
+            FROM event_items ei
+            LEFT JOIN content_items ci ON ci.id = ei.content_item_id
+            WHERE ei.event_id=?
+            ORDER BY
+                CASE ei.item_role
+                    WHEN 'origin' THEN 0
+                    WHEN 'official_doc' THEN 1
+                    WHEN 'update' THEN 2
+                    WHEN 'reaction' THEN 3
+                    ELSE 4
+                END,
+                COALESCE(ci.published_at, ei.added_at, '') ASC,
+                ei.id ASC
+            """,
+            (event["id"],),
+        ) if table_exists(conn, "event_items") else []
+
+        body = [
+            frontmatter(
+                {
+                    "type": "event",
+                    "event_id": event["id"],
+                    "event_type": event.get("event_type"),
+                    "status": event.get("status"),
+                    "event_date_start": event.get("event_date_start"),
+                    "event_date_end": event.get("event_date_end"),
+                    "confidence": event.get("confidence"),
+                }
+            ),
+            f"# {title}",
+            "",
+        ]
+        if event.get("summary_short"):
+            body.extend([event["summary_short"], ""])
+        if event.get("summary_long"):
+            body.extend([event["summary_long"], ""])
+
+        if timeline_rows:
+            body.extend(["## Timeline", ""])
+            for timeline in timeline_rows:
+                line = f"- `{(timeline.get('timeline_date') or '')[:19]}` **{timeline.get('title') or ''}**"
+                if timeline.get("content_item_id") in ctx.content_paths:
+                    content = ctx.content_rows_by_id.get(timeline["content_item_id"])
+                    if content:
+                        line += f" · {note_link(ctx.content_paths[timeline['content_item_id']], content_title(content))}"
+                body.append(line)
+                if timeline.get("description"):
+                    body.append(f"  {timeline['description']}")
+
+        if entity_rows:
+            body.extend(["", "## Participants", ""])
+            for participant in entity_rows:
+                entity_id = participant["entity_id"]
+                entity_link = (
+                    note_link(ctx.entity_paths[entity_id], entity_title(ctx.entity_rows_by_id[entity_id]))
+                    if entity_id in ctx.entity_paths
+                    else md_escape(participant.get("canonical_name"))
+                )
+                body.append(f"- `{participant.get('role') or ''}` {entity_link}")
+
+        if fact_rows:
+            body.extend(["", "## Facts", ""])
+            for fact in fact_rows:
+                fact_rel = ctx.fact_paths.get(fact["id"], fact_note_path(fact))
+                fact_label = f"{fact.get('fact_type') or 'fact'} #{fact['id']}"
+                body.append(
+                    f"- {note_link(fact_rel, fact_label)} `{fact.get('fact_type') or ''}`"
+                )
+
+        if item_rows:
+            body.extend(["", "## Supporting items", ""])
+            for item in item_rows:
+                content_id = item.get("content_item_id")
+                if content_id in ctx.content_paths:
+                    content = ctx.content_rows_by_id.get(content_id)
+                    link = note_link(ctx.content_paths[content_id], content_title(content or item))
+                else:
+                    link = md_escape(item.get("content_title"))
+                body.append(
+                    f"- `{item.get('item_role') or ''}` {link} `{item.get('source_strength') or ''}`"
+                )
+
+        write_note(vault, rel, "\n".join(body))
+
+    write_note(vault, "Events/index.md", "\n".join(index_lines))
+
+
+def export_graph_facts(vault: Path, conn: sqlite3.Connection, ctx: GraphContext):
+    index_lines = ["# Facts", "", "| ID | Type | Event | Fact |", "|---:|---|---|---|"]
+    for fact in ctx.fact_rows:
+        rel = ctx.fact_paths[fact["id"]]
+        event = ctx.event_rows_by_id.get(fact["event_id"], {})
+        event_rel = ctx.event_paths.get(fact["event_id"], event_note_path(event or {"id": fact["event_id"], "canonical_title": f"event-{fact['event_id']}"}))
+        event_title_text = event.get("canonical_title") or f"Event {fact['event_id']}"
+        fact_text = fact.get("canonical_text") or f"fact-{fact['id']}"
+        index_lines.append(
+            f"| {fact['id']} | {md_escape(fact.get('fact_type'))} | {note_link(event_rel, md_escape(event_title_text))} | {note_link(rel, md_escape(fact_text))} |"
+        )
+        evidence_rows = rows(
+            conn,
+            """
+            SELECT *
+            FROM fact_evidence
+            WHERE fact_id=?
+            ORDER BY id
+            """,
+            (fact["id"],),
+        ) if table_exists(conn, "fact_evidence") else []
+        body = [
+            frontmatter(
+                {
+                    "type": "event_fact",
+                    "fact_id": fact["id"],
+                    "event_id": fact.get("event_id"),
+                    "fact_type": fact.get("fact_type"),
+                    "polarity": fact.get("polarity"),
+                    "confidence": fact.get("confidence"),
+                }
+            ),
+            f"# {fact.get('fact_type') or 'Fact'} #{fact['id']}",
+            "",
+            fact.get("canonical_text") or "",
+            "",
+            f"- Event: {note_link(event_rel, event_title_text)}",
+            f"- Type: `{fact.get('fact_type') or ''}`",
+            f"- Polarity: `{fact.get('polarity') or ''}`",
+        ]
+        if evidence_rows:
+            body.extend(["", "## Evidence", ""])
+            for evidence in evidence_rows:
+                content_link = None
+                document_link = None
+                if evidence.get("content_item_id") in ctx.content_paths:
+                    content = ctx.content_rows_by_id.get(evidence["content_item_id"])
+                    content_link = note_link(ctx.content_paths[evidence["content_item_id"]], content_title(content or evidence))
+                if evidence.get("document_content_id") in ctx.content_paths:
+                    document = ctx.content_rows_by_id.get(evidence["document_content_id"])
+                    document_link = note_link(ctx.content_paths[evidence["document_content_id"]], content_title(document or evidence))
+                line = f"- `{evidence.get('evidence_class') or ''}` `{evidence.get('evidence_type') or ''}`"
+                if document_link:
+                    line += f" · doc {document_link}"
+                elif content_link:
+                    line += f" · {content_link}"
+                body.append(line)
+        write_note(vault, rel, "\n".join(body))
+
+    write_note(vault, "Facts/index.md", "\n".join(index_lines))
 
 
 def export_graph_bills(vault: Path, ctx: GraphContext):
@@ -2114,6 +2487,8 @@ def export_graph_obsidian(
         export_graph_content(vault, ctx, copy_media=copy_media)
         export_graph_claims(vault, ctx)
         export_graph_cases(vault, ctx)
+        export_graph_events(vault, conn, ctx)
+        export_graph_facts(vault, conn, ctx)
         export_graph_entities(vault, ctx)
         export_graph_bills(vault, ctx)
         export_graph_vote_sessions(vault, ctx)

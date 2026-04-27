@@ -357,6 +357,41 @@ class ObsidianGraphExportTests(unittest.TestCase):
             self.assertIn("[[Bills/1-123-FZ|123-FZ]]", vote_text)
             self.assertIn("[[Entities/person/1-Ivan-Ivanov|Ivan Ivanov]]", vote_text)
 
+    def test_graph_export_exposes_promoted_official_overlay_in_strong_links(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            db_path = tmp_path / "sample.db"
+            vault = tmp_path / "vault"
+            create_db(db_path)
+
+            conn = sqlite3.connect(db_path)
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO relation_candidates(
+                        entity_a_id, entity_b_id, candidate_type, origin, score,
+                        support_items, support_sources, support_domains, support_hard_evidence_count,
+                        candidate_state, promotion_state, evidence_mix_json, explain_path_json
+                    ) VALUES(
+                        1, 2, 'likely_association', 'candidate_builder:co_occurrence', 0.92,
+                        1, 1, 1, 1,
+                        'promoted', 'promoted',
+                        '{"bridge_types":["Content","Disclosure","OfficialDocument"],"official_content_types":["anticorruption_declaration"]}',
+                        '[{"node_type":"Content","ids":[1]},{"node_type":"Disclosure","ids":[1]},{"node_type":"OfficialDocument","ids":[1]}]'
+                    )
+                    """
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            export_obsidian(db_path=db_path, vault=vault, mode="graph", copy_media=False)
+
+            entity_note = vault / "Entities" / "person" / "1-Ivan-Ivanov.md"
+            entity_text = entity_note.read_text(encoding="utf-8")
+            self.assertIn("promoted official bridge", entity_text)
+            self.assertIn("bridges Content, Disclosure, OfficialDocument", entity_text)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -301,6 +301,10 @@ def _semantic_index(settings: dict[str, Any]):
     return __import__("classifier.semantic_index", fromlist=["build_semantic_index"]).build_semantic_index(settings)
 
 
+def _event_pipeline(settings: dict[str, Any]):
+    return __import__("analysis.event_pipeline", fromlist=["build_event_pipeline"]).build_event_pipeline(settings)
+
+
 def _asr(settings: dict[str, Any]):
     return __import__("media_pipeline.asr", fromlist=["process_untranscribed_videos"]).process_untranscribed_videos()
 
@@ -489,6 +493,7 @@ JOB_SPECS = [
     JobSpec("tagger", "Classifier v3", "Анализ", 21600, "classification_interval_seconds", "analysis", timeout_seconds=3600, runner=_tagger),
     JobSpec("llm", "LLM-классификатор", "Анализ", 43200, "llm_interval_seconds", "analysis", timeout_seconds=7200, scheduled=False, visible=False, runner=_llm),
     JobSpec("semantic_index", "Semantic index", "Анализ", 43200, "semantic_index_interval_seconds", "analysis", timeout_seconds=7200, runner=_semantic_index),
+    JobSpec("event_pipeline", "Event pipeline", "Анализ", 43200, "event_pipeline_interval_seconds", "analysis", timeout_seconds=7200, runner=_event_pipeline),
     JobSpec("asr", "ASR (Whisper)", "Медиа", 3600, None, "media", timeout_seconds=7200, runner=_asr),
     JobSpec("ocr", "OCR (PaddleOCR)", "Медиа", 3600, None, "media", timeout_seconds=7200, runner=_ocr),
     JobSpec("ner", "NER (Natasha)", "Анализ", 7200, "ner_interval_seconds", "analysis", timeout_seconds=3600, runner=_ner),
@@ -564,6 +569,7 @@ PIPELINE_JOB_IDS = {
         "claims",
         "claim_cluster",
         "semantic_index",
+        "event_pipeline",
         "evidence_link",
         "negation",
         "authenticity",
@@ -586,6 +592,7 @@ PIPELINE_JOB_IDS = {
         "claims",
         "claim_cluster",
         "semantic_index",
+        "event_pipeline",
         "evidence_link",
         "negation",
         "authenticity",

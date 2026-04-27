@@ -15,6 +15,7 @@
       search: { query: "" },
       claims: { query: "", status: "" },
       cases: { query: "" },
+      events: { query: "" },
       review_ops: { query: "", queue: "", status: "open" },
       entities: { query: "", entity_type: "" },
       relations: { query: "", layer: "", view: "cards", map_group: "" },
@@ -144,7 +145,7 @@
   }
 
   function screenUsesDetailDrawer(section) {
-    return ["content", "search", "claims", "cases", "review_ops", "entities", "relations", "officials"].includes(section);
+    return ["content", "search", "claims", "cases", "events", "review_ops", "entities", "relations", "officials"].includes(section);
   }
 
   function relationMapOverlayOpen() {
@@ -691,6 +692,9 @@
       case "cases":
         renderCasesScreen(state.screenData);
         break;
+      case "events":
+        renderEventsScreen(state.screenData);
+        break;
       case "review_ops":
         renderReviewOpsScreen(state.screenData);
         break;
@@ -732,6 +736,8 @@
     const runtimeHealth = payload.runtime_health || {};
     const lowAccountability = payload.low_accountability || [];
     const countOrder = [
+      "events",
+      "facts",
       "persons",
       "quotes",
       "flagged_quotes",
@@ -905,6 +911,8 @@
     const labels = {
       content: "Контент",
       claims: "Заявления",
+      events: "События",
+      facts: "Факты",
       entities: "Сущности",
       cases: "Дела",
       persons: "Персоны",
@@ -928,6 +936,8 @@
     const labels = {
       content: "посты, статьи, видео",
       claims: "извлечённые claims",
+      events: "канонические события",
+      facts: "содержательные факты",
       entities: "персоны, организации, места",
       cases: "связанные кейсы",
       persons: "NER и профили",
@@ -1155,6 +1165,128 @@
     bindRowSelection("cases");
   }
 
+  function renderEventsScreen(payload) {
+    const query = state.filters.events.query || "";
+    const drawerOpen = isDetailDrawerOpen("events", payload.detail);
+    ui.screenRoot.innerHTML = renderMasterDetailLayout({
+      filters: `
+        <div class="screen-filters">
+          <input id="screen-query-input" class="glass-input" type="search" placeholder="Поиск по событиям" value="${escapeHtml(query)}">
+        </div>
+      `,
+      list: renderTableList(
+        payload.items,
+        (item) => `
+          <div class="table-row-head">
+            <div class="table-primary">${escapeHtml(item.canonical_title || "Событие")}</div>
+            <span class="badge ${badgeClass(item.status || "active")}">${escapeHtml(item.event_type || item.status || "—")}</span>
+          </div>
+          <div class="table-secondary">${escapeHtml(formatDate(item.event_date_start))}${item.event_date_end ? ` → ${escapeHtml(
+            formatDate(item.event_date_end)
+          )}` : ""} · importance ${escapeHtml(Number(item.importance_score || 0).toFixed(2))}</div>
+          ${
+            item.summary_short
+              ? `<div class="table-secondary">${escapeHtml(truncate(item.summary_short, 160))}</div>`
+              : ""
+          }
+        `
+      ),
+      detail: payload.detail
+        ? `
+            <h3 class="detail-title">${escapeHtml(payload.detail.canonical_title || "Событие")}</h3>
+            <div class="detail-grid">
+              <div class="detail-kv"><div class="k">Тип</div><div class="v">${escapeHtml(payload.detail.event_type || "—")}</div></div>
+              <div class="detail-kv"><div class="k">Статус</div><div class="v">${escapeHtml(payload.detail.status || "—")}</div></div>
+              <div class="detail-kv"><div class="k">Интервал</div><div class="v">${escapeHtml(formatDate(payload.detail.event_date_start))}${
+                payload.detail.event_date_end ? ` → ${escapeHtml(formatDate(payload.detail.event_date_end))}` : ""
+              }</div></div>
+              <div class="detail-kv"><div class="k">Важность</div><div class="v">${escapeHtml(
+                Number(payload.detail.importance_score || 0).toFixed(2)
+              )}</div></div>
+            </div>
+            ${
+              payload.detail.summary_short
+                ? `<div class="detail-section"><h3>Кратко</h3><div class="muted">${escapeHtml(payload.detail.summary_short)}</div></div>`
+                : ""
+            }
+            ${
+              payload.detail.summary_long
+                ? `<div class="detail-section"><h3>Нарратив</h3><div class="muted">${escapeHtml(payload.detail.summary_long)}</div></div>`
+                : ""
+            }
+            ${renderLinkSection(
+              "Таймлайн",
+              payload.detail.timeline,
+              (item) => `${escapeHtml(formatDate(item.timeline_date))} · ${escapeHtml(item.title || "—")}`,
+              {
+                secondary: (item) => escapeHtml(item.description || "—"),
+                resolveJump: (item) =>
+                  item.content_item_id ? { screen: "content", id: item.content_item_id } : null,
+              }
+            )}
+            ${renderLinkSection(
+              "Участники",
+              payload.detail.entities,
+              (item) => `${escapeHtml(item.canonical_name || "—")} · ${escapeHtml(item.role || "role")}`,
+              {
+                secondary: (item) =>
+                  escapeHtml(
+                    [
+                      item.entity_type || "",
+                      item.valid_from ? `c ${formatDate(item.valid_from)}` : "",
+                      item.valid_to ? `до ${formatDate(item.valid_to)}` : "",
+                    ]
+                      .filter(Boolean)
+                      .join(" · ")
+                  ),
+                resolveJump: (item) => ({ screen: "entities", id: item.entity_id || item.id }),
+              }
+            )}
+            ${renderLinkSection(
+              "Факты",
+              payload.detail.facts,
+              (item) => `${escapeHtml(item.fact_type || "fact")} · ${escapeHtml(item.canonical_text || "—")}`,
+              {
+                secondary: (item) =>
+                  escapeHtml(
+                    [
+                      item.polarity || "",
+                      item.valid_from ? `c ${formatDate(item.valid_from)}` : "",
+                      item.valid_to ? `до ${formatDate(item.valid_to)}` : "",
+                    ]
+                      .filter(Boolean)
+                      .join(" · ")
+                  ),
+              }
+            )}
+            ${renderLinkSection(
+              "Материалы",
+              payload.detail.items,
+              (item) => `${escapeHtml(item.title || "—")} · ${escapeHtml(item.item_role || "item")}`,
+              {
+                secondary: (item) =>
+                  escapeHtml(
+                    [item.source_name || "", formatDate(item.published_at), item.source_strength || ""]
+                      .filter(Boolean)
+                      .join(" · ")
+                  ),
+                resolveJump: (item) => ({ screen: "content", id: item.content_item_id || item.id }),
+              }
+            )}
+          `
+        : emptyState("Нет выбранного события", "Выберите событие слева."),
+      selectionBanner: drawerOpen && payload.detail
+        ? renderSelectionBanner(
+            payload.detail.canonical_title || "Событие",
+            [payload.detail.event_type || "", formatDate(payload.detail.event_date_start)].filter(Boolean).join(" · ")
+          )
+        : "",
+      detailOpen: drawerOpen,
+    });
+    bindTextFilter("events");
+    bindRowSelection("events");
+  }
+
   function renderReviewOpsScreen(payload) {
     const query = state.filters.review_ops.query || "";
     const queue = state.filters.review_ops.queue || "";
@@ -1347,6 +1479,28 @@
             ${
               payload.detail.context_title
                 ? `<div class="detail-section"><h3>Контекст</h3><div class="muted">${escapeHtml(payload.detail.context_title)}</div></div>`
+                : ""
+            }
+            ${
+              payload.detail.temporal_window &&
+              Object.values(payload.detail.temporal_window || {}).some((value) => value)
+                ? `<div class="detail-section"><h3>Время</h3><div class="muted">${escapeHtml(
+                    [
+                      payload.detail.temporal_window.valid_from ? `valid_from: ${formatDate(payload.detail.temporal_window.valid_from)}` : "",
+                      payload.detail.temporal_window.valid_to ? `valid_to: ${formatDate(payload.detail.temporal_window.valid_to)}` : "",
+                      payload.detail.temporal_window.observed_at ? `observed: ${formatDate(payload.detail.temporal_window.observed_at)}` : "",
+                      payload.detail.temporal_window.recorded_at ? `recorded: ${formatDate(payload.detail.temporal_window.recorded_at)}` : "",
+                    ]
+                      .filter(Boolean)
+                      .join(" · ")
+                  )}</div></div>`
+                : ""
+            }
+            ${
+              payload.detail.evidence_mix && Object.keys(payload.detail.evidence_mix).length
+                ? `<div class="detail-section"><h3>Evidence mix</h3><pre class="json-block">${escapeHtml(
+                    JSON.stringify(payload.detail.evidence_mix, null, 2)
+                  )}</pre></div>`
                 : ""
             }
             ${renderBridgePathSection(payload.detail.bridge_paths)}
@@ -3273,6 +3427,7 @@
       search: "Быстрый поиск по контенту и связанным объектам.",
       claims: "Список заявлений, статусов и evidence linkages.",
       cases: "Открытые и собранные дела с таймлайном claims.",
+      events: "Канонические события с нарративом, ролями участников, таймлайном и supporting docs.",
       review_ops: "Очереди ручной и полуавтоматической верификации, merge и promotion.",
       entities: "Сущности, должности, claims, content и связи.",
       relations: "Структурные, evidence и weak-similarity связи с card/table режимом.",
@@ -3424,7 +3579,7 @@
         navigation: [
           { key: "monitoring", label: "Мониторинг", sections: [{ key: "overview", label: "Обзор" }, { key: "content", label: "Контент" }, { key: "search", label: "Поиск" }] },
           { key: "verification", label: "Проверка", sections: [{ key: "claims", label: "Заявления" }, { key: "cases", label: "Дела" }, { key: "review_ops", label: "Review Ops" }] },
-          { key: "analytics", label: "Аналитика", sections: [{ key: "entities", label: "Сущности" }, { key: "relations", label: "Связи" }, { key: "officials", label: "Руководство" }] },
+          { key: "analytics", label: "Аналитика", sections: [{ key: "events", label: "События" }, { key: "entities", label: "Сущности" }, { key: "relations", label: "Связи" }, { key: "officials", label: "Руководство" }] },
           { key: "system", label: "Система", sections: [{ key: "settings", label: "Настройки" }] },
         ],
         summary: {
@@ -3502,6 +3657,47 @@
         cases: {
           items: [{ id: 31, title: "Кейс назначения", status: "open", case_type: "oversight", claims_count: 3 }],
           detail: { id: 31, title: "Кейс назначения", status: "open", case_type: "oversight", claims: [{ claim_text: "Иванов занимает должность" }], events: [{ event_date: "2026-04-25", event_title: "Публикация профиля" }] },
+        },
+        events: {
+          items: [
+            {
+              id: 61,
+              canonical_title: "Блокировка Telegram",
+              event_type: "internet_block",
+              status: "active",
+              event_date_start: "2026-04-20",
+              event_date_end: "2026-04-21",
+              importance_score: 0.92,
+              summary_short: "Регулятор инициировал ограничение доступа, после чего начались жалобы пользователей и официальные разъяснения.",
+            },
+          ],
+          detail: {
+            id: 61,
+            canonical_title: "Блокировка Telegram",
+            event_type: "internet_block",
+            status: "active",
+            event_date_start: "2026-04-20",
+            event_date_end: "2026-04-21",
+            importance_score: 0.92,
+            summary_short: "Регулятор инициировал ограничение доступа, после чего начались жалобы пользователей и официальные разъяснения.",
+            summary_long: "Событие объединяет официальное решение об ограничении доступа, первые сообщения о практической блокировке, жалобы пользователей и публичные комментарии ведомств.",
+            timeline: [
+              { timeline_date: "2026-04-20", title: "Постановление опубликовано", description: "Опубликован официальный документ об ограничении доступа.", content_item_id: 11 },
+              { timeline_date: "2026-04-21", title: "Пошли жалобы пользователей", description: "Пользователи сообщают о фактических сбоях доступа к Telegram.", content_item_id: 12 },
+            ],
+            entities: [
+              { entity_id: 4, canonical_name: "Роскомнадзор", entity_type: "organization", role: "regulator", valid_from: "2026-04-20" },
+              { entity_id: 2, canonical_name: "Telegram", entity_type: "organization", role: "target", valid_from: "2026-04-20" },
+            ],
+            facts: [
+              { id: 81, fact_type: "restriction", canonical_text: "Ведомство ограничило доступ к Telegram.", polarity: "negative", valid_from: "2026-04-20" },
+              { id: 82, fact_type: "statement", canonical_text: "Пользователи сообщили о сбоях доступа.", polarity: "negative", valid_from: "2026-04-21" },
+            ],
+            items: [
+              { content_item_id: 11, title: "Постановление об ограничении Telegram", item_role: "official_doc", source_name: "РКН", published_at: "2026-04-20", source_strength: "hard" },
+              { content_item_id: 12, title: "Жалобы пользователей на сбои Telegram", item_role: "update", source_name: "СМИ", published_at: "2026-04-21", source_strength: "support" },
+            ],
+          },
         },
         review_ops: {
           queues: [{ queue_key: "content_duplicates", total: 1, open_total: 1 }],

@@ -890,7 +890,15 @@ def runtime_summary(conn: sqlite3.Connection) -> dict[str, Any]:
     )
     pending_candidates = int(
         conn.execute(
-            "SELECT COUNT(*) FROM relation_candidates WHERE promotion_state IN ('pending', 'review')"
+            """
+            SELECT COUNT(*)
+            FROM relation_candidates
+            WHERE CASE
+                WHEN candidate_state IS NULL THEN promotion_state
+                WHEN promotion_state IS NOT NULL AND candidate_state='pending' AND promotion_state!='pending' THEN promotion_state
+                ELSE candidate_state
+            END IN ('pending', 'review')
+            """
         ).fetchone()[0]
     ) if table_exists(conn, "relation_candidates") else 0
     degraded_sources = int(

@@ -497,6 +497,91 @@ def create_contract_promotion_db(db_path: Path):
         conn.close()
 
 
+def create_restriction_official_promotion_db(db_path: Path):
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+        conn.executescript(
+            """
+            INSERT INTO sources(id, name, category, url, is_active) VALUES
+                (1, 'RKN', 'official_site', 'https://rkn.gov.ru/docs/restrictions', 1);
+
+            INSERT INTO entities(id, entity_type, canonical_name) VALUES
+                (75, 'organization', 'Роскомнадзор'),
+                (76, 'person', 'Андрей Юрьевич Липов');
+
+            INSERT INTO content_items(id, source_id, content_type, title, body_text, status) VALUES
+                (751, 1, 'restriction_record', 'Restriction A', 'Официальный документ об ограничении', 'raw_signal');
+
+            INSERT INTO restriction_events(
+                id, source_content_id, issuer_entity_id, target_entity_id, target_name,
+                restriction_type, right_category, evidence_class
+            ) VALUES
+                (752, 751, 75, 76, 'Андрей Юрьевич Липов', 'restriction_notice', 'information', 'hard');
+
+            INSERT INTO entity_mentions(entity_id, content_item_id, mention_type, confidence) VALUES
+                (75, 751, 'organization', 1.0),
+                (76, 751, 'subject', 1.0);
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def create_disclosure_official_promotion_db(db_path: Path, *, with_structural_relation: bool = False):
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+        conn.executescript(
+            """
+            INSERT INTO sources(id, name, category, url, is_active) VALUES
+                (1, 'Duma archive', 'official_site', 'https://web.archive.org/web/20220415143334/http://duma.gov.ru/duma/persons/properties/2021/', 1);
+
+            INSERT INTO entities(id, entity_type, canonical_name) VALUES
+                (85, 'person', 'Тестовый Депутат'),
+                (86, 'organization', 'Государственная Дума РФ');
+
+            INSERT INTO content_items(id, source_id, content_type, title, body_text, status) VALUES
+                (851, 1, 'declaration', 'Disclosure A', 'Официальная декларация о доходах', 'raw_signal');
+
+            INSERT INTO person_disclosures(
+                id, entity_id, disclosure_year, source_content_id, source_url, source_type,
+                income_amount, raw_income_text, evidence_class, metadata_json
+            ) VALUES
+                (
+                    852,
+                    85,
+                    2021,
+                    851,
+                    'https://web.archive.org/web/20220415143334/http://duma.gov.ru/duma/persons/properties/2021/',
+                    'official_archive',
+                    1234567.89,
+                    '1234567,89',
+                    'hard',
+                    '{"position":"член комитета Государственной Думы"}'
+                );
+
+            INSERT INTO official_positions(
+                entity_id, position_title, organization, source_url, source_type, is_active
+            ) VALUES
+                (85, 'Депутат Государственной Думы', 'Государственная Дума РФ', 'https://duma.gov.ru/deputies/85', 'deputy_profile', 1);
+            """
+        )
+        if with_structural_relation:
+            conn.execute(
+                """
+                INSERT INTO entity_relations(
+                    from_entity_id, to_entity_id, relation_type, strength, detected_by
+                ) VALUES(?,?,?,?,?)
+                """,
+                (85, 86, "works_at", "strong", "official_positions"),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def create_bill_promotion_db(db_path: Path):
     conn = sqlite3.connect(db_path)
     try:
@@ -986,6 +1071,113 @@ class RelationLayerTests(unittest.TestCase):
             self.assertIn("ClaimCluster", row[8])
             self.assertIn("Contract", row[8])
             self.assertEqual(promoted, [("same_contract_cluster",)])
+
+    def test_relation_candidate_builder_promotes_single_source_official_restriction_bridge(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "relations.db"
+            create_restriction_official_promotion_db(db_path)
+
+            result = rebuild_relation_candidates({"db_path": str(db_path)})
+
+            conn = sqlite3.connect(db_path)
+            try:
+                row = conn.execute(
+                    """
+                    SELECT candidate_type, candidate_state, promotion_state, support_items, support_sources, support_domains,
+                           support_hard_evidence_count, promotion_block_reason, evidence_mix_json, explain_path_json
+                    FROM relation_candidates
+                    ORDER BY id
+                    LIMIT 1
+                    """
+                ).fetchone()
+                promoted = conn.execute(
+                    """
+                    SELECT relation_type
+                    FROM entity_relations
+                    WHERE COALESCE(detected_by, '') LIKE 'relation_candidate:%'
+                    ORDER BY id
+                    """
+                ).fetchall()
+            finally:
+                conn.close()
+
+            self.assertEqual(result["promoted_relations"], 1)
+            self.assertEqual(row[0], "likely_association")
+            self.assertEqual(row[1:3], ("promoted", "promoted"))
+            self.assertEqual(row[3:6], (1, 1, 1))
+            self.assertGreaterEqual(row[6], 1)
+            self.assertIsNone(row[7])
+            self.assertIn('"official_bridge_count"', row[8])
+            self.assertIn('"official_content_types"', row[8])
+            self.assertIn("RestrictionEvent", row[9])
+            self.assertIn("OfficialDocument", row[9])
+            self.assertEqual(promoted, [("likely_association",)])
+
+    def test_relation_candidate_builder_promotes_single_source_official_disclosure_bridge(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "relations.db"
+            create_disclosure_official_promotion_db(db_path)
+
+            result = rebuild_relation_candidates({"db_path": str(db_path)})
+
+            conn = sqlite3.connect(db_path)
+            try:
+                row = conn.execute(
+                    """
+                    SELECT candidate_type, candidate_state, promotion_state, support_items, support_sources, support_domains,
+                           support_hard_evidence_count, promotion_block_reason, evidence_mix_json, explain_path_json
+                    FROM relation_candidates
+                    ORDER BY id
+                    LIMIT 1
+                    """
+                ).fetchone()
+                promoted = conn.execute(
+                    """
+                    SELECT relation_type
+                    FROM entity_relations
+                    WHERE COALESCE(detected_by, '') LIKE 'relation_candidate:%'
+                    ORDER BY id
+                    """
+                ).fetchall()
+            finally:
+                conn.close()
+
+            self.assertEqual(result["promoted_candidates"], 1)
+            self.assertEqual(result["promoted_relations"], 1)
+            self.assertEqual(row[0], "likely_association")
+            self.assertEqual(row[1:3], ("promoted", "promoted"))
+            self.assertEqual(row[3:6], (1, 1, 1))
+            self.assertGreaterEqual(row[6], 1)
+            self.assertIsNone(row[7])
+            self.assertIn('"official_bridge_count"', row[8])
+            self.assertIn('"official_content_types"', row[8])
+            self.assertIn("Disclosure", row[9])
+            self.assertIn("OfficialDocument", row[9])
+            self.assertEqual(promoted, [("likely_association",)])
+
+    def test_relation_candidate_builder_skips_materializing_duplicate_over_existing_structural_edge(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "relations.db"
+            create_disclosure_official_promotion_db(db_path, with_structural_relation=True)
+
+            result = rebuild_relation_candidates({"db_path": str(db_path)})
+
+            conn = sqlite3.connect(db_path)
+            try:
+                counts = conn.execute(
+                    """
+                    SELECT
+                        SUM(CASE WHEN COALESCE(detected_by, '') LIKE 'relation_candidate:%' THEN 1 ELSE 0 END) AS candidate_edges,
+                        SUM(CASE WHEN relation_type='works_at' AND COALESCE(detected_by, '')='official_positions' THEN 1 ELSE 0 END) AS structural_edges
+                    FROM entity_relations
+                    """
+                ).fetchone()
+            finally:
+                conn.close()
+
+            self.assertEqual(result["promoted_candidates"], 1)
+            self.assertEqual(result["promoted_relations"], 0)
+            self.assertEqual(counts, (0, 1))
 
     def test_relation_candidate_builder_promotes_bill_cluster_with_real_evidence(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -2012,4 +2012,23 @@ tass.ru (иногда)
 - [x] Перевести relation candidates в feature-driven состояние: `seed_only / pending / review / promoted`, с explainable path и отдельными `relation_features`.
 - [x] Разделить `evidence_links` по `evidence_class = seed / support / hard` и учесть это в authenticity/corroboration scoring.
 - [x] Перевести `classifier_audit` на preferred reviewed-baseline для drift-gate, с fallback на live-distribution до появления review gold set.
-- [x] Прогнать live rebuild/backfill на всей `news_unified.db` и зафиксировать итоговые метрики после полного nightly: `pipeline_version=nightly-20260426200549`, `quality_gate.ok=true`, `relation_candidates=858`, `review=130`, `promoted=21`, `content_clusters=1143`, `fixture_backed_sources=10`, `archive_backed_sources=6`, `source_health unresolved_blockers=0`.
+- [x] Ужесточить relation engine до precision-first: fake domain diversity через `source:{id}` больше не считается независимым доменом, generic location/entity hubs не промоутятся, а `same_case_cluster` без non-seed corroboration остаётся `seed_only`.
+- [x] Включить official bridge promotion: single-source hard official relations теперь могут промоутиться только через валидный мост `RestrictionEvent / Affiliation / Disclosure / Asset / OfficialDocument`.
+- [x] Связать relation support с canonical support units: official bridge rows и `content_clusters` участвуют в `support_items/support_sources/support_domains`, а duplicate-heavy Telegram/story reuse не усиливает promotion.
+- [x] Заполнить `Review Ops -> Relations`: после live rebuild открыто `204` relation review tasks (`seed_flood_same_case=171`, `low_specificity_entity=33`).
+- [x] Подключить `Disclosure` bridge через `person_disclosures + official_positions.organization -> organization entity` и разрешить promotion для official disclosure chains без `employer_entity_id`.
+- [x] Перестать материализовывать duplicate `entity_relations` поверх уже существующих structural links: promoted candidate сохраняется, но лишний relation edge не пишется.
+- [x] Поднять promoted official-bridge overlays в user-facing слои: `ui/web_bridge.py` и `tools/export_obsidian_graph.py` теперь показывают bridge evidence поверх structural relation без создания дублирующего `entity_relations`.
+- [x] Прогнать live rebuild/backfill на `news_unified.db` после disclosure-bridge pass и зафиксировать итоговые метрики: `pipeline_version=nightly-20260426200549`, `quality_gate.ok=true`, `relation_candidates=6905`, `seed_only=5973`, `review=907`, `pending=2`, `promoted_candidates=23`, `materialized_promoted_relations=0`, `content_clusters=1143`, `fixture_backed_sources=10`, `archive_backed_sources=6`, `source_health unresolved_blockers=0`, relation-quality checks = `0`.
+
+## 24) Event-centric temporal platform
+
+- [x] Добавить temporal/event foundation в схему: `content_derivations`, `events`, `event_items`, `event_entities`, `event_timeline`, `event_facts`, `fact_evidence`, а также temporal-поля `valid_from / valid_to / observed_at / recorded_at / superseded_at` в ключевые relation/enrichment слои.
+- [x] Реализовать `analysis/event_pipeline.py`: raw контент остаётся неизменяемым, а derived-слой строит `clean_factual_text`, `structured_extract`, event fragments, canonical events, timeline и fact-evidence связи.
+- [x] Подключить `event_pipeline` в runtime orchestration: job зарегистрирован в `runtime/registry.py` и включён в `incremental`/`nightly` после `semantic_index`.
+- [x] Добавить backend-представление `События` в `ui/web_bridge.py`: экран отдаёт canonical event list, детальную карточку, timeline, участников, facts и привязанные материалы.
+- [x] Добавить frontend-экран `События` в `ui_web/app.js`: split drawer и event detail теперь показывают summary, narrative, timeline, roles, facts и материалы.
+- [x] Расширить relation payload temporal/event контекстом: relation detail теперь отдаёт `bridge_path`, `event_context`, `fact_context`, `temporal_window` и `evidence_mix`.
+- [x] Расширить snapshot/export под event layer: `tools/build_analysis_snapshot.py` считает `events/event_facts`, а `tools/export_obsidian_graph.py` экспортирует отдельные `Events/` и `Facts/` notes.
+- [x] Прогнать live event pipeline и проверить витрины: в `db/news_unified.db` сейчас `events=1141`, `event_facts=44`, `event_items=2518`, `event_entities=671`, `event_timeline=2518`; в `db/news_analysis.db` event layer материализован; в vault `D:\Obsidian\новости` созданы `Events=1142` и `Facts=45` notes.
+- [x] Закрепить event rollout тестами и smoke-проверками: `tests/test_event_platform.py` добавлен, UI smoke покрывает `Events` screen, полный suite после event rollout = `136/136 OK`.

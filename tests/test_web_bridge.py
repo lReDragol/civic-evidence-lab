@@ -477,6 +477,49 @@ class DashboardDataServiceTests(unittest.TestCase):
             bridge_paths = payload["detail"].get("bridge_paths") or []
             self.assertTrue(any("Аффилиация" in path["label"] for path in bridge_paths))
 
+    def test_relation_detail_merges_promoted_disclosure_overlay(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "bridge.db"
+            create_db(db_path)
+
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO relation_candidates(
+                        id, entity_a_id, entity_b_id, candidate_type, origin, score,
+                        support_items, support_sources, support_domains, support_hard_evidence_count,
+                        candidate_state, promotion_state, evidence_mix_json, explain_path_json
+                    ) VALUES(
+                        82, 1, 2, 'likely_association', 'candidate_builder:co_occurrence', 0.91,
+                        1, 1, 1, 1,
+                        'promoted', 'promoted',
+                        '{"bridge_types":["Content","Disclosure","OfficialDocument"],"official_content_types":["anticorruption_declaration"]}',
+                        '[{"node_type":"Content","ids":[12]},{"node_type":"Disclosure","ids":[101]},{"node_type":"OfficialDocument","ids":[12]}]'
+                    )
+                    """
+                )
+                conn.commit()
+                service = DashboardDataService(conn, {})
+                payload = service.screen_payload("relations", {"selected_id": 41})
+            finally:
+                conn.close()
+
+            detail = payload["detail"]
+            self.assertEqual(detail["promoted_candidate_id"], 82)
+            self.assertIn("promoted official bridge", detail["detected_label"])
+            self.assertIn("Disclosure", detail["summary"])
+            self.assertEqual(detail["layer"], "evidence")
+            graph = detail["evidence_graph"]
+            node_roles = {node["role"] for node in graph["nodes"]}
+            self.assertIn("bridge_disclosure", node_roles)
+            self.assertIn("bridge_evidence", node_roles)
+            map_roles = {node["role"] for node in payload["map_graph"]["nodes"]}
+            self.assertIn("bridge_disclosure", map_roles)
+            bridge_paths = detail.get("bridge_paths") or []
+            self.assertTrue(any("Декларация" in path["label"] for path in bridge_paths))
+
     def test_settings_screen_contains_workspace_detail(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "bridge.db"

@@ -170,6 +170,7 @@ NAVIGATION = [
         "key": "analytics",
         "label": "Аналитика",
         "sections": [
+            {"key": "events", "label": "События"},
             {"key": "entities", "label": "Сущности"},
             {"key": "relations", "label": "Связи"},
             {"key": "officials", "label": "Руководство"},
@@ -221,12 +222,15 @@ class DashboardDataService:
         counts = {
             "content": self._count("content_items"),
             "claims": self._count("claims"),
+            "events": self._count("events"),
             "entities": self._count("entities"),
             "cases": self._count("cases"),
             "relations": self._count("entity_relations"),
             "officials": self._count_distinct("official_positions", "entity_id", "is_active=1"),
         }
         secondary_counts = {
+            "events": self._count("events"),
+            "facts": self._count("event_facts"),
             "persons": self._count_where("entities", "entity_type='person'"),
             "quotes": self._count("quotes"),
             "flagged_quotes": self._count_where("quotes", "is_flagged=1"),
@@ -239,10 +243,16 @@ class DashboardDataService:
             "votes": self._count("bill_vote_sessions"),
             "investigation_materials": self._count("investigative_materials"),
         }
+        relation_state_expr = (
+            "CASE "
+            "WHEN candidate_state IS NULL THEN promotion_state "
+            "WHEN promotion_state IS NOT NULL AND candidate_state='pending' AND promotion_state!='pending' THEN promotion_state "
+            "ELSE candidate_state END"
+        )
         graph_health = {
             "evidence_backed_relations": self._count_where("entity_relations", "evidence_item_id IS NOT NULL"),
-            "weak_relations": self._count_where("relation_candidates", "promotion_state IN ('pending', 'review')"),
-            "promoted_candidates": self._count_where("relation_candidates", "promotion_state='promoted'"),
+            "weak_relations": self._count_where("relation_candidates", f"{relation_state_expr} IN ('pending', 'review')"),
+            "promoted_candidates": self._count_where("relation_candidates", f"{relation_state_expr}='promoted'"),
             "tagged_items": self._count_distinct("content_tags", "content_item_id"),
             "untagged_items": self._count_where(
                 "content_items",
@@ -268,7 +278,7 @@ class DashboardDataService:
                 "job_runs",
                 "status IN ('failed', 'abandoned') AND started_at >= datetime('now', '-1 day')",
             ),
-            "pending_candidates": self._count_where("relation_candidates", "promotion_state IN ('pending', 'review')"),
+            "pending_candidates": self._count_where("relation_candidates", f"{relation_state_expr} IN ('pending', 'review')"),
             "degraded_sources": self._count_where("source_sync_state", "state='degraded'"),
             "dead_letters": self._count_where("dead_letter_items", "resolved_at IS NULL"),
         }
@@ -403,6 +413,8 @@ class DashboardDataService:
             return self._cases_screen(filters)
         if screen == "review_ops":
             return self._review_ops_screen(filters)
+        if screen == "events":
+            return self._events_screen(filters)
         if screen == "entities":
             return self._entities_screen(filters)
         if screen == "relations":
@@ -590,6 +602,90 @@ class DashboardDataService:
             return {}
         return payload if isinstance(payload, dict) else {}
 
+    @staticmethod
+    def _json_list(raw_value: Any) -> list[Any]:
+        if not raw_value:
+            return []
+        try:
+            payload = json.loads(str(raw_value))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return []
+        return payload if isinstance(payload, list) else []
+
+    @staticmethod
+    def _relation_candidate_state_expr(alias: str = "rc") -> str:
+        return (
+            f"CASE "
+            f"WHEN {alias}.candidate_state IS NULL THEN {alias}.promotion_state "
+            f"WHEN {alias}.promotion_state IS NOT NULL "
+            f" AND {alias}.candidate_state='pending' "
+            f" AND {alias}.promotion_state!='pending' "
+            f"THEN {alias}.promotion_state "
+            f"ELSE {alias}.candidate_state END"
+        )
+
+    @staticmethod
+    def _relation_pair_key(entity_a_id: Any, entity_b_id: Any) -> tuple[int, int] | None:
+        try:
+            left = int(entity_a_id)
+            right = int(entity_b_id)
+        except (TypeError, ValueError):
+            return None
+        if left == right:
+            return None
+        return (left, right) if left < right else (right, left)
+
+    @staticmethod
+    def _ordered_unique(values: list[Any]) -> list[str]:
+        result: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            text = str(value or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            result.append(text)
+        return result
+
+    def _relation_candidate_bridge_types(self, item: dict[str, Any]) -> list[str]:
+        values: list[str] = []
+        evidence_mix = self._json_object(item.get("evidence_mix_json"))
+        values.extend(str(value) for value in evidence_mix.get("bridge_types") or [])
+        for node in self._json_list(item.get("explain_path_json")):
+            if isinstance(node, dict):
+                values.append(str(node.get("node_type") or ""))
+        return self._ordered_unique(values)
+
+    def _relation_path_context(self, raw_path: Any) -> dict[str, Any]:
+        path = [node for node in self._json_list(raw_path) if isinstance(node, dict)]
+        event_context = [dict(node) for node in path if str(node.get("node_type") or "") == "Event"]
+        fact_context = [
+            dict(node)
+            for node in path
+            if str(node.get("node_type") or "") in {
+                "Fact",
+                "RestrictionEvent",
+                "Disclosure",
+                "Asset",
+                "Affiliation",
+                "OfficialDocument",
+            }
+        ]
+        return {
+            "bridge_path": path,
+            "event_context": event_context,
+            "fact_context": fact_context,
+        }
+
+    @staticmethod
+    def _candidate_overlay_sort_key(item: dict[str, Any]) -> tuple[float, int, int, int]:
+        return (
+            float(item.get("score") or 0.0),
+            int(item.get("support_hard_evidence_count") or 0),
+            int(item.get("support_items") or 0),
+            int(item.get("id") or 0),
+        )
+
     def _graph_node(
         self,
         node_id: str,
@@ -641,6 +737,8 @@ class DashboardDataService:
             return ("affiliations", "Аффилиации", "affiliations")
         if role_text == "bridge_restriction":
             return ("restrictions", "Ограничения", "restrictions")
+        if role_text in {"bridge_disclosure", "bridge_asset"}:
+            return ("documents", "Документы", "documents")
         if role_text in {"content_origin", "bridge_content", "bridge_evidence", "evidence", "context"}:
             return ("documents", "Документы", "documents")
         return ("other", "Прочее", "other")
@@ -932,6 +1030,41 @@ class DashboardDataService:
             )
             edges.append({"from": evidence_node_id, "to": relation_node_id, "label": "доказательство", "kind": "evidence"})
 
+        if detail.get("promoted_candidate_id"):
+            previous_node_id = relation_node_id
+            path = list(reversed(self._json_list(detail.get("promotion_explain_path_json"))))
+            for index, part in enumerate(path):
+                if not isinstance(part, dict):
+                    continue
+                node_type = str(part.get("node_type") or "")
+                ids = [value for value in (part.get("ids") or []) if value is not None]
+                role, label = self._bridge_role_for_node_type(node_type)
+                title, meta, jump_screen, jump_id = self._bridge_node_title(node_type, ids)
+                bridge_node_id = f"relation-bridge:{detail.get('promoted_candidate_id')}:{node_type}:{index}"
+                node_kwargs: dict[str, Any] = {}
+                if jump_screen and jump_id is not None:
+                    node_kwargs = {"jump_screen": jump_screen, "jump_id": jump_id}
+                nodes.append(
+                    self._graph_node(
+                        bridge_node_id,
+                        role,
+                        label,
+                        title,
+                        meta,
+                        description=title,
+                        **node_kwargs,
+                    )
+                )
+                edges.append(
+                    {
+                        "from": bridge_node_id,
+                        "to": previous_node_id,
+                        "label": label,
+                        "kind": "evidence",
+                    }
+                )
+                previous_node_id = bridge_node_id
+
         if len(nodes) < 2:
             return None
         return {"kind": "relation", "nodes": nodes, "edges": edges}
@@ -988,7 +1121,7 @@ class DashboardDataService:
                 "from": from_node_id,
                 "to": to_node_id,
                 "label": item.get("relation_label") or item.get("relation_type") or "связь",
-                "kind": item.get("layer") or "relation",
+                "kind": item.get("map_kind") or item.get("layer") or "relation",
                 "strength": item.get("strength") or "",
                 "detected_label": item.get("detected_label") or item.get("detected_by") or "",
                 "summary": item.get("summary") or "",
@@ -1006,6 +1139,15 @@ class DashboardDataService:
             if edge_key not in edge_keys:
                 edge_keys.add(edge_key)
                 edges.append(edge_payload)
+            self._relation_map_append_candidate_bridge_path(
+                item,
+                from_node_id,
+                to_node_id,
+                node_map,
+                degree_map,
+                edges,
+                edge_keys,
+            )
 
         if len(node_map) < 2 or not edges:
             return None
@@ -1682,6 +1824,170 @@ class DashboardDataService:
             payload["id"] = edge_id
         edges.append(payload)
 
+    def _bridge_node_title(self, node_type: str, ids: list[Any]) -> tuple[str, str, str | None, int | None]:
+        first_id = None
+        for value in ids:
+            try:
+                first_id = int(value)
+                break
+            except (TypeError, ValueError):
+                continue
+        node_type = str(node_type or "")
+        if node_type == "OfficialDocument" and first_id and self._table_exists("content_items"):
+            row = self.db.execute(
+                "SELECT id, title, content_type, published_at FROM content_items WHERE id=?",
+                (first_id,),
+            ).fetchone()
+            if row:
+                payload = self._row_to_dict(row)
+                meta = " · ".join(
+                    value for value in [payload.get("content_type"), payload.get("published_at")] if value
+                )
+                return (payload.get("title") or f"Документ #{first_id}", meta, "content", first_id)
+        if node_type == "Content" and first_id and self._table_exists("content_items"):
+            row = self.db.execute(
+                "SELECT id, title, content_type, published_at FROM content_items WHERE id=?",
+                (first_id,),
+            ).fetchone()
+            if row:
+                payload = self._row_to_dict(row)
+                meta = " · ".join(
+                    value for value in [payload.get("content_type"), payload.get("published_at")] if value
+                )
+                return (payload.get("title") or f"Контент #{first_id}", meta, "content", first_id)
+        if node_type == "RestrictionEvent" and first_id and self._table_exists("restriction_events"):
+            row = self.db.execute(
+                "SELECT id, restriction_type, target_name, right_category FROM restriction_events WHERE id=?",
+                (first_id,),
+            ).fetchone()
+            if row:
+                payload = self._row_to_dict(row)
+                title = payload.get("target_name") or payload.get("restriction_type") or f"Restriction #{first_id}"
+                meta = " · ".join(
+                    value for value in [payload.get("restriction_type"), payload.get("right_category")] if value
+                )
+                return (title, meta, "review_ops", None)
+        if node_type == "Disclosure" and first_id and self._table_exists("person_disclosures"):
+            row = self.db.execute(
+                """
+                SELECT pd.id, pd.disclosure_year, pd.raw_income_text, e.canonical_name
+                FROM person_disclosures pd
+                LEFT JOIN entities e ON e.id = pd.entity_id
+                WHERE pd.id=?
+                """,
+                (first_id,),
+            ).fetchone()
+            if row:
+                payload = self._row_to_dict(row)
+                title = payload.get("canonical_name") or f"Disclosure #{first_id}"
+                meta = " · ".join(
+                    value for value in [str(payload.get("disclosure_year") or ""), payload.get("raw_income_text") or "декларация"]
+                    if value
+                )
+                return (title, meta, "entities", None)
+        if node_type == "Affiliation" and first_id and self._table_exists("company_affiliations"):
+            row = self.db.execute(
+                "SELECT id, company_name, role_title, role_type FROM company_affiliations WHERE id=?",
+                (first_id,),
+            ).fetchone()
+            if row:
+                payload = self._row_to_dict(row)
+                title = payload.get("company_name") or f"Affiliation #{first_id}"
+                meta = " · ".join(
+                    value for value in [payload.get("role_title"), payload.get("role_type")] if value
+                )
+                return (title, meta, "entities", None)
+        if node_type == "Asset" and first_id and self._table_exists("declared_assets"):
+            row = self.db.execute(
+                "SELECT id, asset_type, description FROM declared_assets WHERE id=?",
+                (first_id,),
+            ).fetchone()
+            if row:
+                payload = self._row_to_dict(row)
+                title = payload.get("description") or payload.get("asset_type") or f"Asset #{first_id}"
+                meta = payload.get("asset_type") or ""
+                return (title, meta, "entities", None)
+        fallback = first_id if first_id is not None else len(ids)
+        return (f"{node_type or 'Bridge'} #{fallback}", "", None, None)
+
+    @staticmethod
+    def _bridge_role_for_node_type(node_type: str) -> tuple[str, str]:
+        role_map = {
+            "Content": ("bridge_content", "Контент"),
+            "OfficialDocument": ("bridge_evidence", "Документ"),
+            "RestrictionEvent": ("bridge_restriction", "Ограничение"),
+            "Disclosure": ("bridge_disclosure", "Декларация"),
+            "Affiliation": ("bridge_affiliation", "Аффилиация"),
+            "Asset": ("bridge_asset", "Актив"),
+            "Case": ("bridge_case", "Дело"),
+            "Claim": ("bridge_claim", "Claim"),
+            "Bill": ("bridge_bill", "Законопроект"),
+            "Contract": ("bridge_contract", "Контракт"),
+        }
+        return role_map.get(node_type, ("bridge_content", node_type or "Bridge"))
+
+    def _relation_map_append_candidate_bridge_path(
+        self,
+        item: dict[str, Any],
+        from_node_id: str,
+        to_node_id: str,
+        node_map: dict[str, dict[str, Any]],
+        degree_map: defaultdict[str, int],
+        edges: list[dict[str, Any]],
+        edge_keys: set[tuple[Any, ...]],
+    ) -> None:
+        candidate_id = item.get("promoted_candidate_id")
+        path = self._json_list(item.get("promotion_explain_path_json"))
+        if not candidate_id or not path:
+            return
+        previous_node_id = from_node_id
+        for index, part in enumerate(path):
+            if not isinstance(part, dict):
+                continue
+            node_type = str(part.get("node_type") or "")
+            ids = [value for value in (part.get("ids") or []) if value is not None]
+            role, label = self._bridge_role_for_node_type(node_type)
+            title, meta, jump_screen, jump_id = self._bridge_node_title(node_type, ids)
+            bridge_node_id = f"candidate:{int(candidate_id)}:{node_type}:{index}"
+            self._map_ensure_node(
+                node_map,
+                bridge_node_id,
+                role,
+                label,
+                title,
+                meta,
+                description=title,
+                jump_screen=jump_screen,
+                jump_id=jump_id,
+            )
+            self._map_add_edge(
+                edges,
+                edge_keys,
+                degree_map,
+                previous_node_id,
+                bridge_node_id,
+                label,
+                "evidence",
+                summary=item.get("summary") or "Official bridge path",
+                strength=str(item.get("strength") or ""),
+                detected_label=str(item.get("detected_label") or ""),
+                edge_id=f"candidate:{int(candidate_id)}:{index}",
+            )
+            previous_node_id = bridge_node_id
+        self._map_add_edge(
+            edges,
+            edge_keys,
+            degree_map,
+            previous_node_id,
+            to_node_id,
+            item.get("relation_label") or item.get("relation_type") or "связь",
+            "evidence",
+            summary=item.get("summary") or "Official bridge path",
+            strength=str(item.get("strength") or ""),
+            detected_label=str(item.get("detected_label") or ""),
+            edge_id=f"candidate:{int(candidate_id)}:final",
+        )
+
     def _relation_map_paths(
         self,
         graph: dict[str, Any] | None,
@@ -1786,6 +2092,10 @@ class DashboardDataService:
                     display = f"Контракт: {title}"
                 elif role == "bridge_affiliation":
                     display = f"Аффилиация: {title}"
+                elif role == "bridge_disclosure":
+                    display = f"Декларация: {title}"
+                elif role == "bridge_asset":
+                    display = f"Актив: {title}"
                 elif role == "bridge_restriction":
                     display = f"Ограничение: {title}"
                 else:
@@ -1809,12 +2119,84 @@ class DashboardDataService:
             )
         return result
 
+    def _relation_overlay_path(self, detail: dict[str, Any] | None) -> dict[str, Any] | None:
+        if not detail or not detail.get("promoted_candidate_id"):
+            return None
+        path = self._json_list(detail.get("promotion_explain_path_json"))
+        if not path or not detail.get("from_entity_id") or not detail.get("to_entity_id"):
+            return None
+        nodes = [
+            {
+                "id": f"entity:{int(detail['from_entity_id'])}",
+                "role": "map_entity",
+                "title": detail.get("from_name") or f"Entity #{detail['from_entity_id']}",
+                "label": detail.get("from_name") or f"Entity #{detail['from_entity_id']}",
+                "jump_screen": "entities",
+                "jump_id": int(detail["from_entity_id"]),
+            }
+        ]
+        for index, part in enumerate(path):
+            if not isinstance(part, dict):
+                continue
+            node_type = str(part.get("node_type") or "")
+            ids = [value for value in (part.get("ids") or []) if value is not None]
+            role, label = self._bridge_role_for_node_type(node_type)
+            title, _meta, jump_screen, jump_id = self._bridge_node_title(node_type, ids)
+            if role == "bridge_case":
+                display = f"Дело: {title}"
+            elif role == "bridge_claim":
+                display = f"Claim: {title}"
+            elif role == "bridge_content":
+                display = f"Контент: {title}"
+            elif role == "bridge_evidence":
+                display = f"Evidence: {title}"
+            elif role == "bridge_bill":
+                display = f"Законопроект: {title}"
+            elif role == "bridge_contract":
+                display = f"Контракт: {title}"
+            elif role == "bridge_affiliation":
+                display = f"Аффилиация: {title}"
+            elif role == "bridge_disclosure":
+                display = f"Декларация: {title}"
+            elif role == "bridge_asset":
+                display = f"Актив: {title}"
+            elif role == "bridge_restriction":
+                display = f"Ограничение: {title}"
+            else:
+                display = title
+            nodes.append(
+                {
+                    "id": f"candidate:{int(detail['promoted_candidate_id'])}:{node_type}:{index}",
+                    "role": role,
+                    "title": title,
+                    "label": display,
+                    "jump_screen": jump_screen,
+                    "jump_id": jump_id,
+                }
+            )
+        nodes.append(
+            {
+                "id": f"entity:{int(detail['to_entity_id'])}",
+                "role": "map_entity",
+                "title": detail.get("to_name") or f"Entity #{detail['to_entity_id']}",
+                "label": detail.get("to_name") or f"Entity #{detail['to_entity_id']}",
+                "jump_screen": "entities",
+                "jump_id": int(detail["to_entity_id"]),
+            }
+        )
+        return {
+            "hops": len(nodes) - 1,
+            "label": " → ".join(str(node.get("label") or "") for node in nodes),
+            "nodes": nodes,
+        }
+
     def _relation_candidate_map_items(self, query: str, layer: str) -> list[dict[str, Any]]:
         if layer and layer != "weak_similarity":
             return []
         if not self._table_exists("relation_candidates"):
             return []
 
+        state_expr = self._relation_candidate_state_expr("rc")
         rows = self.db.execute(
             """
             SELECT rc.id, rc.entity_a_id AS from_entity_id, rc.entity_b_id AS to_entity_id,
@@ -1825,7 +2207,9 @@ class DashboardDataService:
             FROM relation_candidates rc
             JOIN entities ea ON ea.id = rc.entity_a_id
             JOIN entities eb ON eb.id = rc.entity_b_id
-            WHERE rc.promotion_state='review'
+            WHERE """
+            + state_expr
+            + """='review'
             ORDER BY rc.score DESC, rc.id DESC
             LIMIT 180
             """
@@ -1883,16 +2267,192 @@ class DashboardDataService:
             )
         return items
 
+    def _promoted_relation_candidate_rows(
+        self,
+        *,
+        entity_id: int | None = None,
+        limit: int = 320,
+    ) -> list[dict[str, Any]]:
+        if not self._table_exists("relation_candidates"):
+            return []
+        state_expr = self._relation_candidate_state_expr("rc")
+        where = [f"{state_expr}='promoted'"]
+        params: list[Any] = []
+        if entity_id:
+            where.append("(rc.entity_a_id=? OR rc.entity_b_id=?)")
+            params.extend([int(entity_id), int(entity_id)])
+        rows = self.db.execute(
+            f"""
+            SELECT rc.id, rc.entity_a_id AS from_entity_id, rc.entity_b_id AS to_entity_id,
+                   rc.candidate_type, rc.origin, rc.score, rc.support_items,
+                   rc.support_sources, rc.support_domains, rc.support_hard_evidence_count,
+                   rc.promotion_block_reason, rc.promoted_relation_type, rc.metadata_json,
+                   rc.evidence_mix_json, rc.explain_path_json,
+                   rc.valid_from, rc.valid_to, rc.observed_at, rc.recorded_at, rc.superseded_at,
+                   ea.canonical_name AS from_name, ea.entity_type AS from_type, ea.description AS from_description,
+                   eb.canonical_name AS to_name, eb.entity_type AS to_type, eb.description AS to_description
+            FROM relation_candidates rc
+            JOIN entities ea ON ea.id = rc.entity_a_id
+            JOIN entities eb ON eb.id = rc.entity_b_id
+            WHERE {' AND '.join(where)}
+            ORDER BY rc.score DESC, rc.id DESC
+            LIMIT ?
+            """,
+            (*params, int(limit)),
+        ).fetchall()
+        return [self._row_to_dict(row) for row in rows]
+
+    def _promoted_relation_overlay_map(self, rows: list[dict[str, Any]]) -> dict[tuple[int, int], list[dict[str, Any]]]:
+        overlays: defaultdict[tuple[int, int], list[dict[str, Any]]] = defaultdict(list)
+        for row in rows:
+            pair_key = self._relation_pair_key(row.get("from_entity_id"), row.get("to_entity_id"))
+            if not pair_key:
+                continue
+            overlays[pair_key].append(dict(row))
+        for pair_key, values in overlays.items():
+            values.sort(key=self._candidate_overlay_sort_key, reverse=True)
+        return dict(overlays)
+
+    def _relation_candidate_item(self, item: dict[str, Any]) -> dict[str, Any]:
+        bridge_types = self._relation_candidate_bridge_types(item)
+        evidence_mix = self._json_object(item.get("evidence_mix_json"))
+        path_context = self._relation_path_context(item.get("explain_path_json"))
+        official_types = evidence_mix.get("official_content_types") or evidence_mix.get("content_types") or []
+        summary = self.relation_summary(
+            item.get("promoted_relation_type") or item.get("candidate_type") or "likely_association",
+            item.get("from_name", ""),
+            item.get("to_name", ""),
+        )
+        if bridge_types:
+            summary = f"{summary} Official bridge: {', '.join(bridge_types)}."
+        detected_parts = ["promoted official bridge"]
+        if official_types:
+            detected_parts.append("/".join(str(value) for value in official_types[:2]))
+        return {
+            "id": -int(item.get("id") or 0),
+            "from_entity_id": item.get("from_entity_id"),
+            "to_entity_id": item.get("to_entity_id"),
+            "from_name": item.get("from_name"),
+            "to_name": item.get("to_name"),
+            "from_type": item.get("from_type"),
+            "to_type": item.get("to_type"),
+            "from_description": item.get("from_description"),
+            "to_description": item.get("to_description"),
+            "relation_type": item.get("promoted_relation_type") or item.get("candidate_type") or "likely_association",
+            "layer": "evidence",
+            "map_kind": "evidence",
+            "strength": "promoted",
+            "detected_by": item.get("origin") or "relation_candidates",
+            "summary": summary,
+            "promoted_candidate_id": item.get("id"),
+            "promoted_candidate_count": 1,
+            "promoted_candidate_type": item.get("candidate_type"),
+            "promoted_score": item.get("score"),
+            "promoted_support_items": item.get("support_items"),
+            "promoted_support_sources": item.get("support_sources"),
+            "promoted_support_domains": item.get("support_domains"),
+            "promoted_support_hard_evidence_count": item.get("support_hard_evidence_count"),
+            "promotion_block_reason": item.get("promotion_block_reason"),
+            "promotion_bridge_types": bridge_types,
+            "promotion_evidence_mix": evidence_mix,
+            "promotion_explain_path_json": item.get("explain_path_json"),
+            "bridge_path": path_context["bridge_path"],
+            "event_context": path_context["event_context"],
+            "fact_context": path_context["fact_context"],
+            "temporal_window": {
+                "valid_from": item.get("valid_from"),
+                "valid_to": item.get("valid_to"),
+                "observed_at": item.get("observed_at"),
+                "recorded_at": item.get("recorded_at"),
+                "superseded_at": item.get("superseded_at"),
+            },
+            "detected_label": " · ".join(part for part in detected_parts if part),
+        }
+
+    def _merge_promoted_relation_overlays(
+        self,
+        relation_items: list[dict[str, Any]],
+        overlay_rows: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        if not relation_items and not overlay_rows:
+            return []
+        overlay_map = self._promoted_relation_overlay_map(overlay_rows)
+        seen_pairs: set[tuple[int, int]] = set()
+        result: list[dict[str, Any]] = []
+        for relation in relation_items:
+            item = dict(relation)
+            pair_key = self._relation_pair_key(item.get("from_entity_id"), item.get("to_entity_id"))
+            if pair_key and pair_key in overlay_map:
+                seen_pairs.add(pair_key)
+                overlays = overlay_map[pair_key]
+                top = overlays[0]
+                bridge_types = self._relation_candidate_bridge_types(top)
+                evidence_mix = self._json_object(top.get("evidence_mix_json"))
+                item["promoted_candidate_id"] = top.get("id")
+                item["promoted_candidate_count"] = len(overlays)
+                item["promoted_candidate_type"] = top.get("candidate_type")
+                item["promoted_score"] = top.get("score")
+                item["promoted_support_items"] = top.get("support_items")
+                item["promoted_support_sources"] = top.get("support_sources")
+                item["promoted_support_domains"] = top.get("support_domains")
+                item["promoted_support_hard_evidence_count"] = top.get("support_hard_evidence_count")
+                item["promotion_block_reason"] = top.get("promotion_block_reason")
+                item["promotion_bridge_types"] = bridge_types
+                item["promotion_evidence_mix"] = evidence_mix
+                item["promotion_explain_path_json"] = top.get("explain_path_json")
+                path_context = self._relation_path_context(top.get("explain_path_json"))
+                item["bridge_path"] = path_context["bridge_path"]
+                item["event_context"] = path_context["event_context"]
+                item["fact_context"] = path_context["fact_context"]
+                item["overlay_layer"] = item.get("layer")
+                item["layer"] = "evidence"
+                item["map_kind"] = "evidence"
+            result.append(item)
+
+        for pair_key, overlays in overlay_map.items():
+            if pair_key in seen_pairs:
+                continue
+            result.append(self._relation_candidate_item(overlays[0]))
+        return result
+
     def _enrich_relation_item(self, item: dict[str, Any]) -> dict[str, Any]:
         item = dict(item)
         item["relation_label"] = self.relation_label(item.get("relation_type", ""))
+        base_detected_label = self.relation_detected_label(item.get("detected_by"))
         item["layer_label"] = self.relation_layer_label(item.get("layer"))
-        item["detected_label"] = self.relation_detected_label(item.get("detected_by"))
+        item["detected_label"] = base_detected_label
+        item.setdefault("bridge_path", [])
+        item.setdefault("event_context", [])
+        item.setdefault("fact_context", [])
+        item["temporal_window"] = {
+            "valid_from": item.get("valid_from"),
+            "valid_to": item.get("valid_to"),
+            "observed_at": item.get("observed_at"),
+            "recorded_at": item.get("recorded_at"),
+            "superseded_at": item.get("superseded_at"),
+        }
         item["summary"] = self.relation_summary(
             item.get("relation_type", ""),
             item.get("from_name", ""),
             item.get("to_name", ""),
         )
+        if item.get("promoted_candidate_id"):
+            bridge_types = item.get("promotion_bridge_types") or []
+            overlay_bits = ["promoted official bridge"]
+            if bridge_types:
+                overlay_bits.append(", ".join(map(str, bridge_types[:4])))
+            item["detected_label"] = " · ".join(part for part in [base_detected_label, *overlay_bits] if part)
+            base_layer = str(item.get("overlay_layer") or "structural")
+            if base_layer == "structural":
+                item["layer_label"] = "доказательная + structural"
+            elif base_layer:
+                item["layer_label"] = f"доказательная + {base_layer}"
+            promotion_summary = f"Подкреплено official bridge: {', '.join(map(str, bridge_types))}." if bridge_types else ""
+            if promotion_summary:
+                item["summary"] = f"{item['summary']} {promotion_summary}".strip()
+            item["evidence_mix"] = item.get("promotion_evidence_mix") or {}
+        else:
+            item["evidence_mix"] = self._json_object(item.get("evidence_mix_json"))
         bill = self._bill_context(item.get("to_name"))
         if bill:
             item["context_title"] = bill.get("title")
@@ -1986,6 +2546,7 @@ class DashboardDataService:
             relation_rows = self.db.execute(
                 """
                 SELECT er.id, er.from_entity_id, er.to_entity_id, er.relation_type, er.strength, er.detected_by, er.evidence_item_id,
+                       er.valid_from, er.valid_to, er.observed_at, er.recorded_at, er.superseded_at,
                        ef.canonical_name AS from_name, ef.entity_type AS from_type, ef.description AS from_description,
                        et.canonical_name AS to_name, et.entity_type AS to_type, et.description AS to_description
                 FROM entity_relations er
@@ -2003,7 +2564,12 @@ class DashboardDataService:
                     item.get("detected_by"),
                     item.get("evidence_item_id"),
                 )
-                relations.append(self._enrich_relation_item(item))
+                relations.append(item)
+            relations = self._merge_promoted_relation_overlays(
+                relations,
+                self._promoted_relation_candidate_rows(entity_id=int(entity_id), limit=240),
+            )
+            relations = [self._enrich_relation_item(item) for item in relations]
             relations.sort(key=self.relation_sort_key)
             relations = relations[:30]
 
@@ -2278,6 +2844,112 @@ class DashboardDataService:
                 ] if self._table_exists("case_events") else []
         return {"items": rows, "detail": detail}
 
+    def _events_screen(self, filters: dict[str, Any]) -> dict[str, Any]:
+        raw_query = self._query(filters.get("query") or "")
+        rows = [
+            self._row_to_dict(row)
+            for row in self.db.execute(
+                """
+                SELECT id, canonical_title, event_type, summary_short, status, event_date_start, event_date_end,
+                       importance_score, confidence
+                FROM events
+                ORDER BY COALESCE(event_date_start, created_at, '') DESC, id DESC
+                LIMIT 160
+                """
+            ).fetchall()
+        ] if self._table_exists("events") else []
+        if raw_query:
+            rows = [
+                row
+                for row in rows
+                if self._contains_query(
+                    raw_query,
+                    row.get("canonical_title"),
+                    row.get("event_type"),
+                    row.get("status"),
+                )
+            ]
+        selected_id = filters.get("selected_id") or (rows[0]["id"] if rows else None)
+        detail = None
+        if selected_id and self._table_exists("events"):
+            row = self.db.execute(
+                """
+                SELECT *
+                FROM events
+                WHERE id=?
+                """,
+                (selected_id,),
+            ).fetchone()
+            if row:
+                detail = self._row_to_dict(row)
+                detail["timeline"] = [
+                    self._row_to_dict(item)
+                    for item in self.db.execute(
+                        """
+                        SELECT id, timeline_date, title, description, content_item_id, document_content_id, sort_order
+                        FROM event_timeline
+                        WHERE event_id=?
+                        ORDER BY sort_order, id
+                        """,
+                        (selected_id,),
+                    ).fetchall()
+                ] if self._table_exists("event_timeline") else []
+                detail["entities"] = [
+                    self._row_to_dict(item)
+                    for item in self.db.execute(
+                        """
+                        SELECT ee.id, ee.entity_id, ee.role, ee.confidence, ee.valid_from, ee.valid_to, ee.observed_at,
+                               e.canonical_name, e.entity_type, e.description
+                        FROM event_entities ee
+                        JOIN entities e ON e.id = ee.entity_id
+                        WHERE ee.event_id=?
+                        ORDER BY ee.role, e.canonical_name, ee.id
+                        """,
+                        (selected_id,),
+                    ).fetchall()
+                ] if self._table_exists("event_entities") else []
+                detail["facts"] = [
+                    self._row_to_dict(item)
+                    for item in self.db.execute(
+                        """
+                        SELECT ef.id, ef.claim_id, ef.fact_type, ef.canonical_text, ef.polarity,
+                               ef.valid_from, ef.valid_to, ef.observed_at, ef.recorded_at, ef.superseded_at,
+                               ef.confidence, cl.claim_text
+                        FROM event_facts ef
+                        LEFT JOIN claims cl ON cl.id = ef.claim_id
+                        WHERE ef.event_id=?
+                        ORDER BY ef.id
+                        """,
+                        (selected_id,),
+                    ).fetchall()
+                ] if self._table_exists("event_facts") else []
+                detail["items"] = [
+                    self._row_to_dict(item)
+                    for item in self.db.execute(
+                        """
+                        SELECT ei.id, ei.content_item_id, ei.content_cluster_id, ei.item_role, ei.source_strength, ei.added_at,
+                               ci.title AS title, ci.content_type, ci.published_at, ci.url,
+                               s.name AS source_name
+                        FROM event_items ei
+                        LEFT JOIN content_items ci ON ci.id = ei.content_item_id
+                        LEFT JOIN sources s ON s.id = ci.source_id
+                        WHERE ei.event_id=?
+                        ORDER BY
+                            CASE ei.item_role
+                                WHEN 'origin' THEN 0
+                                WHEN 'official_doc' THEN 1
+                                WHEN 'update' THEN 2
+                                WHEN 'reaction' THEN 3
+                                ELSE 4
+                            END,
+                            COALESCE(ci.published_at, ei.added_at, '') ASC,
+                            ei.id ASC
+                        """,
+                        (selected_id,),
+                    ).fetchall()
+                ] if self._table_exists("event_items") else []
+        return {"items": rows, "detail": detail}
+
     def _entities_screen(self, filters: dict[str, Any]) -> dict[str, Any]:
         raw_query = self._query(filters.get("query") or "")
         entity_type = (filters.get("entity_type") or "").strip()
@@ -2336,7 +3008,13 @@ class DashboardDataService:
                     item.get("detected_by"),
                     item.get("evidence_item_id"),
                 )
-                all_rows.append(self._enrich_relation_item(item))
+                all_rows.append(item)
+
+        all_rows = self._merge_promoted_relation_overlays(
+            all_rows,
+            self._promoted_relation_candidate_rows(limit=320),
+        )
+        all_rows = [self._enrich_relation_item(item) for item in all_rows]
 
         if query:
             all_rows = [
@@ -2357,11 +3035,17 @@ class DashboardDataService:
         if detail:
             detail = dict(detail)
             detail["evidence_graph"] = self._relation_evidence_graph(detail)
-            detail["bridge_paths"] = self._relation_map_paths(
+            bridge_paths = self._relation_map_paths(
                 map_graph,
                 detail.get("from_entity_id"),
                 detail.get("to_entity_id"),
             )
+            overlay_path = self._relation_overlay_path(detail)
+            if overlay_path:
+                existing_labels = {path.get("label") for path in bridge_paths}
+                if overlay_path.get("label") not in existing_labels:
+                    bridge_paths = [overlay_path, *bridge_paths]
+            detail["bridge_paths"] = bridge_paths
         return {
             "items": visible_rows,
             "detail": detail,

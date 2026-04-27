@@ -149,6 +149,9 @@ def _sync_relation_review_tasks(conn, rows: list[dict[str, Any]]) -> None:
     except Exception:
         return
     for row in rows:
+        suggested_action = "reject"
+        if row["issue"] in {"promoted_without_nonseed_bridge", "blocked_official_bridge"}:
+            suggested_action = "needs_more_docs"
         ensure_review_task(
             conn,
             task_key=f"relation:{row['candidate_id']}:{row['issue']}",
@@ -156,12 +159,27 @@ def _sync_relation_review_tasks(conn, rows: list[dict[str, Any]]) -> None:
             subject_type="relation_candidate",
             subject_id=int(row["candidate_id"]),
             candidate_payload=row,
-            suggested_action="reject" if row["issue"] != "promoted_without_nonseed_bridge" else "needs_more_docs",
+            suggested_action=suggested_action,
             confidence=0.97,
             machine_reason=row["issue"],
-            source_links=[],
+            source_links=row.get("source_links", []),
         )
     conn.commit()
+
+
+def _relation_source_links(conn, candidate_id: int) -> list[str]:
+    rows = conn.execute(
+        """
+        SELECT DISTINCT COALESCE(NULLIF(ci.url, ''), NULLIF(s.url, ''), '')
+        FROM relation_support rs
+        LEFT JOIN content_items ci ON ci.id = COALESCE(rs.content_item_id, rs.evidence_item_id)
+        LEFT JOIN sources s ON s.id = COALESCE(rs.source_id, ci.source_id)
+        WHERE rs.candidate_id = ?
+        """
+        ,
+        (int(candidate_id),),
+    ).fetchall()
+    return [str(row[0]) for row in rows if row and row[0]]
 
 
 def build_quality_gate(settings: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -326,6 +344,181 @@ def build_quality_gate(settings: dict[str, Any] | None = None) -> dict[str, Any]
                 }
                 duplicate_amplified_promotions.append(payload)
                 relation_review_rows.append(payload)
+
+        blocked_official_rows = conn.execute(
+            """
+            SELECT
+                rc.id,
+                rc.entity_a_id,
+                rc.entity_b_id,
+                rc.candidate_type,
+                rc.candidate_state,
+                COALESCE(rc.promotion_block_reason, '') AS promotion_block_reason,
+                COALESCE(rc.evidence_mix_json, '{}') AS evidence_mix_json,
+                COALESCE(rc.explain_path_json, '[]') AS explain_path_json,
+                COALESCE(ea.entity_type, '') AS entity_a_type,
+                COALESCE(ea.canonical_name, '') AS entity_a_name,
+                COALESCE(eb.entity_type, '') AS entity_b_type,
+                COALESCE(eb.canonical_name, '') AS entity_b_name,
+                COALESCE(rc.support_items, 0),
+                COALESCE(rc.support_sources, 0),
+                COALESCE(rc.support_domains, 0),
+                COALESCE(rc.support_hard_evidence_count, 0)
+            FROM relation_candidates rc
+            LEFT JOIN entities ea ON ea.id = rc.entity_a_id
+            LEFT JOIN entities eb ON eb.id = rc.entity_b_id
+            WHERE rc.candidate_state IN ('seed_only', 'review', 'pending')
+              AND COALESCE(rc.support_hard_evidence_count, 0) >= 1
+              AND COALESCE(rc.promotion_block_reason, '') <> ''
+            ORDER BY rc.id
+            """
+        ).fetchall()
+        blocked_official_candidates: list[dict[str, Any]] = []
+        for row in blocked_official_rows:
+            (
+                candidate_id,
+                entity_a_id,
+                entity_b_id,
+                candidate_type,
+                candidate_state,
+                promotion_block_reason,
+                evidence_mix_json,
+                explain_path_json,
+                entity_a_type,
+                entity_a_name,
+                entity_b_type,
+                entity_b_name,
+                support_items,
+                support_sources,
+                support_domains,
+                support_hard_evidence_count,
+            ) = row
+            evidence_mix = _parse_json(evidence_mix_json, {})
+            explain_path = _parse_json(explain_path_json, [])
+            issue = ""
+            if promotion_block_reason == "official_bridge_missing":
+                issue = "blocked_official_bridge"
+            elif promotion_block_reason == "low_entity_specificity":
+                issue = "low_specificity_entity"
+            elif promotion_block_reason == "duplicate_amplified_support":
+                issue = "duplicate_amplified_support"
+            elif promotion_block_reason in {"same_case_requires_nonseed_bridge", "same_case_requires_evidence_bridge"}:
+                issue = "seed_flood_same_case"
+            if not issue:
+                continue
+            payload = {
+                "candidate_id": int(candidate_id),
+                "issue": issue,
+                "candidate_type": candidate_type,
+                "candidate_state": candidate_state,
+                "promotion_block_reason": promotion_block_reason,
+                "entity_a_id": int(entity_a_id),
+                "entity_b_id": int(entity_b_id),
+                "entity_a_type": entity_a_type,
+                "entity_a_name": entity_a_name,
+                "entity_b_type": entity_b_type,
+                "entity_b_name": entity_b_name,
+                "support_items": int(support_items or 0),
+                "support_sources": int(support_sources or 0),
+                "support_domains": int(support_domains or 0),
+                "support_hard_evidence_count": int(support_hard_evidence_count or 0),
+                "bridge_types": [str(node.get("node_type") or "") for node in explain_path if isinstance(node, dict)],
+                "evidence_mix": evidence_mix,
+                "source_links": _relation_source_links(conn, int(candidate_id)),
+            }
+            blocked_official_candidates.append(payload)
+            relation_review_rows.append(payload)
+
+        blocked_seed_rows = conn.execute(
+            """
+            SELECT
+                rc.id,
+                rc.entity_a_id,
+                rc.entity_b_id,
+                rc.candidate_type,
+                rc.candidate_state,
+                COALESCE(rc.promotion_block_reason, '') AS promotion_block_reason,
+                COALESCE(rc.evidence_mix_json, '{}') AS evidence_mix_json,
+                COALESCE(rc.explain_path_json, '[]') AS explain_path_json,
+                COALESCE(ea.entity_type, '') AS entity_a_type,
+                COALESCE(ea.canonical_name, '') AS entity_a_name,
+                COALESCE(eb.entity_type, '') AS entity_b_type,
+                COALESCE(eb.canonical_name, '') AS entity_b_name,
+                COALESCE(rc.support_items, 0),
+                COALESCE(rc.support_sources, 0),
+                COALESCE(rc.support_domains, 0),
+                COALESCE(rc.support_hard_evidence_count, 0),
+                COALESCE(rf.calibrated_score, rc.calibrated_score, 0)
+            FROM relation_candidates rc
+            LEFT JOIN entities ea ON ea.id = rc.entity_a_id
+            LEFT JOIN entities eb ON eb.id = rc.entity_b_id
+            LEFT JOIN relation_features rf ON rf.candidate_id = rc.id
+            WHERE rc.candidate_state IN ('seed_only', 'review', 'pending')
+              AND COALESCE(rc.promotion_block_reason, '') IN (
+                  'same_case_requires_nonseed_bridge',
+                  'same_case_requires_evidence_bridge',
+                  'low_entity_specificity',
+                  'duplicate_amplified_support'
+              )
+            ORDER BY COALESCE(rf.calibrated_score, rc.calibrated_score, 0) DESC, rc.id
+            LIMIT 200
+            """
+        ).fetchall()
+        blocked_seed_candidates: list[dict[str, Any]] = []
+        for row in blocked_seed_rows:
+            (
+                candidate_id,
+                entity_a_id,
+                entity_b_id,
+                candidate_type,
+                candidate_state,
+                promotion_block_reason,
+                evidence_mix_json,
+                explain_path_json,
+                entity_a_type,
+                entity_a_name,
+                entity_b_type,
+                entity_b_name,
+                support_items,
+                support_sources,
+                support_domains,
+                support_hard_evidence_count,
+                calibrated_score,
+            ) = row
+            evidence_mix = _parse_json(evidence_mix_json, {})
+            explain_path = _parse_json(explain_path_json, [])
+            issue = ""
+            if promotion_block_reason in {"same_case_requires_nonseed_bridge", "same_case_requires_evidence_bridge"}:
+                issue = "seed_flood_same_case"
+            elif promotion_block_reason == "low_entity_specificity":
+                issue = "low_specificity_entity"
+            elif promotion_block_reason == "duplicate_amplified_support":
+                issue = "duplicate_amplified_support"
+            if not issue:
+                continue
+            payload = {
+                "candidate_id": int(candidate_id),
+                "issue": issue,
+                "candidate_type": candidate_type,
+                "candidate_state": candidate_state,
+                "promotion_block_reason": promotion_block_reason,
+                "entity_a_id": int(entity_a_id),
+                "entity_b_id": int(entity_b_id),
+                "entity_a_type": entity_a_type,
+                "entity_a_name": entity_a_name,
+                "entity_b_type": entity_b_type,
+                "entity_b_name": entity_b_name,
+                "support_items": int(support_items or 0),
+                "support_sources": int(support_sources or 0),
+                "support_domains": int(support_domains or 0),
+                "support_hard_evidence_count": int(support_hard_evidence_count or 0),
+                "calibrated_score": float(calibrated_score or 0.0),
+                "bridge_types": [str(node.get("node_type") or "") for node in explain_path if isinstance(node, dict)],
+                "evidence_mix": evidence_mix,
+                "source_links": _relation_source_links(conn, int(candidate_id)),
+            }
+            blocked_seed_candidates.append(payload)
+            relation_review_rows.append(payload)
 
         suppressed_claims = int(
             conn.execute(
@@ -542,6 +735,8 @@ def build_quality_gate(settings: dict[str, Any] | None = None) -> dict[str, Any]
                 ],
                 "promoted_without_nonseed_bridge_rows": promoted_without_nonseed_bridge,
                 "duplicate_amplified_promotion_rows": duplicate_amplified_promotions,
+                "blocked_official_candidates": blocked_official_candidates,
+                "blocked_seed_candidates": blocked_seed_candidates,
             },
             "dedupe_leakage": {
                 "suppressed_claims": suppressed_claims,
