@@ -78,11 +78,108 @@ class AiSweepTests(unittest.TestCase):
         from analysis.ai_sweep import _detect_failure_kind
 
         self.assertEqual(_detect_failure_kind('429 {"error":{"message":"Rate limit reached"}}'), "rate")
-        self.assertEqual(_detect_failure_kind('400 {"message":"WebSearchTool connector is not supported","type":"invalid_tools"}'), "provider_model")
-        self.assertEqual(_detect_failure_kind('400 {"error":{"message":"openrouter:auto:online is not a valid model ID"}}'), "provider_model")
+        self.assertEqual(_detect_failure_kind('400 {"message":"WebSearchTool connector is not supported","type":"invalid_tools"}'), "unsupported_tool")
+        self.assertEqual(_detect_failure_kind('400 {"error":{"message":"openrouter:auto:online is not a valid model ID"}}'), "invalid_model")
+        self.assertEqual(_detect_failure_kind("provider returned bad response shape: missing output_json"), "bad_response_shape")
         self.assertEqual(_detect_failure_kind("invalid json response from provider"), "invalid_output")
         self.assertEqual(_detect_failure_kind("schema_violation: source-only stage returned external_context"), "schema_violation")
         self.assertEqual(_detect_failure_kind('401 invalid api key'), "auth")
+
+    def test_run_provider_budget_skips_exhausted_provider_for_stage(self):
+        from analysis.ai_sweep import RunProviderBudget
+
+        budget = RunProviderBudget(max_failures_per_provider_stage=2)
+        priority = ["mistral", "groq", "openrouter"]
+
+        self.assertEqual(budget.allowed_priority("structured_extract", priority), priority)
+        budget.record_failure("structured_extract", "mistral", "timeout")
+        self.assertEqual(budget.allowed_priority("structured_extract", priority), priority)
+        budget.record_failure("structured_extract", "mistral", "rate")
+
+        self.assertEqual(budget.allowed_priority("structured_extract", priority), ["groq", "openrouter"])
+        self.assertEqual(budget.allowed_priority("tag_reasoning", priority), priority)
+
+    def test_ai_sweep_doctor_reports_provider_stage_health_without_mutating(self):
+        from analysis.ai_sweep import build_ai_sweep_doctor
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "ai.db"
+            create_db(db_path)
+            conn = sqlite3.connect(db_path)
+            try:
+                conn.executescript(
+                    """
+                    INSERT INTO llm_keys(provider, api_key, key_hash, status)
+                    VALUES
+                        ('mistral', 'key-a', 'hash-a', 'active'),
+                        ('mistral', 'key-b', 'hash-b', 'removed'),
+                        ('groq', 'key-c', 'hash-c', 'cooldown');
+                    INSERT INTO ai_work_items(id, unit_kind, unit_key, stage, prompt_version, status)
+                    VALUES
+                        (7001, 'content_item', 'content:12', 'structured_extract', 'ai-sweep-v3-extract', 'pending'),
+                        (7002, 'content_item', 'content:13', 'tag_reasoning', 'ai-sweep-v3-tags', 'failed');
+                    INSERT INTO ai_task_attempts(work_item_id, provider, model_name, status, failure_kind, error_text)
+                    VALUES
+                        (7001, 'mistral', 'mistral-medium', 'failed', 'timeout', 'timeout');
+                    """
+                )
+                conn.commit()
+                before = conn.total_changes
+                report = build_ai_sweep_doctor({"db_path": str(db_path), "ensure_schema_on_connect": False})
+                after = conn.total_changes
+            finally:
+                conn.close()
+
+            self.assertEqual(before, after)
+            self.assertEqual(report["active_keys"]["mistral"], 1)
+            self.assertEqual(report["removed_keys"]["mistral"], 1)
+            self.assertEqual(report["cooldown_keys"]["groq"], 1)
+            self.assertEqual(report["pending_work_items"], 1)
+            self.assertEqual(report["failed_work_items"], 1)
+            self.assertEqual(report["provider_stage_failures"]["mistral:structured_extract"]["timeout"], 1)
+
+    def test_focused_event_linking_sampling_prioritizes_multi_item_clusters(self):
+        from analysis.ai_sweep import canonicalize_units, ensure_ai_sweep_campaign
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "ai.db"
+            create_db(db_path)
+
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            try:
+                conn.executescript(
+                    """
+                    INSERT INTO content_items(id, source_id, external_id, content_type, title, body_text, published_at, url, status)
+                    VALUES
+                        (21, 1, 'tg-21', 'post', 'Ещё один одиночный пост', 'Нет общего события', '2026-04-25T09:00:00', 'https://t.me/test/21', 'raw_signal'),
+                        (22, 1, 'tg-22', 'post', 'Повтор истории', 'Та же блокировка', '2026-04-20T11:00:00', 'https://t.me/test/22', 'raw_signal'),
+                        (23, 1, 'tg-23', 'post', 'Повтор истории 2', 'Та же блокировка', '2026-04-20T12:00:00', 'https://t.me/test/23', 'raw_signal');
+                    INSERT INTO content_cluster_items(cluster_id, content_item_id, similarity_score, reason, is_canonical)
+                    VALUES (101, 22, 0.91, 'story-update', 0), (101, 23, 0.90, 'story-update', 0);
+                    UPDATE content_clusters SET item_count=5 WHERE id=101;
+                    """
+                )
+                conn.commit()
+                units = canonicalize_units(conn)
+                campaign = ensure_ai_sweep_campaign(
+                    conn,
+                    {
+                        "ai_sweep": {
+                            "campaign_seed": "focused",
+                            "campaign_key": "pilot:focused",
+                            "pilot_target_units": 2,
+                            "pilot_distribution": {"content_cluster": 1, "content_item": 1},
+                            "sample_strategy": "focused_event_linking",
+                        }
+                    },
+                    units,
+                )
+            finally:
+                conn.close()
+
+            self.assertEqual(campaign["selection"][0]["unit_kind"], "content_cluster")
+            self.assertEqual(campaign["selection"][0]["unit_key"], "cluster:telegram-block")
 
     def test_source_only_stage_rejects_ungrounded_external_context(self):
         from analysis.ai_sweep import _validate_stage_result
@@ -804,6 +901,48 @@ class AiSweepTests(unittest.TestCase):
             self.assertEqual(candidate["candidate_state"], "standalone")
             self.assertIsNone(candidate["suggested_event_id"])
             self.assertIn("gate_failed", candidate["suggestion_json"])
+
+    def test_candidate_events_include_timeline_roles_facts_and_document_context(self):
+        from analysis.ai_sweep import _build_unit_context, _candidate_events_for_unit
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "ai.db"
+            create_db(db_path)
+
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            try:
+                conn.executescript(
+                    """
+                    INSERT INTO event_timeline(event_id, timeline_date, title, description, sort_order)
+                    VALUES(201, '2026-04-20T08:00:00', 'Решение о блокировке', 'Официальное решение', 1);
+                    INSERT INTO event_facts(event_id, fact_type, canonical_text, confidence)
+                    VALUES(201, 'restriction', 'Правительство ограничило доступ к Telegram', 0.9);
+                    INSERT INTO fact_evidence(fact_id, content_item_id, evidence_class, source_strength)
+                    SELECT id, 12, 'hard', 1.0 FROM event_facts WHERE event_id=201;
+                    """
+                )
+                conn.commit()
+                unit = {
+                    "unit_kind": "content_item",
+                    "unit_key": "content:12",
+                    "content_item_id": 12,
+                    "canonical_content_id": 12,
+                    "title": "Документ 12",
+                    "published_at": "2026-04-20T08:00:00",
+                }
+                context = _build_unit_context(conn, unit)
+                candidates = _candidate_events_for_unit(conn, unit, context)
+            finally:
+                conn.close()
+
+            self.assertTrue(candidates)
+            candidate = candidates[0]
+            self.assertEqual(candidate["event_id"], 201)
+            self.assertIn("timeline_anchors", candidate)
+            self.assertIn("entity_roles", candidate)
+            self.assertIn("facts", candidate)
+            self.assertIn("official_docs", candidate)
 
     def test_run_ai_full_sweep_tolerates_invalid_event_link_id_from_model(self):
         from analysis.ai_sweep import run_ai_full_sweep

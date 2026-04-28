@@ -328,6 +328,10 @@ def _ai_sweep_maintenance(settings: dict[str, Any]):
         conn.close()
 
 
+def _ai_sweep_doctor(settings: dict[str, Any]):
+    return __import__("analysis.ai_sweep", fromlist=["build_ai_sweep_doctor"]).build_ai_sweep_doctor(settings)
+
+
 def _asr(settings: dict[str, Any]):
     return __import__("media_pipeline.asr", fromlist=["process_untranscribed_videos"]).process_untranscribed_videos()
 
@@ -518,6 +522,7 @@ JOB_SPECS = [
     JobSpec("semantic_index", "Semantic index", "Анализ", 43200, "semantic_index_interval_seconds", "analysis", timeout_seconds=7200, runner=_semantic_index),
     JobSpec("event_pipeline", "Event pipeline", "Анализ", 43200, "event_pipeline_interval_seconds", "analysis", timeout_seconds=7200, runner=_event_pipeline),
     JobSpec("ai_full_sweep", "AI Sweep", "AI", 86400, "ai_full_sweep_interval_seconds", "ai", timeout_seconds=43200, scheduled=False, runner=_ai_full_sweep),
+    JobSpec("ai_sweep_doctor", "AI Sweep doctor", "AI", 86400, "ai_sweep_doctor_interval_seconds", "ai", timeout_seconds=600, scheduled=False, runner=_ai_sweep_doctor),
     JobSpec("ai_sweep_maintenance", "AI Sweep maintenance", "AI", 86400, "ai_sweep_maintenance_interval_seconds", "ai", timeout_seconds=1800, scheduled=False, visible=False, runner=_ai_sweep_maintenance),
     JobSpec("asr", "ASR (Whisper)", "Медиа", 3600, None, "media", timeout_seconds=7200, runner=_asr),
     JobSpec("ocr", "OCR (PaddleOCR)", "Медиа", 3600, None, "media", timeout_seconds=7200, runner=_ocr),

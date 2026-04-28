@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -107,6 +108,7 @@ def _ai_settings(settings: dict[str, Any]) -> dict[str, Any]:
     cfg.setdefault("max_parallel_workers", 24)
     cfg.setdefault("dead_key_threshold", 3)
     cfg.setdefault("max_units_per_run", 0)
+    cfg.setdefault("max_failures_per_provider_stage", 25)
     cfg.setdefault("provider_priority", ["mistral", "perplexity", "groq", "openrouter", "openai"])
     cfg.setdefault("mode", "pilot")
     cfg.setdefault("campaign_seed", "ai-pilot-2026-04-27")
@@ -147,6 +149,44 @@ def _stage_provider_priority(stage: str, settings: dict[str, Any]) -> list[str]:
         "event_synthesis": ["openai", "perplexity", "openrouter"],
     }
     return list(stage_specific.get(stage) or _provider_priority(settings))
+
+
+BUDGETED_FAILURE_KINDS = {
+    "rate",
+    "timeout",
+    "provider_model",
+    "invalid_model",
+    "unsupported_tool",
+    "bad_response_shape",
+}
+
+
+class RunProviderBudget:
+    """Shared run-level guard against provider/stage failure storms."""
+
+    def __init__(self, *, max_failures_per_provider_stage: int = 25) -> None:
+        self.max_failures_per_provider_stage = max(1, int(max_failures_per_provider_stage or 1))
+        self._failures: dict[tuple[str, str], int] = {}
+        self._lock = threading.Lock()
+
+    def record_failure(self, stage: str, provider: str, failure_kind: str) -> None:
+        if failure_kind not in BUDGETED_FAILURE_KINDS:
+            return
+        key = (str(stage), str(provider))
+        with self._lock:
+            self._failures[key] = self._failures.get(key, 0) + 1
+
+    def is_exhausted(self, stage: str, provider: str) -> bool:
+        key = (str(stage), str(provider))
+        with self._lock:
+            return self._failures.get(key, 0) >= self.max_failures_per_provider_stage
+
+    def allowed_priority(self, stage: str, provider_priority: list[str]) -> list[str]:
+        return [provider for provider in provider_priority if not self.is_exhausted(stage, provider)]
+
+    def snapshot(self) -> dict[str, int]:
+        with self._lock:
+            return {f"{stage}:{provider}": count for (stage, provider), count in sorted(self._failures.items())}
 
 
 def _bootstrap_key_pool(conn: sqlite3.Connection, settings: dict[str, Any]) -> dict[str, Any]:
@@ -310,10 +350,21 @@ def _unit_sample_bucket(unit: dict[str, Any]) -> str:
     return kind if kind in {"content_item", "content_cluster", "event", "review_task"} else "other"
 
 
-def _unit_priority(unit: dict[str, Any]) -> tuple[int, int]:
+def _unit_priority(unit: dict[str, Any], sample_strategy: str = "") -> tuple[int, int]:
     bucket = _unit_sample_bucket(unit)
     content_type = str(unit.get("content_type") or "").strip().lower()
     source_category = str(unit.get("source_category") or unit.get("queue_key") or "").strip().lower()
+    strategy = str(sample_strategy or "").strip().lower()
+    if strategy == "focused_event_linking":
+        if bucket == "content_cluster":
+            item_count = int(unit.get("item_count") or 0)
+            if item_count >= 3:
+                return (0, -item_count)
+            return (2, -item_count)
+        if bucket == "content_item":
+            return (3, 0)
+        if bucket == "event":
+            return (4, 0)
     if bucket == "review_task":
         queue_order = {"relations": 0, "content_duplicates": 1, "sources": 2}
         return (queue_order.get(source_category, 3), 0)
@@ -331,6 +382,7 @@ def _stable_rank(seed: str, unit_key: str) -> str:
 def _build_campaign_selection(units: list[dict[str, Any]], settings: dict[str, Any]) -> list[dict[str, Any]]:
     cfg = _ai_settings(settings)
     seed = str(cfg.get("campaign_seed") or "ai-pilot")
+    sample_strategy = str(cfg.get("sample_strategy") or "")
     target = int(cfg.get("pilot_target_units") or 232)
     quotas = {str(key): int(value or 0) for key, value in dict(cfg.get("pilot_distribution") or {}).items()}
     grouped: dict[str, list[dict[str, Any]]] = {}
@@ -341,7 +393,7 @@ def _build_campaign_selection(units: list[dict[str, Any]], settings: dict[str, A
     used: set[tuple[str, str]] = set()
 
     def _ordered(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        return sorted(items, key=lambda unit: (_unit_priority(unit), _stable_rank(seed, str(unit["unit_key"])), str(unit["unit_key"])))
+        return sorted(items, key=lambda unit: (_unit_priority(unit, sample_strategy), _stable_rank(seed, str(unit["unit_key"])), str(unit["unit_key"])))
 
     for bucket, quota in quotas.items():
         for unit in _ordered(grouped.get(bucket, []))[: max(0, quota)]:
@@ -599,6 +651,114 @@ def _time_overlap(unit_time: Any, event_start: Any, event_end: Any, *, days: int
     return min(delta_start, delta_end) <= days * 86400
 
 
+def _candidate_event_context(conn: sqlite3.Connection, event_id: int) -> dict[str, Any]:
+    timeline_anchors: list[dict[str, Any]] = []
+    if _table_exists(conn, "event_timeline"):
+        rows = conn.execute(
+            """
+            SELECT timeline_date, title, description
+            FROM event_timeline
+            WHERE event_id=?
+            ORDER BY COALESCE(sort_order, 999999), COALESCE(timeline_date, ''), id
+            LIMIT 5
+            """,
+            (event_id,),
+        ).fetchall()
+        timeline_anchors = [
+            {
+                "date": row["timeline_date"] if isinstance(row, sqlite3.Row) else row[0],
+                "title": row["title"] if isinstance(row, sqlite3.Row) else row[1],
+                "description": row["description"] if isinstance(row, sqlite3.Row) else row[2],
+            }
+            for row in rows
+        ]
+
+    entity_roles: list[dict[str, Any]] = []
+    if _table_exists(conn, "event_entities") and _table_exists(conn, "entities"):
+        rows = conn.execute(
+            """
+            SELECT ee.entity_id, ee.role, e.canonical_name, e.entity_type
+            FROM event_entities ee
+            JOIN entities e ON e.id = ee.entity_id
+            WHERE ee.event_id=?
+            ORDER BY COALESCE(ee.confidence, 0) DESC, ee.id
+            LIMIT 12
+            """,
+            (event_id,),
+        ).fetchall()
+        entity_roles = [
+            {
+                "entity_id": int(row["entity_id"] if isinstance(row, sqlite3.Row) else row[0]),
+                "role": row["role"] if isinstance(row, sqlite3.Row) else row[1],
+                "canonical_name": row["canonical_name"] if isinstance(row, sqlite3.Row) else row[2],
+                "entity_type": row["entity_type"] if isinstance(row, sqlite3.Row) else row[3],
+            }
+            for row in rows
+        ]
+
+    facts: list[dict[str, Any]] = []
+    if _table_exists(conn, "event_facts"):
+        rows = conn.execute(
+            """
+            SELECT id, fact_type, canonical_text, confidence
+            FROM event_facts
+            WHERE event_id=?
+            ORDER BY COALESCE(confidence, 0) DESC, id
+            LIMIT 8
+            """,
+            (event_id,),
+        ).fetchall()
+        facts = [
+            {
+                "fact_id": int(row["id"] if isinstance(row, sqlite3.Row) else row[0]),
+                "fact_type": row["fact_type"] if isinstance(row, sqlite3.Row) else row[1],
+                "canonical_text": row["canonical_text"] if isinstance(row, sqlite3.Row) else row[2],
+                "confidence": float((row["confidence"] if isinstance(row, sqlite3.Row) else row[3]) or 0.0),
+            }
+            for row in rows
+        ]
+
+    official_docs: list[dict[str, Any]] = []
+    if _table_exists(conn, "event_facts") and _table_exists(conn, "fact_evidence") and _table_exists(conn, "content_items"):
+        rows = conn.execute(
+            """
+            SELECT DISTINCT ci.id, ci.title, ci.url, ci.content_type, fe.evidence_class
+            FROM event_facts ef
+            JOIN fact_evidence fe ON fe.fact_id = ef.id
+            JOIN content_items ci ON ci.id = fe.content_item_id
+            WHERE ef.event_id=?
+              AND (
+                    COALESCE(fe.evidence_class, '')='hard'
+                 OR COALESCE(ci.content_type, '') IN (
+                    'restriction_record', 'registry_record', 'official_profile', 'declaration',
+                    'bill', 'court_record', 'procurement', 'official_document'
+                 )
+                 OR COALESCE(ci.status, '') IN ('official_document', 'verified')
+              )
+            ORDER BY ci.id
+            LIMIT 8
+            """,
+            (event_id,),
+        ).fetchall()
+        official_docs = [
+            {
+                "content_item_id": int(row["id"] if isinstance(row, sqlite3.Row) else row[0]),
+                "title": row["title"] if isinstance(row, sqlite3.Row) else row[1],
+                "url": row["url"] if isinstance(row, sqlite3.Row) else row[2],
+                "content_type": row["content_type"] if isinstance(row, sqlite3.Row) else row[3],
+                "evidence_class": row["evidence_class"] if isinstance(row, sqlite3.Row) else row[4],
+            }
+            for row in rows
+        ]
+
+    return {
+        "timeline_anchors": timeline_anchors,
+        "entity_roles": entity_roles,
+        "facts": facts,
+        "official_docs": official_docs,
+    }
+
+
 def _candidate_events_for_unit(conn: sqlite3.Connection, unit: dict[str, Any], context: dict[str, Any], *, limit: int = 12) -> list[dict[str, Any]]:
     if not _table_exists(conn, "events"):
         return []
@@ -639,8 +799,7 @@ def _candidate_events_for_unit(conn: sqlite3.Connection, unit: dict[str, Any], c
             score += 1
         if not reasons:
             continue
-        candidates.append(
-            {
+        candidate = {
                 "event_id": event_id,
                 "canonical_title": event_title,
                 "event_type": row["event_type"] if isinstance(row, sqlite3.Row) else row[2],
@@ -648,8 +807,9 @@ def _candidate_events_for_unit(conn: sqlite3.Connection, unit: dict[str, Any], c
                 "event_date_end": event_end,
                 "overlap_reasons": reasons,
                 "retrieval_score": score,
-            }
-        )
+        }
+        candidate.update(_candidate_event_context(conn, event_id))
+        candidates.append(candidate)
     candidates.sort(key=lambda item: (-int(item["retrieval_score"]), str(item.get("event_date_start") or ""), int(item["event_id"])))
     return candidates[:limit]
 
@@ -1935,15 +2095,25 @@ def _detect_failure_kind(error_text: str) -> str:
     lowered = (error_text or "").lower()
     if "schema_violation" in lowered or "ungrounded" in lowered or "external_context" in lowered:
         return "schema_violation"
+    if "bad response shape" in lowered or "missing output_json" in lowered or "missing required" in lowered or "unexpected response shape" in lowered:
+        return "bad_response_shape"
     if "invalid json" in lowered or "invalid_output" in lowered or "json decode" in lowered:
         return "invalid_output"
     if (
         "invalid_tools" in lowered
         or "connector is not supported" in lowered
-        or "not a valid model id" in lowered
-        or "invalid model" in lowered
-        or "unsupported_provider" in lowered
+        or "unsupported tool" in lowered
+        or "tool is not supported" in lowered
     ):
+        return "unsupported_tool"
+    if (
+        "not a valid model id" in lowered
+        or "invalid model" in lowered
+        or "model not found" in lowered
+        or "model_not_found" in lowered
+    ):
+        return "invalid_model"
+    if "unsupported_provider" in lowered:
         return "provider_model"
     if (
         "429" in lowered
@@ -1976,6 +2146,7 @@ def _worker_run(
     input_hash: str,
     payload: dict[str, Any],
     work_item_id: int,
+    provider_budget: RunProviderBudget | None = None,
 ) -> dict[str, Any]:
     worker_settings = dict(settings)
     worker_settings["ensure_schema_on_connect"] = False
@@ -2002,7 +2173,20 @@ def _worker_run(
                     "attempts": failures,
                     "error": "ai_task_retry_budget_exhausted",
                 }
-            chosen = choose_key_for_stage(conn, stage=stage, provider_priority=priority, exclude_key_ids=exclude)
+            stage_priority = provider_budget.allowed_priority(stage, priority) if provider_budget else priority
+            if not stage_priority:
+                return {
+                    "ok": False,
+                    "work_item_id": work_item_id,
+                    "unit": unit,
+                    "stage": stage,
+                    "prompt_version": prompt_version,
+                    "input_hash": input_hash,
+                    "payload": payload,
+                    "attempts": failures,
+                    "error": "stage_provider_budget_exhausted",
+                }
+            chosen = choose_key_for_stage(conn, stage=stage, provider_priority=stage_priority, exclude_key_ids=exclude)
             if not chosen:
                 return {
                     "ok": False,
@@ -2045,6 +2229,8 @@ def _worker_run(
             except Exception as error:  # pragma: no cover - exercised via higher-level retry behavior
                 failure_text = str(error)
                 failure_kind = _detect_failure_kind(failure_text)
+                if provider_budget:
+                    provider_budget.record_failure(stage, provider, failure_kind)
                 record = record_key_failure(
                     conn,
                     key_id,
@@ -2093,6 +2279,65 @@ def _effective_worker_count(conn: sqlite3.Connection, settings: dict[str, Any], 
     if int(active_keys or 0) <= 0:
         return 1
     return max(1, min(maximum, int(active_keys), desired))
+
+
+def build_ai_sweep_doctor(settings: dict[str, Any]) -> dict[str, Any]:
+    doctor_settings = dict(settings)
+    doctor_settings["ensure_schema_on_connect"] = False
+    conn = get_db(doctor_settings)
+    conn.row_factory = sqlite3.Row
+    try:
+        key_rows = conn.execute(
+            """
+            SELECT provider, status, COUNT(*) AS total
+            FROM llm_keys
+            GROUP BY provider, status
+            ORDER BY provider, status
+            """
+        ).fetchall() if _table_exists(conn, "llm_keys") else []
+        work_rows = conn.execute(
+            """
+            SELECT status, COUNT(*) AS total
+            FROM ai_work_items
+            GROUP BY status
+            """
+        ).fetchall() if _table_exists(conn, "ai_work_items") else []
+        failure_rows = conn.execute(
+            """
+            SELECT aw.stage,
+                   COALESCE(ata.provider, 'unknown') AS provider,
+                   COALESCE(NULLIF(TRIM(ata.failure_kind), ''), 'unknown') AS failure_kind,
+                   COUNT(*) AS total
+            FROM ai_task_attempts ata
+            JOIN ai_work_items aw ON aw.id = ata.work_item_id
+            WHERE ata.status <> 'ok'
+            GROUP BY aw.stage, COALESCE(ata.provider, 'unknown'), COALESCE(NULLIF(TRIM(ata.failure_kind), ''), 'unknown')
+            ORDER BY total DESC, aw.stage, provider, failure_kind
+            """
+        ).fetchall() if _table_exists(conn, "ai_task_attempts") and _table_exists(conn, "ai_work_items") else []
+        key_status: dict[str, dict[str, int]] = {}
+        for row in key_rows:
+            key_status.setdefault(str(row["provider"]), {})[str(row["status"])] = int(row["total"] or 0)
+        work_status = {str(row["status"]): int(row["total"] or 0) for row in work_rows}
+        provider_stage_failures: dict[str, dict[str, int]] = {}
+        for row in failure_rows:
+            key = f"{row['provider']}:{row['stage']}"
+            provider_stage_failures.setdefault(key, {})[str(row["failure_kind"])] = int(row["total"] or 0)
+        return {
+            "ok": True,
+            "generated_at": now_iso(),
+            "key_status": key_status,
+            "active_keys": {provider: statuses.get("active", 0) for provider, statuses in key_status.items()},
+            "removed_keys": {provider: statuses.get("removed", 0) for provider, statuses in key_status.items()},
+            "cooldown_keys": {provider: statuses.get("cooldown", 0) for provider, statuses in key_status.items()},
+            "work_item_status": work_status,
+            "pending_work_items": int(work_status.get("pending", 0)),
+            "running_work_items": int(work_status.get("running", 0)),
+            "failed_work_items": int(work_status.get("failed", 0)),
+            "provider_stage_failures": provider_stage_failures,
+        }
+    finally:
+        conn.close()
 
 
 def _record_attempts(conn: sqlite3.Connection, work_item_id: int, attempts: list[dict[str, Any]], final_result: dict[str, Any] | None = None) -> int:
@@ -2262,6 +2507,9 @@ def run_ai_full_sweep(settings: dict[str, Any]) -> dict[str, Any]:
         _mark_work_item_running(conn, int(row["id"]), owner)
 
     futures = {}
+    provider_budget = RunProviderBudget(
+        max_failures_per_provider_stage=int(cfg.get("max_failures_per_provider_stage") or 25)
+    )
     with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="ai-sweep") as executor:
         for row in work_rows:
             unit = unit_index[(row["unit_kind"], row["unit_key"])]
@@ -2275,6 +2523,7 @@ def run_ai_full_sweep(settings: dict[str, Any]) -> dict[str, Any]:
                 str(row["input_hash"] or _hash_payload(payload)),
                 payload,
                 int(row["id"]),
+                provider_budget,
             )
             futures[future] = int(row["id"])
 
@@ -2360,6 +2609,7 @@ def run_ai_full_sweep(settings: dict[str, Any]) -> dict[str, Any]:
         "items_updated": items_updated,
         "attempts": attempts,
         "worker_count": worker_count,
+        "provider_stage_failure_budget": provider_budget.snapshot(),
         "warnings": warnings,
         "retriable_errors": retriable_errors,
         "fatal_errors": fatal_errors,

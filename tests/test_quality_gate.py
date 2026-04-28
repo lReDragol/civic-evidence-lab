@@ -21,6 +21,20 @@ def create_quality_db(db_path: Path):
 
 
 class QualityGateTests(unittest.TestCase):
+    def test_quality_report_sections_accept_top_level_and_runtime_artifacts_shape(self):
+        from quality.pipeline_gate import quality_report_sections
+
+        top_level = {
+            "relation_quality": {"promoted_same_case_cluster": 0},
+            "ai_sweep": {"failure_kind_breakdown": {"rate": 1}},
+            "event_linking": {"link_existing_count": 2},
+            "source_health": {"degraded_count": 0},
+        }
+        runtime_shape = {"artifacts": top_level}
+
+        self.assertEqual(quality_report_sections(top_level)["event_linking"]["link_existing_count"], 2)
+        self.assertEqual(quality_report_sections(runtime_shape)["ai_sweep"]["failure_kind_breakdown"]["rate"], 1)
+
     def test_quality_gate_fails_on_zero_support_duplicates_and_degraded_sources(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "quality.db"
@@ -372,6 +386,78 @@ class QualityGateTests(unittest.TestCase):
                 conn.close()
 
             self.assertEqual(row, ("relations", "relation_candidate", 901, "needs_more_docs", "blocked_official_bridge"))
+
+    def test_quality_gate_flags_relation_review_backlog_budgets_and_dedupes_tasks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "quality.db"
+            report_path = Path(tmp) / "qa_quality_latest.json"
+            create_quality_db(db_path)
+
+            conn = sqlite3.connect(db_path)
+            try:
+                conn.executescript(
+                    """
+                    INSERT INTO entities(id, entity_type, canonical_name) VALUES
+                        (10, 'organization', 'Министерство юстиции Российской Федерации'),
+                        (11, 'person', 'Панферов Константин Юрьевич');
+
+                    INSERT INTO relation_candidates(
+                        id, entity_a_id, entity_b_id, candidate_type, origin, score, support_items,
+                        support_sources, support_domains, support_hard_evidence_count,
+                        candidate_state, promotion_state, promotion_block_reason, evidence_mix_json, explain_path_json
+                    ) VALUES
+                        (1001, 10, 11, 'same_case_cluster', 'candidate_builder:hybrid', 0.72, 3, 2, 1, 0,
+                         'review', 'review', 'same_case_not_promotable', '{}', '[{"node_type":"Case","ids":[1]}]'),
+                        (1002, 10, 11, 'likely_association', 'candidate_builder:hybrid', 0.72, 1, 1, 1, 1,
+                         'review', 'review', 'official_bridge_missing', '{"official_bridge_count":1,"bridge_types":["OfficialDocument"]}', '[{"node_type":"OfficialDocument","ids":[1]}]');
+
+                    INSERT INTO review_tasks(task_key, queue_key, subject_type, subject_id, candidate_payload, suggested_action, confidence, machine_reason, status)
+                    VALUES
+                        ('relation:1001:same_case_not_promotable', 'relations', 'relation_candidate', 1001, '{}', 'reject', 0.9, 'same_case_not_promotable', 'open'),
+                        ('relation:1001:same_case_not_promotable:dupe', 'relations', 'relation_candidate', 1001, '{}', 'reject', 0.8, 'same_case_not_promotable', 'open'),
+                        ('relation:9999:stale', 'relations', 'relation_candidate', 9999, '{}', 'reject', 0.8, 'stale', 'open');
+
+                    INSERT INTO job_runs(job_id, trigger_mode, requested_by, owner, attempt_no, status, started_at, warnings_json)
+                    VALUES('tagger', 'manual', 'test', 'owner', 1, 'ok', '2026-04-26T00:00:00', '[]');
+                    """
+                )
+                set_runtime_metadata(conn, "classifier_audit_last_status", "ok")
+                set_runtime_metadata(conn, "classifier_audit_last_report", {"reviewed_baseline_ready": True})
+                conn.commit()
+            finally:
+                conn.close()
+
+            result = build_quality_gate(
+                {
+                    "db_path": str(db_path),
+                    "ensure_schema_on_connect": True,
+                    "quality_gate": {
+                        "report_path": str(report_path),
+                        "strict_gate": True,
+                        "max_relations_open_review_tasks": 1,
+                        "max_same_case_review_ratio": 0.4,
+                    },
+                }
+            )
+
+            self.assertFalse(result["ok"])
+            self.assertIn("relation_review_backlog_gate_failed", result["fatal_errors"])
+            relation_quality = result["artifacts"]["relation_quality"]
+            self.assertEqual(relation_quality["relations_open_review_tasks"], 1)
+            self.assertGreater(relation_quality["same_case_review_ratio"], 0.4)
+
+            conn = sqlite3.connect(db_path)
+            try:
+                rows = conn.execute(
+                    "SELECT task_key, status FROM review_tasks WHERE queue_key='relations' ORDER BY task_key"
+                ).fetchall()
+            finally:
+                conn.close()
+
+            statuses = {task_key: status for task_key, status in rows}
+            self.assertEqual(statuses["relation:1001:same_case_not_promotable"], "closed")
+            self.assertEqual(statuses["relation:1001:same_case_not_promotable:dupe"], "closed")
+            self.assertEqual(statuses["relation:9999:stale"], "closed")
 
 
 if __name__ == "__main__":

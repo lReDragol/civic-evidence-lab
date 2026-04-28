@@ -696,7 +696,7 @@ class RelationLayerTests(unittest.TestCase):
             promotion_block_reason=None,
         )
 
-        self.assertEqual(state, "review")
+        self.assertEqual(state, "seed_only")
 
     def test_pair_entity_quality_blocks_all_location_nodes_as_event_roles_only(self):
         score, reason = _pair_entity_quality(

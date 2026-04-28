@@ -34,6 +34,9 @@ DEFAULT_CONFIG = {
     "max_promoted_location_candidates": 0,
     "max_promoted_without_event_fact_or_official_bridge": 0,
     "max_duplicate_amplified_promotions": 0,
+    "max_relations_open_review_tasks": 1500,
+    "max_same_case_review_ratio": 0.60,
+    "max_location_role_only_review_ratio": 0.35,
     "max_duplicate_leakage": 0,
     "report_path": str(PROJECT_ROOT / "reports" / "qa_quality_latest.json"),
 }
@@ -70,6 +73,18 @@ def _report_path(settings: dict[str, Any]) -> Path:
     configured = _config(settings).get("report_path") or DEFAULT_CONFIG["report_path"]
     path = Path(configured)
     return path if path.is_absolute() else (PROJECT_ROOT / path)
+
+
+def quality_report_sections(report: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
+    source = dict(report or {})
+    if isinstance(source.get("artifacts"), dict):
+        source = dict(source["artifacts"])
+    return {
+        "relation_quality": dict(source.get("relation_quality") or {}),
+        "ai_sweep": dict(source.get("ai_sweep") or {}),
+        "event_linking": dict(source.get("event_linking") or {}),
+        "source_health": dict(source.get("source_health") or {}),
+    }
 
 
 def _critical_warning_rows(rows: list[tuple[str, str, str]]) -> list[dict[str, str]]:
@@ -155,20 +170,23 @@ def _sync_source_review_tasks(conn, rows: list[dict[str, Any]]) -> None:
     conn.commit()
 
 
-def _sync_relation_review_tasks(conn, rows: list[dict[str, Any]]) -> None:
+def _sync_relation_review_tasks(conn, rows: list[dict[str, Any]]) -> set[str]:
     if not rows:
-        return
+        return set()
     try:
         from enrichment.common import ensure_review_task
     except Exception:
-        return
+        return set()
+    active_task_keys: set[str] = set()
     for row in rows:
         suggested_action = "reject"
         if row["issue"] in {"promoted_without_nonseed_bridge", "promoted_without_event_fact_or_official_bridge", "blocked_official_bridge"}:
             suggested_action = "needs_more_docs"
+        task_key = f"relation:{row['candidate_id']}:{row['issue']}"
+        active_task_keys.add(task_key)
         ensure_review_task(
             conn,
-            task_key=f"relation:{row['candidate_id']}:{row['issue']}",
+            task_key=task_key,
             queue_key="relations",
             subject_type="relation_candidate",
             subject_id=int(row["candidate_id"]),
@@ -179,6 +197,61 @@ def _sync_relation_review_tasks(conn, rows: list[dict[str, Any]]) -> None:
             source_links=row.get("source_links", []),
         )
     conn.commit()
+    return active_task_keys
+
+
+def _cleanup_relation_review_tasks(conn, active_task_keys: set[str]) -> dict[str, int]:
+    rows = conn.execute(
+        """
+        SELECT id, task_key, subject_id, machine_reason
+        FROM review_tasks
+        WHERE queue_key='relations'
+          AND COALESCE(status, 'open')='open'
+        ORDER BY COALESCE(subject_id, -1), COALESCE(machine_reason, ''), id
+        """
+    ).fetchall()
+    seen: set[tuple[int | None, str]] = set()
+    stale_ids: list[int] = []
+    duplicate_ids: list[int] = []
+    for row in rows:
+        task_id = int(row[0])
+        task_key = str(row[1] or "")
+        subject_id = int(row[2]) if row[2] is not None else None
+        reason = str(row[3] or "")
+        if task_key not in active_task_keys:
+            stale_ids.append(task_id)
+            continue
+        dedupe_key = (subject_id, reason)
+        if dedupe_key in seen:
+            duplicate_ids.append(task_id)
+            continue
+        seen.add(dedupe_key)
+    close_ids = sorted(set(stale_ids + duplicate_ids))
+    if close_ids:
+        placeholders = ",".join("?" for _ in close_ids)
+        conn.execute(
+            f"""
+            UPDATE review_tasks
+            SET status='closed',
+                reviewed_at=COALESCE(reviewed_at, ?),
+                resolution_notes=COALESCE(NULLIF(resolution_notes, ''), 'closed by relation review cleanup'),
+                updated_at=?
+            WHERE id IN ({placeholders})
+            """,
+            (now_iso(), now_iso(), *close_ids),
+        )
+        conn.commit()
+    open_count = int(
+        conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM review_tasks
+            WHERE queue_key='relations' AND COALESCE(status, 'open')='open'
+            """
+        ).fetchone()[0]
+        or 0
+    )
+    return {"closed_stale_or_duplicate": len(close_ids), "open": open_count}
 
 
 def _relation_source_links(conn, candidate_id: int) -> list[str]:
@@ -423,6 +496,7 @@ def build_quality_gate(settings: dict[str, Any] | None = None) -> dict[str, Any]
               AND COALESCE(rc.support_hard_evidence_count, 0) >= 1
               AND COALESCE(rc.promotion_block_reason, '') <> ''
             ORDER BY rc.id
+            LIMIT 200
             """
         ).fetchall()
         blocked_official_candidates: list[dict[str, Any]] = []
@@ -460,6 +534,9 @@ def build_quality_gate(settings: dict[str, Any] | None = None) -> dict[str, Any]
                 issue = "seed_flood_same_case"
             if not issue:
                 continue
+            bridge_types = {str(node.get("node_type") or "") for node in explain_path if isinstance(node, dict)}
+            if issue == "seed_flood_same_case" and not (bridge_types & EVENT_FACT_OR_OFFICIAL_BRIDGE_TYPES):
+                continue
             payload = {
                 "candidate_id": int(candidate_id),
                 "issue": issue,
@@ -476,12 +553,13 @@ def build_quality_gate(settings: dict[str, Any] | None = None) -> dict[str, Any]
                 "support_sources": int(support_sources or 0),
                 "support_domains": int(support_domains or 0),
                 "support_hard_evidence_count": int(support_hard_evidence_count or 0),
-                "bridge_types": [str(node.get("node_type") or "") for node in explain_path if isinstance(node, dict)],
+                "bridge_types": sorted(bridge_types),
                 "evidence_mix": evidence_mix,
                 "source_links": _relation_source_links(conn, int(candidate_id)),
             }
             blocked_official_candidates.append(payload)
-            relation_review_rows.append(payload)
+            if issue not in {"seed_flood_same_case", "location_role_only"}:
+                relation_review_rows.append(payload)
 
         blocked_seed_rows = conn.execute(
             """
@@ -554,6 +632,9 @@ def build_quality_gate(settings: dict[str, Any] | None = None) -> dict[str, Any]
                 issue = "duplicate_amplified_support"
             if not issue:
                 continue
+            bridge_types = {str(node.get("node_type") or "") for node in explain_path if isinstance(node, dict)}
+            if issue == "seed_flood_same_case" and not (bridge_types & EVENT_FACT_OR_OFFICIAL_BRIDGE_TYPES):
+                continue
             payload = {
                 "candidate_id": int(candidate_id),
                 "issue": issue,
@@ -571,12 +652,42 @@ def build_quality_gate(settings: dict[str, Any] | None = None) -> dict[str, Any]
                 "support_domains": int(support_domains or 0),
                 "support_hard_evidence_count": int(support_hard_evidence_count or 0),
                 "calibrated_score": float(calibrated_score or 0.0),
-                "bridge_types": [str(node.get("node_type") or "") for node in explain_path if isinstance(node, dict)],
+                "bridge_types": sorted(bridge_types),
                 "evidence_mix": evidence_mix,
                 "source_links": _relation_source_links(conn, int(candidate_id)),
             }
             blocked_seed_candidates.append(payload)
-            relation_review_rows.append(payload)
+            if issue not in {"seed_flood_same_case", "location_role_only"}:
+                relation_review_rows.append(payload)
+
+        review_state_rows = conn.execute(
+            """
+            SELECT
+                COUNT(*) AS total_review,
+                SUM(CASE WHEN rc.candidate_type='same_case_cluster' THEN 1 ELSE 0 END) AS same_case_review,
+                SUM(CASE WHEN COALESCE(ea.entity_type, '')='location'
+                           OR COALESCE(eb.entity_type, '')='location'
+                           OR COALESCE(rc.promotion_block_reason, '')='location_role_only'
+                         THEN 1 ELSE 0 END) AS location_role_only_review
+            FROM relation_candidates rc
+            LEFT JOIN entities ea ON ea.id = rc.entity_a_id
+            LEFT JOIN entities eb ON eb.id = rc.entity_b_id
+            WHERE rc.candidate_state='review'
+            """
+        ).fetchone()
+        total_relation_review_candidates = int((review_state_rows[0] if review_state_rows else 0) or 0)
+        same_case_review_candidates = int((review_state_rows[1] if review_state_rows else 0) or 0)
+        location_role_only_review_candidates = int((review_state_rows[2] if review_state_rows else 0) or 0)
+        same_case_review_ratio = (
+            same_case_review_candidates / total_relation_review_candidates
+            if total_relation_review_candidates
+            else 0.0
+        )
+        location_role_only_review_ratio = (
+            location_role_only_review_candidates / total_relation_review_candidates
+            if total_relation_review_candidates
+            else 0.0
+        )
 
         suppressed_claims = int(
             conn.execute(
@@ -723,6 +834,12 @@ def build_quality_gate(settings: dict[str, Any] | None = None) -> dict[str, Any]
             if not row["resolved_by_source_policy"]:
                 unresolved_warning_jobs.append(row)
 
+        if source_review_rows:
+            _sync_source_review_tasks(conn, source_review_rows)
+        active_relation_task_keys = _sync_relation_review_tasks(conn, relation_review_rows)
+        relation_review_cleanup = _cleanup_relation_review_tasks(conn, active_relation_task_keys)
+        relations_open_review_tasks = int(relation_review_cleanup.get("open") or 0)
+
         degrade_reasons: list[str] = []
         warnings: list[str] = []
         if classifier_status == "degraded":
@@ -745,17 +862,18 @@ def build_quality_gate(settings: dict[str, Any] | None = None) -> dict[str, Any]
             _append_once(degrade_reasons, "relation_quality_gate_failed")
         if len(duplicate_amplified_promotions) > int(cfg["max_duplicate_amplified_promotions"]):
             _append_once(degrade_reasons, "relation_quality_gate_failed")
+        if (
+            relations_open_review_tasks > int(cfg["max_relations_open_review_tasks"])
+            or same_case_review_ratio > float(cfg["max_same_case_review_ratio"])
+            or location_role_only_review_ratio > float(cfg["max_location_role_only_review_ratio"])
+        ):
+            _append_once(degrade_reasons, "relation_review_backlog_gate_failed")
         if duplicate_leakage > int(cfg["max_duplicate_leakage"]):
             _append_once(degrade_reasons, "dedupe_leak_gate_failed")
         if len(unresolved_blockers) > int(cfg["max_degraded_sources"]):
             _append_once(degrade_reasons, "source_health_gate_failed")
         if len(unresolved_warning_jobs) > int(cfg["max_critical_warning_jobs"]):
             _append_once(degrade_reasons, "source_health_gate_failed")
-
-        if source_review_rows:
-            _sync_source_review_tasks(conn, source_review_rows)
-        if relation_review_rows:
-            _sync_relation_review_tasks(conn, relation_review_rows)
 
         ai_failure_rows = conn.execute(
             """
@@ -793,6 +911,13 @@ def build_quality_gate(settings: dict[str, Any] | None = None) -> dict[str, Any]
                 "promoted_without_nonseed_bridge": len(promoted_without_nonseed_bridge),
                 "promoted_without_event_fact_or_official_bridge": len(promoted_without_event_fact_or_official_bridge),
                 "duplicate_amplified_promotions": len(duplicate_amplified_promotions),
+                "relations_open_review_tasks": relations_open_review_tasks,
+                "relation_review_cleanup": relation_review_cleanup,
+                "total_relation_review_candidates": total_relation_review_candidates,
+                "same_case_review_candidates": same_case_review_candidates,
+                "same_case_review_ratio": same_case_review_ratio,
+                "location_role_only_review_candidates": location_role_only_review_candidates,
+                "location_role_only_review_ratio": location_role_only_review_ratio,
                 "rows": [
                     {
                         "candidate_id": int(row[0]),

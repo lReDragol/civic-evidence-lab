@@ -1200,10 +1200,7 @@ def _candidate_state(
     if structural_seed_kind and not has_evidence_support:
         return "seed_only"
     if candidate_type == "same_case_cluster":
-        case_review_support = support_hard_evidence_count > 0 or (
-            support_items >= 1 and support_sources >= 2 and support_domains >= 1
-        )
-        return "review" if case_review_support else ("seed_only" if structural_seed_kind else "pending")
+        return "seed_only" if structural_seed_kind else "pending"
     if promotion_block_reason:
         if promotion_block_reason in {"low_entity_specificity", "location_role_only"}:
             return "seed_only" if structural_seed_kind else "pending"
@@ -1218,7 +1215,7 @@ def _candidate_state(
         if structural_seed_kind:
             return "seed_only"
         return "pending"
-    if candidate_type == "same_case_cluster" and not has_nonseed_bridge:
+    if candidate_type == "same_case_cluster":
         return "seed_only" if structural_seed_kind else "pending"
     if (
         candidate_type != "same_case_cluster"
@@ -1248,8 +1245,6 @@ def _candidate_state(
         )
     ):
         return "promoted"
-    if candidate_type == "same_case_cluster" and has_evidence_support:
-        return "review"
     if has_evidence_support or (not structural_seed_kind and has_support_layer):
         return "review"
     if structural_seed_kind:
