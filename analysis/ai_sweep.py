@@ -5,6 +5,7 @@ import json
 import os
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -23,12 +24,12 @@ from runtime.contracts import now_iso
 from runtime.state import finish_pipeline_run, set_runtime_metadata, start_pipeline_run
 
 PROMPT_VERSIONS: dict[str, str] = {
-    "clean_factual_text": "ai-sweep-v2-cleaner",
-    "structured_extract": "ai-sweep-v2-extract",
-    "event_link_hint": "ai-sweep-v2-event-link",
-    "tag_reasoning": "ai-sweep-v2-tags",
-    "relation_reasoning": "ai-sweep-v1-relations",
-    "event_synthesis": "ai-sweep-v1-synthesis",
+    "clean_factual_text": "ai-sweep-v3-cleaner",
+    "structured_extract": "ai-sweep-v3-extract",
+    "event_link_hint": "ai-sweep-v3-event-link",
+    "tag_reasoning": "ai-sweep-v3-tags",
+    "relation_reasoning": "ai-sweep-v3-relations",
+    "event_synthesis": "ai-sweep-v3-synthesis",
 }
 DERIVATION_STAGES = {
     "clean_factual_text",
@@ -138,12 +139,12 @@ def _prompt_version_for_stage(stage: str, settings: dict[str, Any]) -> str:
 
 def _stage_provider_priority(stage: str, settings: dict[str, Any]) -> list[str]:
     stage_specific = {
-        "clean_factual_text": ["mistral", "openrouter", "groq", "perplexity", "openai"],
-        "structured_extract": ["mistral", "openrouter", "groq", "perplexity", "openai"],
-        "event_link_hint": ["mistral", "groq", "openrouter", "openai", "perplexity"],
-        "tag_reasoning": ["mistral", "groq", "openrouter", "openai", "perplexity"],
-        "relation_reasoning": ["perplexity", "openai", "openrouter", "groq", "mistral"],
-        "event_synthesis": ["openai", "perplexity", "openrouter", "mistral", "groq"],
+        "clean_factual_text": ["mistral", "groq", "openrouter"],
+        "structured_extract": ["mistral", "groq", "openrouter"],
+        "event_link_hint": ["mistral", "groq", "openrouter", "openai"],
+        "tag_reasoning": ["mistral", "groq", "openrouter"],
+        "relation_reasoning": ["perplexity", "openai", "openrouter"],
+        "event_synthesis": ["openai", "perplexity", "openrouter"],
     }
     return list(stage_specific.get(stage) or _provider_priority(settings))
 
@@ -516,6 +517,141 @@ def _build_unit_context(conn: sqlite3.Connection, unit: dict[str, Any]) -> dict[
             ).fetchall()
         return {"event_row": dict(event_row) if event_row else {}, "event_items": [dict(row) for row in item_rows]}
     return {}
+
+
+def _parse_iso(value: Any) -> datetime | None:
+    if not value:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        try:
+            return datetime.fromisoformat(text[:10])
+        except ValueError:
+            return None
+
+
+def _content_ids_for_unit_context(unit: dict[str, Any], context: dict[str, Any]) -> list[int]:
+    ids: set[int] = set()
+    if context.get("content_item_id"):
+        ids.add(int(context["content_item_id"]))
+    content_row = context.get("content_row") or {}
+    if isinstance(content_row, dict) and content_row.get("id"):
+        ids.add(int(content_row["id"]))
+    for item in context.get("cluster_items") or []:
+        if isinstance(item, dict) and item.get("id"):
+            ids.add(int(item["id"]))
+    if unit.get("content_item_id"):
+        ids.add(int(unit["content_item_id"]))
+    if unit.get("canonical_content_id"):
+        ids.add(int(unit["canonical_content_id"]))
+    return sorted(ids)
+
+
+def _content_entity_ids(conn: sqlite3.Connection, content_ids: list[int]) -> set[int]:
+    if not content_ids or not _table_exists(conn, "entity_mentions"):
+        return set()
+    placeholders = ",".join("?" for _ in content_ids)
+    rows = conn.execute(
+        f"""
+        SELECT DISTINCT entity_id
+        FROM entity_mentions
+        WHERE content_item_id IN ({placeholders}) AND entity_id IS NOT NULL
+        """,
+        tuple(content_ids),
+    ).fetchall()
+    return {int(row[0]) for row in rows if row and row[0] is not None}
+
+
+def _event_entity_ids(conn: sqlite3.Connection, event_id: int) -> set[int]:
+    if not _table_exists(conn, "event_entities"):
+        return set()
+    rows = conn.execute(
+        "SELECT DISTINCT entity_id FROM event_entities WHERE event_id=? AND entity_id IS NOT NULL",
+        (event_id,),
+    ).fetchall()
+    return {int(row[0]) for row in rows if row and row[0] is not None}
+
+
+def _text_tokens(*values: Any) -> set[str]:
+    tokens: set[str] = set()
+    for value in values:
+        for raw in str(value or "").lower().replace("ё", "е").split():
+            token = "".join(ch for ch in raw if ch.isalnum())
+            if len(token) >= 5:
+                tokens.add(token)
+    return tokens
+
+
+def _time_overlap(unit_time: Any, event_start: Any, event_end: Any, *, days: int = 3) -> bool:
+    unit_dt = _parse_iso(unit_time)
+    start_dt = _parse_iso(event_start)
+    end_dt = _parse_iso(event_end) or start_dt
+    if not unit_dt or not start_dt:
+        return False
+    if start_dt <= unit_dt <= (end_dt or start_dt):
+        return True
+    delta_start = abs((unit_dt - start_dt).total_seconds())
+    delta_end = abs((unit_dt - (end_dt or start_dt)).total_seconds())
+    return min(delta_start, delta_end) <= days * 86400
+
+
+def _candidate_events_for_unit(conn: sqlite3.Connection, unit: dict[str, Any], context: dict[str, Any], *, limit: int = 12) -> list[dict[str, Any]]:
+    if not _table_exists(conn, "events"):
+        return []
+    content_row = context.get("content_row") or {}
+    content_ids = _content_ids_for_unit_context(unit, context)
+    unit_entities = _content_entity_ids(conn, content_ids)
+    unit_time = content_row.get("published_at") or unit.get("published_at")
+    unit_tokens = _text_tokens(content_row.get("title"), content_row.get("body_text"), unit.get("canonical_title"))
+    rows = conn.execute(
+        """
+        SELECT id, canonical_title, event_type, summary_short, event_date_start, event_date_end,
+               first_observed_at, last_observed_at
+        FROM events
+        ORDER BY COALESCE(event_date_start, first_observed_at, ''), id
+        LIMIT 200
+        """
+    ).fetchall()
+    candidates: list[dict[str, Any]] = []
+    for row in rows:
+        event_id = int(row["id"] if isinstance(row, sqlite3.Row) else row[0])
+        if unit.get("event_id") and int(unit["event_id"]) == event_id:
+            continue
+        event_title = row["canonical_title"] if isinstance(row, sqlite3.Row) else row[1]
+        event_start = row["event_date_start"] if isinstance(row, sqlite3.Row) else row[4]
+        event_end = row["event_date_end"] if isinstance(row, sqlite3.Row) else row[5]
+        event_entities = _event_entity_ids(conn, event_id)
+        reasons: list[str] = []
+        score = 0
+        if unit_entities and event_entities and unit_entities & event_entities:
+            reasons.append("entity_overlap")
+            score += 3
+        if _time_overlap(unit_time, event_start, event_end):
+            reasons.append("temporal_proximity")
+            score += 2
+        event_tokens = _text_tokens(event_title, row["summary_short"] if isinstance(row, sqlite3.Row) else row[3])
+        if unit_tokens and event_tokens and unit_tokens & event_tokens:
+            reasons.append("title_or_summary_anchor")
+            score += 1
+        if not reasons:
+            continue
+        candidates.append(
+            {
+                "event_id": event_id,
+                "canonical_title": event_title,
+                "event_type": row["event_type"] if isinstance(row, sqlite3.Row) else row[2],
+                "event_date_start": event_start,
+                "event_date_end": event_end,
+                "overlap_reasons": reasons,
+                "retrieval_score": score,
+            }
+        )
+    candidates.sort(key=lambda item: (-int(item["retrieval_score"]), str(item.get("event_date_start") or ""), int(item["event_id"])))
+    return candidates[:limit]
 
 
 GENERIC_TAG_NAMES = {
@@ -999,6 +1135,7 @@ def _stage_payload(unit: dict[str, Any], context: dict[str, Any], stage: str) ->
         "cluster_key": unit.get("cluster_key"),
         "cluster_size": len(cluster_items),
         "event_context": event_row,
+        "candidate_events": context.get("candidate_events") or [],
         "cluster_items": cluster_items,
         "review_payload": unit.get("candidate_payload"),
         "machine_reason": unit.get("machine_reason"),
@@ -1136,6 +1273,8 @@ def enqueue_ai_work_items(settings: dict[str, Any]) -> dict[str, Any]:
             if not sample_bucket:
                 continue
             context = _build_unit_context(conn, unit)
+            if unit["unit_kind"] in {"content_item", "content_cluster"}:
+                context["candidate_events"] = _candidate_events_for_unit(conn, unit, context)
             for stage in STAGES_BY_KIND.get(unit["unit_kind"], ()):
                 prompt_version = _prompt_version_for_stage(stage, settings)
                 payload = _stage_payload(unit, context, stage)
@@ -1464,6 +1603,61 @@ def _persist_content_derivation(
     return conn.total_changes - before
 
 
+def _event_link_gate(
+    conn: sqlite3.Connection,
+    unit: dict[str, Any],
+    suggested_event_id: int,
+    output_json: dict[str, Any],
+) -> tuple[str, int | None, dict[str, Any]]:
+    context = _build_unit_context(conn, unit)
+    content_row = context.get("content_row") or {}
+    content_ids = _content_ids_for_unit_context(unit, context)
+    unit_entities = _content_entity_ids(conn, content_ids)
+    event_entities = _event_entity_ids(conn, suggested_event_id)
+    event_row = conn.execute(
+        """
+        SELECT id, canonical_title, summary_short, event_date_start, event_date_end
+        FROM events
+        WHERE id=?
+        LIMIT 1
+        """,
+        (suggested_event_id,),
+    ).fetchone()
+    if not event_row:
+        return "standalone", None, {"accepted": False, "reason": "missing_event"}
+
+    event_title = event_row["canonical_title"] if isinstance(event_row, sqlite3.Row) else event_row[1]
+    event_summary = event_row["summary_short"] if isinstance(event_row, sqlite3.Row) else event_row[2]
+    event_start = event_row["event_date_start"] if isinstance(event_row, sqlite3.Row) else event_row[3]
+    event_end = event_row["event_date_end"] if isinstance(event_row, sqlite3.Row) else event_row[4]
+    unit_tokens = _text_tokens(content_row.get("title"), content_row.get("body_text"), output_json.get("reason"))
+    event_tokens = _text_tokens(event_title, event_summary)
+    checks = {
+        "entity_overlap": bool(unit_entities and event_entities and unit_entities & event_entities),
+        "temporal_proximity": _time_overlap(content_row.get("published_at") or unit.get("published_at"), event_start, event_end),
+        "document_or_title_anchor": bool(unit_tokens and event_tokens and unit_tokens & event_tokens),
+    }
+    score = sum(1 for value in checks.values() if value)
+    gate = {
+        "accepted": score >= 2,
+        "score": score,
+        "checks": checks,
+        "unit_entity_ids": sorted(unit_entities),
+        "event_entity_ids": sorted(event_entities),
+    }
+    if score >= 2:
+        return "link_existing", suggested_event_id, gate
+    try:
+        confidence = float(output_json.get("confidence") or 0)
+    except (TypeError, ValueError):
+        confidence = 0.0
+    if score == 1 and confidence >= 0.75:
+        gate["reason"] = "merge_review_required"
+        return "merge_review", suggested_event_id, gate
+    gate["reason"] = "gate_failed"
+    return "standalone", None, gate
+
+
 def _persist_event_candidate(conn: sqlite3.Connection, unit: dict[str, Any], prompt_version: str, result: dict[str, Any]) -> int:
     output_json = result.get("output_json")
     if not isinstance(output_json, dict):
@@ -1497,6 +1691,13 @@ def _persist_event_candidate(conn: sqlite3.Connection, unit: dict[str, Any], pro
             output_json["invalid_event_id"] = suggested_event_id
             suggested_event_id = None
             candidate_state = normalize_candidate_state(raw_action, False)
+        elif candidate_state == "link_existing":
+            gated_state, gated_event_id, gate = _event_link_gate(conn, unit, suggested_event_id, output_json)
+            output_json["deterministic_gate"] = gate
+            if gated_state != "link_existing":
+                output_json["gate_failed"] = True
+            candidate_state = gated_state
+            suggested_event_id = gated_event_id
     row = conn.execute(
         """
         SELECT id
@@ -1692,8 +1893,41 @@ def _persist_result(
     return 0
 
 
+SOURCE_ONLY_STAGES = {
+    "clean_factual_text",
+    "structured_extract",
+    "event_link_hint",
+    "tag_reasoning",
+    "event_synthesis",
+}
+UNGROUNDED_OUTPUT_KEYS = {
+    "external_context",
+    "web_context",
+    "ungrounded_facts",
+    "added_facts",
+    "unsupported_facts",
+}
+
+
+def _validate_stage_result(stage: str, result: dict[str, Any]) -> None:
+    output_json = result.get("output_json")
+    if output_json is not None and not isinstance(output_json, dict):
+        raise ValueError("invalid_output: output_json must be an object")
+    if stage not in SOURCE_ONLY_STAGES or not isinstance(output_json, dict):
+        return
+    for key in UNGROUNDED_OUTPUT_KEYS:
+        value = output_json.get(key)
+        if value in (None, "", [], {}):
+            continue
+        raise ValueError(f"schema_violation: source-only stage returned {key}")
+
+
 def _detect_failure_kind(error_text: str) -> str:
     lowered = (error_text or "").lower()
+    if "schema_violation" in lowered or "ungrounded" in lowered or "external_context" in lowered:
+        return "schema_violation"
+    if "invalid json" in lowered or "invalid_output" in lowered or "json decode" in lowered:
+        return "invalid_output"
     if (
         "invalid_tools" in lowered
         or "connector is not supported" in lowered
@@ -1701,7 +1935,7 @@ def _detect_failure_kind(error_text: str) -> str:
         or "invalid model" in lowered
         or "unsupported_provider" in lowered
     ):
-        return "provider"
+        return "provider_model"
     if (
         "429" in lowered
         or "rate limit" in lowered
@@ -1722,7 +1956,7 @@ def _detect_failure_kind(error_text: str) -> str:
         return "auth"
     if "timeout" in lowered or "timed out" in lowered:
         return "timeout"
-    return "provider"
+    return "provider_model"
 
 
 def _worker_run(
@@ -1783,6 +2017,7 @@ def _worker_run(
                     api_key=str(chosen["api_key"]),
                     task={"stage": stage, "prompt_version": prompt_version, "unit": unit, "payload": payload},
                 )
+                _validate_stage_result(stage, dict(response or {}))
                 record_key_success(conn, key_id)
                 return {
                     "ok": True,
@@ -1855,6 +2090,10 @@ def _record_attempts(conn: sqlite3.Connection, work_item_id: int, attempts: list
     count = 0
     for attempt in attempts:
         key_id = attempt.get("key_id")
+        status = attempt.get("status") or "unknown"
+        failure_kind = attempt.get("failure_kind")
+        if status != "ok" and not failure_kind:
+            failure_kind = _detect_failure_kind(str(attempt.get("error_text") or attempt.get("error") or ""))
         row = conn.execute(
             """
             SELECT id FROM llm_keys
@@ -1875,8 +2114,8 @@ def _record_attempts(conn: sqlite3.Connection, work_item_id: int, attempts: list
                 attempt.get("provider"),
                 attempt.get("model"),
                 int(row[0]) if row else None,
-                attempt.get("status") or "unknown",
-                attempt.get("failure_kind"),
+                status,
+                failure_kind,
                 attempt.get("error_text"),
                 _json_dumps(final_result) if final_result and attempt.get("status") == "ok" else None,
                 now_iso(),
@@ -1885,6 +2124,54 @@ def _record_attempts(conn: sqlite3.Connection, work_item_id: int, attempts: list
         )
         count += 1
     return count
+
+
+def backfill_ai_attempt_failure_kinds(conn: sqlite3.Connection) -> int:
+    if not _table_exists(conn, "ai_task_attempts"):
+        return 0
+    rows = conn.execute(
+        """
+        SELECT id, error_text
+        FROM ai_task_attempts
+        WHERE status <> 'ok'
+          AND (failure_kind IS NULL OR TRIM(failure_kind)='' OR failure_kind='provider')
+        """
+    ).fetchall()
+    updated = 0
+    for row in rows:
+        attempt_id = int(row["id"] if isinstance(row, sqlite3.Row) else row[0])
+        error_text = row["error_text"] if isinstance(row, sqlite3.Row) else row[1]
+        conn.execute(
+            "UPDATE ai_task_attempts SET failure_kind=? WHERE id=?",
+            (_detect_failure_kind(str(error_text or "")), attempt_id),
+        )
+        updated += 1
+    return updated
+
+
+def normalize_event_candidate_states(conn: sqlite3.Connection) -> int:
+    if not _table_exists(conn, "event_candidates"):
+        return 0
+    mappings = {
+        "link_existing_event": "link_existing",
+        "suggested": "link_existing",
+        "create_event_candidate": "create_candidate",
+        "merge_candidate": "merge_review",
+        "possible_merge": "merge_review",
+        "reject": "rejected",
+    }
+    updated = 0
+    for old_state, new_state in mappings.items():
+        cursor = conn.execute(
+            """
+            UPDATE event_candidates
+            SET candidate_state=?, updated_at=COALESCE(updated_at, ?)
+            WHERE candidate_state=?
+            """,
+            (new_state, now_iso(), old_state),
+        )
+        updated += int(cursor.rowcount or 0)
+    return updated
 
 
 def run_ai_full_sweep(settings: dict[str, Any]) -> dict[str, Any]:
@@ -1906,6 +2193,9 @@ def run_ai_full_sweep(settings: dict[str, Any]) -> dict[str, Any]:
         stages=["canonicalize_units", "clean_factual_text", "structured_extract", "event_link_hint", "tag_reasoning", "relation_reasoning", "event_synthesis"],
     )
     bootstrap = _bootstrap_key_pool(conn, settings)
+    failure_kind_backfilled = backfill_ai_attempt_failure_kinds(conn)
+    event_candidate_states_normalized = normalize_event_candidate_states(conn)
+    conn.commit()
     before_report = build_ai_sweep_pilot_report(settings, report_path=before_path)
     enqueue_stats = enqueue_ai_work_items(settings)
     all_units = canonicalize_units(conn)
@@ -1921,6 +2211,8 @@ def run_ai_full_sweep(settings: dict[str, Any]) -> dict[str, Any]:
             "pipeline_version": pipeline_version,
             "pipeline_run_id": pipeline_run_id,
             "bootstrap": bootstrap,
+            "failure_kind_backfilled": failure_kind_backfilled,
+            "event_candidate_states_normalized": event_candidate_states_normalized,
             "enqueue": enqueue_stats,
             "campaign_id": int(campaign["campaign_id"]),
             "campaign_key": campaign["campaign_key"],
@@ -2046,6 +2338,8 @@ def run_ai_full_sweep(settings: dict[str, Any]) -> dict[str, Any]:
         "pipeline_version": pipeline_version,
         "pipeline_run_id": pipeline_run_id,
         "bootstrap": bootstrap,
+        "failure_kind_backfilled": failure_kind_backfilled,
+        "event_candidate_states_normalized": event_candidate_states_normalized,
         "enqueue": enqueue_stats,
         "campaign_id": int(campaign["campaign_id"]),
         "campaign_key": campaign["campaign_key"],

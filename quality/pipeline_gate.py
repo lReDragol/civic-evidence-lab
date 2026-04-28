@@ -30,6 +30,9 @@ DEFAULT_CONFIG = {
     "max_generic_promoted_candidates": 0,
     "max_fake_domain_diversity_candidates": 0,
     "max_promoted_without_nonseed_bridge": 0,
+    "max_promoted_same_case_cluster": 0,
+    "max_promoted_location_candidates": 0,
+    "max_promoted_without_event_fact_or_official_bridge": 0,
     "max_duplicate_amplified_promotions": 0,
     "max_duplicate_leakage": 0,
     "report_path": str(PROJECT_ROOT / "reports" / "qa_quality_latest.json"),
@@ -45,6 +48,15 @@ PROMOTION_BRIDGE_TYPES = {
     "Affiliation",
     "Disclosure",
     "Asset",
+}
+EVENT_FACT_OR_OFFICIAL_BRIDGE_TYPES = {
+    "Event",
+    "Fact",
+    "RestrictionEvent",
+    "Affiliation",
+    "Disclosure",
+    "Asset",
+    "OfficialDocument",
 }
 
 
@@ -152,7 +164,7 @@ def _sync_relation_review_tasks(conn, rows: list[dict[str, Any]]) -> None:
         return
     for row in rows:
         suggested_action = "reject"
-        if row["issue"] in {"promoted_without_nonseed_bridge", "blocked_official_bridge"}:
+        if row["issue"] in {"promoted_without_nonseed_bridge", "promoted_without_event_fact_or_official_bridge", "blocked_official_bridge"}:
             suggested_action = "needs_more_docs"
         ensure_review_task(
             conn,
@@ -288,7 +300,10 @@ def build_quality_gate(settings: dict[str, Any] | None = None) -> dict[str, Any]
         ).fetchall()
 
         generic_promoted_rows: list[dict[str, Any]] = []
+        promoted_same_case_rows: list[dict[str, Any]] = []
+        promoted_location_rows: list[dict[str, Any]] = []
         promoted_without_nonseed_bridge: list[dict[str, Any]] = []
+        promoted_without_event_fact_or_official_bridge: list[dict[str, Any]] = []
         duplicate_amplified_promotions: list[dict[str, Any]] = []
         relation_review_rows: list[dict[str, Any]] = []
         for row in promoted_rows:
@@ -311,6 +326,30 @@ def build_quality_gate(settings: dict[str, Any] | None = None) -> dict[str, Any]
             explain_path = _parse_json(explain_path_json, [])
             evidence_mix = _parse_json(evidence_mix_json, {})
             bridge_types = {str(node.get("node_type") or "") for node in explain_path if isinstance(node, dict)}
+            if candidate_type == "same_case_cluster":
+                payload = {
+                    "candidate_id": int(candidate_id),
+                    "issue": "demoted_same_case",
+                    "candidate_type": candidate_type,
+                    "entity_a_id": int(entity_a_id),
+                    "entity_b_id": int(entity_b_id),
+                }
+                promoted_same_case_rows.append(payload)
+                relation_review_rows.append(payload)
+            if entity_a_type == "location" or entity_b_type == "location":
+                payload = {
+                    "candidate_id": int(candidate_id),
+                    "issue": "location_role_only",
+                    "candidate_type": candidate_type,
+                    "entity_a_id": int(entity_a_id),
+                    "entity_b_id": int(entity_b_id),
+                    "entity_a_type": entity_a_type,
+                    "entity_a_name": entity_a_name,
+                    "entity_b_type": entity_b_type,
+                    "entity_b_name": entity_b_name,
+                }
+                promoted_location_rows.append(payload)
+                relation_review_rows.append(payload)
             if _is_generic_relation_entity(entity_a_type, entity_a_name) or _is_generic_relation_entity(entity_b_type, entity_b_name):
                 payload = {
                     "candidate_id": int(candidate_id),
@@ -333,6 +372,17 @@ def build_quality_gate(settings: dict[str, Any] | None = None) -> dict[str, Any]
                     "bridge_types": sorted(bridge_types),
                 }
                 promoted_without_nonseed_bridge.append(payload)
+                relation_review_rows.append(payload)
+            if not (bridge_types & EVENT_FACT_OR_OFFICIAL_BRIDGE_TYPES):
+                payload = {
+                    "candidate_id": int(candidate_id),
+                    "issue": "promoted_without_event_fact_or_official_bridge",
+                    "candidate_type": candidate_type,
+                    "entity_a_id": int(entity_a_id),
+                    "entity_b_id": int(entity_b_id),
+                    "bridge_types": sorted(bridge_types),
+                }
+                promoted_without_event_fact_or_official_bridge.append(payload)
                 relation_review_rows.append(payload)
             if float(dedupe_support_score or 0.0) < 0.5:
                 payload = {
@@ -400,11 +450,13 @@ def build_quality_gate(settings: dict[str, Any] | None = None) -> dict[str, Any]
             issue = ""
             if promotion_block_reason == "official_bridge_missing":
                 issue = "blocked_official_bridge"
+            elif promotion_block_reason == "location_role_only":
+                issue = "location_role_only"
             elif promotion_block_reason == "low_entity_specificity":
                 issue = "low_specificity_entity"
             elif promotion_block_reason == "duplicate_amplified_support":
                 issue = "duplicate_amplified_support"
-            elif promotion_block_reason in {"same_case_requires_nonseed_bridge", "same_case_requires_evidence_bridge"}:
+            elif promotion_block_reason in {"same_case_requires_nonseed_bridge", "same_case_requires_evidence_bridge", "same_case_not_promotable"}:
                 issue = "seed_flood_same_case"
             if not issue:
                 continue
@@ -459,6 +511,8 @@ def build_quality_gate(settings: dict[str, Any] | None = None) -> dict[str, Any]
               AND COALESCE(rc.promotion_block_reason, '') IN (
                   'same_case_requires_nonseed_bridge',
                   'same_case_requires_evidence_bridge',
+                  'same_case_not_promotable',
+                  'location_role_only',
                   'low_entity_specificity',
                   'duplicate_amplified_support'
               )
@@ -490,8 +544,10 @@ def build_quality_gate(settings: dict[str, Any] | None = None) -> dict[str, Any]
             evidence_mix = _parse_json(evidence_mix_json, {})
             explain_path = _parse_json(explain_path_json, [])
             issue = ""
-            if promotion_block_reason in {"same_case_requires_nonseed_bridge", "same_case_requires_evidence_bridge"}:
+            if promotion_block_reason in {"same_case_requires_nonseed_bridge", "same_case_requires_evidence_bridge", "same_case_not_promotable"}:
                 issue = "seed_flood_same_case"
+            elif promotion_block_reason == "location_role_only":
+                issue = "location_role_only"
             elif promotion_block_reason == "low_entity_specificity":
                 issue = "low_specificity_entity"
             elif promotion_block_reason == "duplicate_amplified_support":
@@ -677,9 +733,15 @@ def build_quality_gate(settings: dict[str, Any] | None = None) -> dict[str, Any]
             _append_once(degrade_reasons, "relation_quality_gate_failed")
         if len(generic_promoted_rows) > int(cfg["max_generic_promoted_candidates"]):
             _append_once(degrade_reasons, "relation_quality_gate_failed")
+        if len(promoted_same_case_rows) > int(cfg["max_promoted_same_case_cluster"]):
+            _append_once(degrade_reasons, "relation_quality_gate_failed")
+        if len(promoted_location_rows) > int(cfg["max_promoted_location_candidates"]):
+            _append_once(degrade_reasons, "relation_quality_gate_failed")
         if len(fake_domain_rows) > int(cfg["max_fake_domain_diversity_candidates"]):
             _append_once(degrade_reasons, "relation_quality_gate_failed")
         if len(promoted_without_nonseed_bridge) > int(cfg["max_promoted_without_nonseed_bridge"]):
+            _append_once(degrade_reasons, "relation_quality_gate_failed")
+        if len(promoted_without_event_fact_or_official_bridge) > int(cfg["max_promoted_without_event_fact_or_official_bridge"]):
             _append_once(degrade_reasons, "relation_quality_gate_failed")
         if len(duplicate_amplified_promotions) > int(cfg["max_duplicate_amplified_promotions"]):
             _append_once(degrade_reasons, "relation_quality_gate_failed")
@@ -695,6 +757,24 @@ def build_quality_gate(settings: dict[str, Any] | None = None) -> dict[str, Any]
         if relation_review_rows:
             _sync_relation_review_tasks(conn, relation_review_rows)
 
+        ai_failure_rows = conn.execute(
+            """
+            SELECT COALESCE(NULLIF(TRIM(failure_kind), ''), 'unknown') AS failure_kind, COUNT(*) AS total
+            FROM ai_task_attempts
+            WHERE status <> 'ok'
+            GROUP BY COALESCE(NULLIF(TRIM(failure_kind), ''), 'unknown')
+            ORDER BY total DESC, failure_kind
+            """
+        ).fetchall() if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='ai_task_attempts'").fetchone() else []
+        event_link_rows = conn.execute(
+            """
+            SELECT candidate_state, COUNT(*) AS total
+            FROM event_candidates
+            GROUP BY candidate_state
+            """
+        ).fetchall() if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='event_candidates'").fetchone() else []
+        event_link_counts = {str(row[0] or "unknown"): int(row[1] or 0) for row in event_link_rows}
+
         report = {
             "ok": not degrade_reasons,
             "generated_at": now_iso(),
@@ -707,8 +787,11 @@ def build_quality_gate(settings: dict[str, Any] | None = None) -> dict[str, Any]
             "relation_quality": {
                 "zero_support_review_candidates": len(zero_support_rows),
                 "promoted_with_generic_entity": len(generic_promoted_rows),
+                "promoted_same_case_cluster": len(promoted_same_case_rows),
+                "promoted_with_location_entity": len(promoted_location_rows),
                 "promoted_with_fake_domain_diversity": len(fake_domain_rows),
                 "promoted_without_nonseed_bridge": len(promoted_without_nonseed_bridge),
+                "promoted_without_event_fact_or_official_bridge": len(promoted_without_event_fact_or_official_bridge),
                 "duplicate_amplified_promotions": len(duplicate_amplified_promotions),
                 "rows": [
                     {
@@ -724,6 +807,8 @@ def build_quality_gate(settings: dict[str, Any] | None = None) -> dict[str, Any]
                     for row in zero_support_rows
                 ],
                 "generic_promotions": generic_promoted_rows,
+                "same_case_promotions": promoted_same_case_rows,
+                "location_promotions": promoted_location_rows,
                 "fake_domain_diversity_rows": [
                     {
                         "candidate_id": int(row[0]),
@@ -736,9 +821,20 @@ def build_quality_gate(settings: dict[str, Any] | None = None) -> dict[str, Any]
                     for row in fake_domain_rows
                 ],
                 "promoted_without_nonseed_bridge_rows": promoted_without_nonseed_bridge,
+                "promoted_without_event_fact_or_official_bridge_rows": promoted_without_event_fact_or_official_bridge,
                 "duplicate_amplified_promotion_rows": duplicate_amplified_promotions,
                 "blocked_official_candidates": blocked_official_candidates,
                 "blocked_seed_candidates": blocked_seed_candidates,
+            },
+            "ai_sweep": {
+                "failure_kind_breakdown": {str(row[0]): int(row[1] or 0) for row in ai_failure_rows},
+            },
+            "event_linking": {
+                "link_existing_count": event_link_counts.get("link_existing", 0),
+                "merge_review_count": event_link_counts.get("merge_review", 0),
+                "standalone_count": event_link_counts.get("standalone", 0),
+                "create_candidate_count": event_link_counts.get("create_candidate", 0) + event_link_counts.get("create_event_candidate", 0),
+                "rejected_count": event_link_counts.get("rejected", 0),
             },
             "dedupe_leakage": {
                 "suppressed_claims": suppressed_claims,

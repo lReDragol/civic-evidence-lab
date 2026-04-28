@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 from analysis.entity_relation_builder import build_co_occurrence_from_mentions
-from graph.relation_candidates import rebuild_relation_candidates
+from graph.relation_candidates import _candidate_state, _pair_entity_quality, rebuild_relation_candidates
 from ner.relation_extractor import extract_co_occurrence_relations
 
 
@@ -680,6 +680,36 @@ def create_event_fact_official_bridge_db(db_path: Path):
 
 
 class RelationLayerTests(unittest.TestCase):
+    def test_candidate_state_never_promotes_same_case_cluster_even_with_strong_support(self):
+        state = _candidate_state(
+            candidate_type="same_case_cluster",
+            structural_seed_kind="case",
+            support_items=3,
+            support_sources=3,
+            support_domains=3,
+            support_claim_cluster_count=0,
+            support_hard_evidence_count=2,
+            semantic_support_score=0.0,
+            calibrated_score=0.95,
+            explain_path=[{"node_type": "Event"}, {"node_type": "Fact"}, {"node_type": "OfficialDocument"}],
+            shortest_bridge_path=[{"node_type": "Event"}, {"node_type": "Fact"}, {"node_type": "OfficialDocument"}],
+            promotion_block_reason=None,
+        )
+
+        self.assertEqual(state, "review")
+
+    def test_pair_entity_quality_blocks_all_location_nodes_as_event_roles_only(self):
+        score, reason = _pair_entity_quality(
+            "person",
+            "Петров Юрий Александрович",
+            "location",
+            "Екатеринбурге",
+            bridge_types={"Event", "Fact", "OfficialDocument"},
+        )
+
+        self.assertLess(score, 0.45)
+        self.assertEqual(reason, "location_role_only")
+
     def test_relation_extractor_requires_independent_sources_and_cleans_old_rows(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "relations.db"
@@ -1044,7 +1074,7 @@ class RelationLayerTests(unittest.TestCase):
             self.assertEqual(row[3:6], (3, 2, 2))
             self.assertEqual(row[6], 1)
             self.assertGreaterEqual(row[7], 3)
-            self.assertEqual(row[8], "low_entity_specificity")
+            self.assertEqual(row[8], "location_role_only")
             self.assertEqual(promoted, 0)
 
     def test_relation_candidate_builder_collapses_duplicate_cluster_support(self):

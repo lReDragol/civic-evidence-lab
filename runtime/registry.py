@@ -309,6 +309,25 @@ def _ai_full_sweep(settings: dict[str, Any]):
     return __import__("analysis.ai_sweep", fromlist=["run_ai_full_sweep"]).run_ai_full_sweep(settings)
 
 
+def _ai_sweep_maintenance(settings: dict[str, Any]):
+    module = __import__("analysis.ai_sweep", fromlist=["backfill_ai_attempt_failure_kinds", "normalize_event_candidate_states"])
+    conn = get_db(settings)
+    try:
+        updated = module.backfill_ai_attempt_failure_kinds(conn)
+        normalized = module.normalize_event_candidate_states(conn)
+        conn.commit()
+        return {
+            "ok": True,
+            "items_updated": int(updated) + int(normalized),
+            "artifacts": {
+                "failure_kind_backfilled": int(updated),
+                "event_candidate_states_normalized": int(normalized),
+            },
+        }
+    finally:
+        conn.close()
+
+
 def _asr(settings: dict[str, Any]):
     return __import__("media_pipeline.asr", fromlist=["process_untranscribed_videos"]).process_untranscribed_videos()
 
@@ -499,6 +518,7 @@ JOB_SPECS = [
     JobSpec("semantic_index", "Semantic index", "Анализ", 43200, "semantic_index_interval_seconds", "analysis", timeout_seconds=7200, runner=_semantic_index),
     JobSpec("event_pipeline", "Event pipeline", "Анализ", 43200, "event_pipeline_interval_seconds", "analysis", timeout_seconds=7200, runner=_event_pipeline),
     JobSpec("ai_full_sweep", "AI Sweep", "AI", 86400, "ai_full_sweep_interval_seconds", "ai", timeout_seconds=43200, scheduled=False, runner=_ai_full_sweep),
+    JobSpec("ai_sweep_maintenance", "AI Sweep maintenance", "AI", 86400, "ai_sweep_maintenance_interval_seconds", "ai", timeout_seconds=1800, scheduled=False, visible=False, runner=_ai_sweep_maintenance),
     JobSpec("asr", "ASR (Whisper)", "Медиа", 3600, None, "media", timeout_seconds=7200, runner=_asr),
     JobSpec("ocr", "OCR (PaddleOCR)", "Медиа", 3600, None, "media", timeout_seconds=7200, runner=_ocr),
     JobSpec("ner", "NER (Natasha)", "Анализ", 7200, "ner_interval_seconds", "analysis", timeout_seconds=3600, runner=_ner),

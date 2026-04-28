@@ -44,6 +44,23 @@ def create_db(db_path: Path):
                 (201, 'Блокировка Telegram', 'internet_block', 'Короткое summary', 'Длинное summary', 'active',
                  '2026-04-20T08:00:00', '2026-04-21T10:00:00', '2026-04-20T08:00:00', '2026-04-21T10:00:00', 0.8, 0.9);
 
+            INSERT INTO entities(id, entity_type, canonical_name) VALUES
+                (301, 'organization', 'Правительство РФ'),
+                (302, 'organization', 'Telegram'),
+                (303, 'person', 'Случайный комментатор');
+
+            INSERT INTO entity_mentions(entity_id, content_item_id, mention_type, confidence) VALUES
+                (301, 11, 'issuer', 1.0),
+                (302, 11, 'target', 1.0),
+                (301, 12, 'issuer', 1.0),
+                (302, 12, 'target', 1.0),
+                (302, 13, 'target', 1.0),
+                (303, 14, 'subject', 1.0);
+
+            INSERT INTO event_entities(event_id, entity_id, role, confidence) VALUES
+                (201, 301, 'issuer', 0.95),
+                (201, 302, 'target', 0.95);
+
             INSERT INTO review_tasks(
                 task_key, queue_key, subject_type, subject_id, candidate_payload, suggested_action, confidence,
                 machine_reason, status
@@ -61,9 +78,27 @@ class AiSweepTests(unittest.TestCase):
         from analysis.ai_sweep import _detect_failure_kind
 
         self.assertEqual(_detect_failure_kind('429 {"error":{"message":"Rate limit reached"}}'), "rate")
-        self.assertEqual(_detect_failure_kind('400 {"message":"WebSearchTool connector is not supported","type":"invalid_tools"}'), "provider")
-        self.assertEqual(_detect_failure_kind('400 {"error":{"message":"openrouter:auto:online is not a valid model ID"}}'), "provider")
+        self.assertEqual(_detect_failure_kind('400 {"message":"WebSearchTool connector is not supported","type":"invalid_tools"}'), "provider_model")
+        self.assertEqual(_detect_failure_kind('400 {"error":{"message":"openrouter:auto:online is not a valid model ID"}}'), "provider_model")
+        self.assertEqual(_detect_failure_kind("invalid json response from provider"), "invalid_output")
+        self.assertEqual(_detect_failure_kind("schema_violation: source-only stage returned external_context"), "schema_violation")
         self.assertEqual(_detect_failure_kind('401 invalid api key'), "auth")
+
+    def test_source_only_stage_rejects_ungrounded_external_context(self):
+        from analysis.ai_sweep import _validate_stage_result
+
+        with self.assertRaisesRegex(ValueError, "schema_violation"):
+            _validate_stage_result(
+                "clean_factual_text",
+                {
+                    "output_text": "Текст переписан.",
+                    "output_json": {
+                        "source_facts": ["Факт из документа"],
+                        "external_context": ["Модель добавила факт из поиска"],
+                    },
+                    "confidence": 0.8,
+                },
+            )
 
     def test_campaign_sampling_is_deterministic_and_reuses_same_selection(self):
         from analysis.ai_sweep import canonicalize_units, ensure_ai_sweep_campaign
@@ -301,7 +336,7 @@ class AiSweepTests(unittest.TestCase):
                 **settings,
                 "ai_sweep": {
                     **settings["ai_sweep"],
-                    "prompt_versions": {"clean_factual_text": "ai-sweep-v3-cleaner"},
+                    "prompt_versions": {"clean_factual_text": "ai-sweep-v4-cleaner"},
                 },
             }
             enqueue_ai_work_items(changed_settings)
@@ -316,7 +351,7 @@ class AiSweepTests(unittest.TestCase):
                 conn.close()
 
             self.assertEqual(refreshed[0], "pending")
-            self.assertEqual(refreshed[1], "ai-sweep-v3-cleaner")
+            self.assertEqual(refreshed[1], "ai-sweep-v4-cleaner")
             self.assertIsNone(refreshed[2])
 
     def test_enqueue_ai_work_items_keeps_event_synthesis_completed_when_only_generated_summary_changed(self):
@@ -506,7 +541,13 @@ class AiSweepTests(unittest.TestCase):
                     "SELECT DISTINCT derivation_type FROM content_derivations ORDER BY derivation_type"
                 ).fetchall()
                 event_candidate = conn.execute(
-                    "SELECT suggested_event_id, candidate_state, suggestion_json FROM event_candidates ORDER BY id LIMIT 1"
+                    """
+                    SELECT suggested_event_id, candidate_state, suggestion_json
+                    FROM event_candidates
+                    WHERE candidate_state='link_existing'
+                    ORDER BY id
+                    LIMIT 1
+                    """
                 ).fetchone()
                 event_row = conn.execute(
                     "SELECT summary_short, summary_long FROM events WHERE id=201"
@@ -630,6 +671,46 @@ class AiSweepTests(unittest.TestCase):
 
             self.assertEqual(tuple(row), ("groq", "failed", "rate"))
 
+    def test_record_attempts_backfills_missing_failure_kind_from_error_text(self):
+        from analysis.ai_sweep import _record_attempts
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "ai.db"
+            create_db(db_path)
+            conn = sqlite3.connect(db_path)
+            try:
+                conn.execute(
+                    "INSERT INTO llm_keys(id, provider, api_key, key_hash, status) VALUES(1, 'mistral', 'm', 'm-hash', 'active')"
+                )
+                conn.execute(
+                    """
+                    INSERT INTO ai_work_items(id, unit_kind, unit_key, stage, prompt_version, status)
+                    VALUES(2, 'content_item', 'content:14', 'structured_extract', 'ai-sweep-v3-extract', 'running')
+                    """
+                )
+                conn.commit()
+
+                _record_attempts(
+                    conn,
+                    2,
+                    [
+                        {
+                            "provider": "mistral",
+                            "model": "mistral-medium",
+                            "key_id": 1,
+                            "status": "failed",
+                            "error_text": "ReadTimeout: request timed out after 30 seconds",
+                        }
+                    ],
+                )
+                row = conn.execute(
+                    "SELECT provider, status, failure_kind FROM ai_task_attempts WHERE work_item_id=2"
+                ).fetchone()
+            finally:
+                conn.close()
+
+            self.assertEqual(tuple(row), ("mistral", "failed", "timeout"))
+
     def test_event_link_hint_normalizes_merge_review_and_enqueues_event_review_task(self):
         from analysis.ai_sweep import _persist_event_candidate
 
@@ -672,6 +753,42 @@ class AiSweepTests(unittest.TestCase):
             self.assertEqual(updated, 1)
             self.assertEqual(tuple(candidate), ("merge_review", 201))
             self.assertEqual(tuple(review), ("events", "event_candidate", "needs_review", "same actors and legal anchor but weak time window"))
+
+    def test_event_link_hint_demotes_link_existing_when_deterministic_gates_fail(self):
+        from analysis.ai_sweep import _persist_event_candidate
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "ai.db"
+            create_db(db_path)
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            try:
+                updated = _persist_event_candidate(
+                    conn,
+                    {"unit_kind": "content_item", "unit_key": "content:14", "content_item_id": 14},
+                    "ai-sweep-v3-event-link",
+                    {
+                        "provider": "mistral",
+                        "model": "mistral-medium",
+                        "confidence": 0.91,
+                        "output_json": {
+                            "action": "link_existing_event",
+                            "event_id": 201,
+                            "reason": "same broad topic",
+                        },
+                    },
+                )
+                conn.commit()
+                candidate = conn.execute(
+                    "SELECT candidate_state, suggested_event_id, suggestion_json FROM event_candidates ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+            finally:
+                conn.close()
+
+            self.assertEqual(updated, 1)
+            self.assertEqual(candidate["candidate_state"], "standalone")
+            self.assertIsNone(candidate["suggested_event_id"])
+            self.assertIn("gate_failed", candidate["suggestion_json"])
 
     def test_run_ai_full_sweep_tolerates_invalid_event_link_id_from_model(self):
         from analysis.ai_sweep import run_ai_full_sweep

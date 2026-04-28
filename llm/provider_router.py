@@ -25,7 +25,7 @@ STAGE_SPECS: dict[str, dict[str, Any]] = {
         ),
         "output_contract": (
             'Return JSON with keys: "output_text" (clean factual paragraph), '
-            '"output_json" ({"cleaned_text": "...", "removed_noise": [...]}), '
+            '"output_json" ({"cleaned_text": "...", "source_facts": [...], "removed_noise": [...], "external_context": []}), '
             '"confidence" (0..1).'
         ),
     },
@@ -40,7 +40,7 @@ STAGE_SPECS: dict[str, dict[str, Any]] = {
         "output_contract": (
             'Return JSON with keys: "output_text", "output_json" and "confidence". '
             '"output_json" must contain arrays/objects for actors, organizations, dates, locations, actions, '
-            'legal_basis, affected_groups, explicit_claims, uncertainty_markers, document_anchors.'
+            'legal_basis, affected_groups, explicit_claims, uncertainty_markers, document_anchors, source_facts, external_context.'
         ),
     },
     "event_link_hint": {
@@ -54,7 +54,7 @@ STAGE_SPECS: dict[str, dict[str, Any]] = {
         "output_contract": (
             'Return JSON with keys: "output_text", "output_json" and "confidence". '
             '"output_json" must contain action (link_existing_event|create_event_candidate|standalone), '
-            'event_id if known, reason, matched_signals, and abstain_reason if linking is too weak.'
+            'event_id if known, reason, matched_signals, candidate_event_ids_considered, external_context, and abstain_reason if linking is too weak.'
         ),
     },
     "tag_reasoning": {
@@ -69,7 +69,7 @@ STAGE_SPECS: dict[str, dict[str, Any]] = {
         "output_contract": (
             'Return JSON with keys: "output_text", "output_json" and "confidence". '
             '"output_json" should contain tags, abstain_tags, rationale, signal_layers, and abstain_reason. '
-            'Only emit a tag when at least one explicit supported signal is present; generic tags require two independent signals.'
+            'Only emit a tag when at least one explicit supported signal is present; generic tags require two independent signals; set external_context to [].'
         ),
     },
     "relation_reasoning": {
@@ -94,7 +94,7 @@ STAGE_SPECS: dict[str, dict[str, Any]] = {
         ),
         "output_contract": (
             'Return JSON with keys: "output_text", "output_json" and "confidence". '
-            '"output_json" must contain summary_short, summary_long, timeline, participants, open_questions.'
+            '"output_json" must contain summary_short, summary_long, timeline, participants, open_questions, source_facts, external_context.'
         ),
     },
 }

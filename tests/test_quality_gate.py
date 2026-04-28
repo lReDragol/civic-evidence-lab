@@ -288,8 +288,11 @@ class QualityGateTests(unittest.TestCase):
             self.assertFalse(result["ok"])
             relation_quality = result["artifacts"]["relation_quality"]
             self.assertEqual(relation_quality["promoted_with_generic_entity"], 1)
+            self.assertEqual(relation_quality["promoted_same_case_cluster"], 1)
+            self.assertEqual(relation_quality["promoted_with_location_entity"], 1)
             self.assertEqual(relation_quality["promoted_with_fake_domain_diversity"], 1)
             self.assertEqual(relation_quality["promoted_without_nonseed_bridge"], 1)
+            self.assertEqual(relation_quality["promoted_without_event_fact_or_official_bridge"], 1)
 
     def test_quality_gate_creates_relation_review_task_for_blocked_official_candidate(self):
         with tempfile.TemporaryDirectory() as tmp:

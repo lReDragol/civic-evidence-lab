@@ -213,12 +213,7 @@ def _entity_specificity(entity_type: str, canonical_name: str) -> tuple[float, s
     if not tokens:
         return 0.15, "low_entity_specificity"
     if entity_type == "location":
-        normalized = " ".join(tokens)
-        if normalized in GENERIC_LOCATION_TOKENS or any(token in GENERIC_LOCATION_TOKENS for token in tokens):
-            return 0.1, "low_entity_specificity"
-        if len(tokens) == 1 and len(tokens[0]) <= 12:
-            return 0.25, "low_entity_specificity"
-        return 0.45, None
+        return 0.1, "location_role_only"
     if entity_type == "person":
         if len(tokens) >= 2:
             return 1.0, None
@@ -244,6 +239,8 @@ def _pair_entity_quality(
     quality_a, reason_a = _entity_specificity(entity_a_type, entity_a_name)
     quality_b, reason_b = _entity_specificity(entity_b_type, entity_b_name)
     quality = round(min(quality_a, quality_b), 4)
+    if entity_a_type == "location" or entity_b_type == "location":
+        return quality, "location_role_only"
     if quality >= 0.45:
         return quality, None
     if (entity_a_type == "location" and reason_a) or (entity_b_type == "location" and reason_b):
@@ -1202,8 +1199,13 @@ def _candidate_state(
     has_official_bridge = bool(bridge_types & OFFICIAL_PROMOTION_BRIDGE_TYPES)
     if structural_seed_kind and not has_evidence_support:
         return "seed_only"
+    if candidate_type == "same_case_cluster":
+        case_review_support = support_hard_evidence_count > 0 or (
+            support_items >= 1 and support_sources >= 2 and support_domains >= 1
+        )
+        return "review" if case_review_support else ("seed_only" if structural_seed_kind else "pending")
     if promotion_block_reason:
-        if promotion_block_reason == "low_entity_specificity":
+        if promotion_block_reason in {"low_entity_specificity", "location_role_only"}:
             return "seed_only" if structural_seed_kind else "pending"
         if promotion_block_reason in {
             "same_case_requires_nonseed_bridge",
@@ -1990,6 +1992,7 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
                     or has_evidence_bridge
                 ):
                     promotion_block_reason = promotion_block_reason or "same_case_requires_evidence_bridge"
+                promotion_block_reason = promotion_block_reason or "same_case_not_promotable"
             elif (
                 support_hard_evidence_count > 0
                 and (
