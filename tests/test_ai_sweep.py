@@ -100,6 +100,21 @@ class AiSweepTests(unittest.TestCase):
                 },
             )
 
+    def test_prompt_review_uses_current_prompt_versions_instead_of_stale_v2_text(self):
+        from analysis.ai_sweep import PROMPT_VERSIONS, build_ai_sweep_prompt_review
+
+        before = {"campaign_key": "pilot:test", "selected_counts": {"content_item": 1}, "sample_units": []}
+        after = {"campaign_key": "pilot:test", "selected_counts": {"content_item": 1}, "sample_units": []}
+        diff = {"strict_generic_tag_count_before": 0, "strict_generic_tag_count_after": 0}
+
+        text = build_ai_sweep_prompt_review(before, after, diff)
+
+        self.assertIn(PROMPT_VERSIONS["clean_factual_text"], text)
+        self.assertIn(PROMPT_VERSIONS["structured_extract"], text)
+        self.assertIn(PROMPT_VERSIONS["tag_reasoning"], text)
+        self.assertIn(PROMPT_VERSIONS["event_link_hint"], text)
+        self.assertNotIn("ai-sweep-v2-tags", text)
+
     def test_campaign_sampling_is_deterministic_and_reuses_same_selection(self):
         from analysis.ai_sweep import canonicalize_units, ensure_ai_sweep_campaign
 

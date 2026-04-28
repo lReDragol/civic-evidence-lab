@@ -1,6 +1,8 @@
 import json
 import sqlite3
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -209,6 +211,107 @@ class AiKeyPoolTests(unittest.TestCase):
                 ("groq", "active", 0, None),
                 ("mistral", "active", 0, None),
             ])
+
+    def test_record_key_success_waits_out_short_sqlite_write_lock(self):
+        from llm.key_pool import record_key_success
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "ai.db"
+            create_db(db_path)
+
+            setup = sqlite3.connect(db_path)
+            try:
+                cur = setup.execute(
+                    """
+                    INSERT INTO llm_keys(provider, api_key, key_hash, status, failure_count)
+                    VALUES('mistral', 'm-key', 'm-hash', 'active', 2)
+                    """
+                )
+                key_id = int(cur.lastrowid)
+                setup.commit()
+            finally:
+                setup.close()
+
+            locker = sqlite3.connect(db_path, check_same_thread=False)
+            locker.execute("BEGIN IMMEDIATE")
+            locker.execute("UPDATE llm_keys SET updated_at='locked' WHERE id=?", (key_id,))
+
+            def release_lock():
+                time.sleep(0.15)
+                locker.commit()
+                locker.close()
+
+            releaser = threading.Thread(target=release_lock)
+            releaser.start()
+            worker = sqlite3.connect(db_path)
+            worker.execute("PRAGMA busy_timeout = 20")
+            try:
+                record_key_success(worker, key_id)
+                row = worker.execute(
+                    "SELECT status, failure_count, last_used_at FROM llm_keys WHERE id=?",
+                    (key_id,),
+                ).fetchone()
+            finally:
+                worker.close()
+                releaser.join(timeout=2)
+
+            self.assertEqual(row[0], "active")
+            self.assertEqual(row[1], 0)
+            self.assertIsNotNone(row[2])
+
+    def test_record_key_failure_waits_out_short_sqlite_write_lock(self):
+        from llm.key_pool import record_key_failure
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "ai.db"
+            create_db(db_path)
+
+            setup = sqlite3.connect(db_path)
+            try:
+                cur = setup.execute(
+                    """
+                    INSERT INTO llm_keys(provider, api_key, key_hash, status, failure_count)
+                    VALUES('groq', 'g-key', 'g-hash', 'active', 0)
+                    """
+                )
+                key_id = int(cur.lastrowid)
+                setup.commit()
+            finally:
+                setup.close()
+
+            locker = sqlite3.connect(db_path, check_same_thread=False)
+            locker.execute("BEGIN IMMEDIATE")
+            locker.execute("UPDATE llm_keys SET updated_at='locked' WHERE id=?", (key_id,))
+
+            def release_lock():
+                time.sleep(0.15)
+                locker.commit()
+                locker.close()
+
+            releaser = threading.Thread(target=release_lock)
+            releaser.start()
+            worker = sqlite3.connect(db_path)
+            worker.execute("PRAGMA busy_timeout = 20")
+            try:
+                result = record_key_failure(
+                    worker,
+                    key_id,
+                    failure_kind="timeout",
+                    error_text="request timed out",
+                    remove_threshold=3,
+                )
+                row = worker.execute(
+                    "SELECT status, failure_count, last_failure_kind FROM llm_keys WHERE id=?",
+                    (key_id,),
+                ).fetchone()
+            finally:
+                worker.close()
+                releaser.join(timeout=2)
+
+            self.assertFalse(result["removed"])
+            self.assertEqual(row[0], "active")
+            self.assertEqual(row[1], 1)
+            self.assertEqual(row[2], "timeout")
 
 
 if __name__ == "__main__":

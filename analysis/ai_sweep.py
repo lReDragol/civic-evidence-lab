@@ -1043,9 +1043,18 @@ def build_ai_sweep_prompt_review(
     lines.append("")
     lines.append("## Fix Applied")
     lines.append("")
-    lines.append("- `clean_factual_text` rerouted to `ai-sweep-v2-cleaner` and `structured_extract` to `ai-sweep-v2-extract`.")
-    lines.append("- `tag_reasoning` bumped to `ai-sweep-v2-tags` with stricter abstain-first policy for `official_profile`, `declaration`, and `restriction_record`.")
-    lines.append("- `event_link_hint` bumped to `ai-sweep-v2-event-link` with explicit standalone preference when the packet lacks enough merge evidence.")
+    lines.append(
+        f"- `clean_factual_text` uses `{PROMPT_VERSIONS['clean_factual_text']}` and "
+        f"`structured_extract` uses `{PROMPT_VERSIONS['structured_extract']}`."
+    )
+    lines.append(
+        f"- `tag_reasoning` uses `{PROMPT_VERSIONS['tag_reasoning']}` with stricter abstain-first policy "
+        "for `official_profile`, `declaration`, and `restriction_record`."
+    )
+    lines.append(
+        f"- `event_link_hint` uses `{PROMPT_VERSIONS['event_link_hint']}` with deterministic candidate gates and "
+        "explicit standalone preference when the packet lacks enough merge evidence."
+    )
     lines.append("- Provider routing now prefers `mistral`/`groq` for non-web stages and keeps `perplexity` as a late fallback for these stricter prompts.")
     lines.append("")
     lines.append("## Sample Before/After")
@@ -1100,7 +1109,7 @@ def build_ai_sweep_prompt_review(
     lines.append("")
     lines.append("- Re-run only `tag_reasoning` and `event_link_hint` for the same campaign when prompt versions change.")
     lines.append("- Keep idempotency guard: same campaign + same stage + same prompt_version + same input_hash must be skipped.")
-    lines.append("- Review at least 30 sampled units after the v2 tags/event-link rerun and classify each as `better`, `same`, or `worse`.")
+    lines.append("- Review at least 30 sampled units after the current tags/event-link rerun and classify each as `better`, `same`, or `worse`.")
     lines.append("")
     text = "\n".join(lines).strip() + "\n"
     if report_path:

@@ -4,9 +4,10 @@ import hashlib
 import json
 import re
 import sqlite3
+import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, TypeVar
 
 
 def now_iso() -> str:
@@ -83,10 +84,35 @@ PROVIDER_CATALOG: dict[str, list[dict[str, Any]]] = {
 }
 
 SUPPORTED_PROVIDERS = tuple(PROVIDER_CATALOG.keys())
+T = TypeVar("T")
 
 
 def _json_dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+
+def _is_sqlite_lock(error: sqlite3.OperationalError) -> bool:
+    text = str(error).lower()
+    return "database is locked" in text or "database table is locked" in text
+
+
+def _with_sqlite_write_retry(operation: Callable[[], T], conn: sqlite3.Connection, *, attempts: int = 8) -> T:
+    last_error: sqlite3.OperationalError | None = None
+    for index in range(max(1, int(attempts))):
+        try:
+            return operation()
+        except sqlite3.OperationalError as error:
+            if not _is_sqlite_lock(error):
+                raise
+            last_error = error
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+            time.sleep(min(0.2, 0.025 * (2**index)))
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("sqlite write retry failed without an error")
 
 
 def _hash_key(provider: str, api_key: str) -> str:
@@ -336,54 +362,60 @@ def record_key_failure(
     remove_threshold: int = 3,
     failure_code: str | None = None,
 ) -> dict[str, Any]:
-    row = conn.execute(
-        "SELECT provider, failure_count, status FROM llm_keys WHERE id=?",
-        (int(key_id),),
-    ).fetchone()
-    if row is None:
-        raise KeyError(f"Unknown llm key: {key_id}")
-    provider = str(row[0])
-    new_count = int(row[1] or 0) + 1
-    removed = new_count >= int(remove_threshold or 3)
-    conn.execute(
-        """
-        INSERT INTO llm_key_failures(key_id, provider, failure_kind, failure_code, error_text, created_at)
-        VALUES(?,?,?,?,?,?)
-        """,
-        (int(key_id), provider, failure_kind, failure_code, error_text, now_iso()),
-    )
-    conn.execute(
-        """
-        UPDATE llm_keys
-        SET failure_count=?, status=?, last_error=?, last_failure_kind=?, removed_at=?, updated_at=?
-        WHERE id=?
-        """,
-        (
-            new_count,
-            "removed" if removed else "active",
-            error_text,
-            failure_kind,
-            now_iso() if removed else None,
-            now_iso(),
-            int(key_id),
-        ),
-    )
-    _refresh_provider_health(conn)
-    conn.commit()
-    return {"key_id": int(key_id), "provider": provider, "removed": removed, "failure_count": new_count}
+    def operation() -> dict[str, Any]:
+        row = conn.execute(
+            "SELECT provider, failure_count, status FROM llm_keys WHERE id=?",
+            (int(key_id),),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"Unknown llm key: {key_id}")
+        provider = str(row[0])
+        new_count = int(row[1] or 0) + 1
+        removed = new_count >= int(remove_threshold or 3)
+        conn.execute(
+            """
+            INSERT INTO llm_key_failures(key_id, provider, failure_kind, failure_code, error_text, created_at)
+            VALUES(?,?,?,?,?,?)
+            """,
+            (int(key_id), provider, failure_kind, failure_code, error_text, now_iso()),
+        )
+        conn.execute(
+            """
+            UPDATE llm_keys
+            SET failure_count=?, status=?, last_error=?, last_failure_kind=?, removed_at=?, updated_at=?
+            WHERE id=?
+            """,
+            (
+                new_count,
+                "removed" if removed else "active",
+                error_text,
+                failure_kind,
+                now_iso() if removed else None,
+                now_iso(),
+                int(key_id),
+            ),
+        )
+        _refresh_provider_health(conn)
+        conn.commit()
+        return {"key_id": int(key_id), "provider": provider, "removed": removed, "failure_count": new_count}
+
+    return _with_sqlite_write_retry(operation, conn)
 
 
 def record_key_success(conn: sqlite3.Connection, key_id: int) -> None:
-    conn.execute(
-        """
-        UPDATE llm_keys
-        SET last_used_at=?, updated_at=?, failure_count=0, status='active'
-        WHERE id=?
-        """,
-        (now_iso(), now_iso(), int(key_id)),
-    )
-    _refresh_provider_health(conn)
-    conn.commit()
+    def operation() -> None:
+        conn.execute(
+            """
+            UPDATE llm_keys
+            SET last_used_at=?, updated_at=?, failure_count=0, status='active'
+            WHERE id=?
+            """,
+            (now_iso(), now_iso(), int(key_id)),
+        )
+        _refresh_provider_health(conn)
+        conn.commit()
+
+    _with_sqlite_write_retry(operation, conn)
 
 
 def list_active_keys(conn: sqlite3.Connection) -> list[dict[str, Any]]:
