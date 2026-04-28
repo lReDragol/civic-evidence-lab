@@ -18,6 +18,7 @@ Windows-first evidence pipeline for collecting public signals, documents, files,
 - [Quick start](#quick-start)
 - [Configuration](#configuration)
 - [Runtime and operations](#runtime-and-operations)
+- [AI Sweep](#ai-sweep)
 - [Review Ops](#review-ops)
 - [Obsidian export](#obsidian-export)
 - [Verification](#verification)
@@ -140,6 +141,7 @@ flowchart LR
 - `reviewed_baseline_pending` from `classifier_audit` is currently a warning, not a blocker.
 - Non-required degraded sources are redirected into review queues instead of killing the pipeline.
 - `event_pipeline` creates immutable derived layers (`content_derivations`, `events`, `event_facts`) without rewriting raw source text.
+- `ai_full_sweep` is a manual high-cost orchestration path: it processes canonical work units through web-grounded AI providers and writes only into derived/event/review layers.
 
 ## Data model
 
@@ -204,7 +206,44 @@ Latest validated local state in this repository:
 - latest successful pipeline: `nightly-20260426200549`
 - latest QA report: `reports/qa_quality_latest.json`
 - `quality_gate.ok = true`
-- tests: `136/136`
+- tests: `147/147`
+
+The repository also contains a DB-backed **AI Sweep foundation**:
+
+- tolerant `key.json` import into canonical provider/key tables;
+- dead-key hard removal and provider failover;
+- canonical AI work queues (`content_cluster`, singleton `content_item`, `event`, `review_task`);
+- stage-aware derivations for cleaned factual text, structured extraction, event linking, tag reasoning, relation reasoning, and event synthesis;
+- one-click UI trigger via `AI Sweep`.
+
+### Latest validated AI Sweep pilot
+
+- campaign: `pilot:ai-pilot-2026-04-27`
+- canonical sample size: `232` units
+- total completed stage runs in campaign: `872`
+- live provider-backed pilot rerun succeeded on real keys
+- stricter rerun of only affected stages (`tag_reasoning` + `event_link_hint`) reset `320` work items and left `552` untouched
+- repeated enqueue for the same campaign now returns `items_new=0`, `items_reset=0`, `items_skipped=872`, confirming stage-level idempotency
+
+Current validated stage/provider mix for the campaign:
+
+- `clean_factual_text` -> `mistral`
+- `structured_extract` -> `mistral`
+- `event_link_hint` -> `mistral`
+- `tag_reasoning` -> `mistral` / `groq`
+- `relation_reasoning` -> `perplexity`
+- `event_synthesis` -> `openai` / `perplexity`
+
+Current validated prompt versions for the campaign:
+
+- `clean_factual_text` -> `ai-sweep-v2-cleaner`
+- `structured_extract` -> `ai-sweep-v2-extract`
+- `event_link_hint` -> `ai-sweep-v2-event-link`
+- `tag_reasoning` -> `ai-sweep-v2-tags`
+- `relation_reasoning` -> `ai-sweep-v1-relations`
+- `event_synthesis` -> `ai-sweep-v1-synthesis`
+
+Because this path consumes real provider keys and may spend credits, it is intentionally validated by unit/integration tests rather than by an unconditional live full sweep.
 
 ### Current validated metrics
 
@@ -339,6 +378,7 @@ python -m runtime.run_job --job state_company_reports
 python -m runtime.run_job --job restriction_corpus
 python -m runtime.run_job --job content_dedupe
 python -m runtime.run_job --job relation_rebuild_enriched
+python -m runtime.run_job --job ai_full_sweep
 python -m runtime.run_pipeline --mode nightly
 python -m runtime.daemon
 python -m runtime.recover --request-daemon-stop
@@ -353,6 +393,43 @@ python -m runtime.task_scheduler --remove
 ```
 
 If `schtasks /Create` is unavailable in the current session, the project falls back to a launcher in the user Startup folder.
+
+## AI Sweep
+
+`AI Sweep` is a manual orchestration path for expensive AI-assisted cleanup and event-centric refinement.
+
+What it does:
+
+- imports provider keys from `key.json` into canonical DB tables (`llm_keys`, `llm_provider_models`, `llm_provider_health`);
+- keeps the DB as the operational source of truth for active and removed keys;
+- hard-removes dead keys from the active pool after repeated failures;
+- shards canonical work units across parallel workers;
+- writes AI outputs only into derived layers such as `content_derivations`, `event_candidates`, updated event summaries, attempt logs, and review queues.
+
+Default worker policy:
+
+- default target: `12`
+- minimum parallel workers: `10`
+- autoscale ceiling: `24`
+
+The UI exposes `AI Sweep` as a top action. On successful completion the desktop shell shows a toast and a completion dialog with processed-unit statistics.
+
+Validated pilot artifacts from the live 1% run:
+
+- `reports/ai_sweep_pilot_before_rerun.json`
+- `reports/ai_sweep_pilot_after_rerun.json`
+- `reports/ai_sweep_pilot_diff_rerun.json`
+- `reports/ai_sweep_pilot_before_v2_tags.json`
+- `reports/ai_sweep_pilot_after_v2_tags.json`
+- `reports/ai_sweep_pilot_diff_v2_tags.json`
+- `reports/ai_sweep_prompt_review_v2_tags.md`
+
+Operational rules validated in the pilot:
+
+- `key.json` is import-only; the DB key pool is the runtime source of truth.
+- removed keys are not resurrected by repeated import.
+- prompt-version bumps rerun only affected stages.
+- repeated enqueue of the same campaign skips already-good work without touching raw content.
 
 ## Review Ops
 

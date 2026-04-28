@@ -83,6 +83,8 @@ AMBIGUOUS_PERSON_TOKENS = {
     "мария",
 }
 PROMOTION_BRIDGE_TYPES = {
+    "Event",
+    "Fact",
     "Bill",
     "Contract",
     "VotePattern",
@@ -92,12 +94,13 @@ PROMOTION_BRIDGE_TYPES = {
     "Asset",
 }
 OFFICIAL_PROMOTION_BRIDGE_TYPES = {
+    "Fact",
     "RestrictionEvent",
     "Affiliation",
     "Disclosure",
     "Asset",
 }
-OFFICIAL_SEED_KINDS = {"restriction", "affiliation", "disclosure"}
+OFFICIAL_SEED_KINDS = {"restriction", "affiliation", "disclosure", "event_fact"}
 OFFICIAL_CANDIDATE_CONTENT_TYPES = {"restriction_record", "declaration", "official_document"}
 NON_CONTENT_PATH_TYPES = PROMOTION_BRIDGE_TYPES | {"OfficialDocument"}
 
@@ -243,6 +246,8 @@ def _pair_entity_quality(
     quality = round(min(quality_a, quality_b), 4)
     if quality >= 0.45:
         return quality, None
+    if (entity_a_type == "location" and reason_a) or (entity_b_type == "location" and reason_b):
+        return quality, reason_a or reason_b or "low_entity_specificity"
     if bridge_types & PROMOTION_BRIDGE_TYPES:
         return quality, None
     return quality, reason_a or reason_b or "low_entity_specificity"
@@ -734,6 +739,96 @@ def _load_official_bridge_support_rows(
     return support_rows
 
 
+def _load_event_fact_bridge_support_rows(
+    conn,
+    *,
+    content_context_map: dict[int, dict[str, Any]],
+) -> dict[tuple[int, int], list[dict[str, Any]]]:
+    support_rows: dict[tuple[int, int], list[dict[str, Any]]] = defaultdict(list)
+    if not (_table_exists(conn, "event_facts") and _table_exists(conn, "event_entities")):
+        return support_rows
+    evidence_rows: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    if _table_exists(conn, "fact_evidence"):
+        for row in conn.execute(
+            """
+            SELECT
+                fe.fact_id,
+                COALESCE(fe.document_content_id, fe.content_item_id) AS source_content_id,
+                COALESCE(fe.evidence_class, 'support') AS evidence_class,
+                COALESCE(fe.evidence_type, '') AS evidence_type,
+                COALESCE(fe.source_strength, '') AS source_strength
+            FROM fact_evidence fe
+            """
+        ).fetchall():
+            evidence_rows[int(row[0])].append(
+                {
+                    "source_content_id": int(row[1]) if row[1] is not None else None,
+                    "evidence_class": row[2],
+                    "evidence_type": row[3],
+                    "source_strength": row[4],
+                }
+            )
+    entity_rows: dict[int, list[int]] = defaultdict(list)
+    for row in conn.execute(
+        """
+        SELECT event_id, entity_id
+        FROM event_entities
+        WHERE entity_id IS NOT NULL
+        ORDER BY event_id, entity_id
+        """
+    ).fetchall():
+        entity_id = int(row[1])
+        if entity_id not in entity_rows[int(row[0])]:
+            entity_rows[int(row[0])].append(entity_id)
+    for row in conn.execute(
+        """
+        SELECT
+            ef.id,
+            ef.event_id,
+            COALESCE(ef.fact_type, '') AS fact_type,
+            COALESCE(ef.canonical_text, '') AS canonical_text,
+            COALESCE(ef.valid_from, ef.observed_at, ef.recorded_at, '') AS seen_at
+        FROM event_facts ef
+        WHERE ef.superseded_at IS NULL
+        """
+    ).fetchall():
+        fact_id = int(row[0])
+        event_id = int(row[1])
+        event_entities = sorted(set(entity_rows.get(event_id, [])))
+        if len(event_entities) < 2 or len(event_entities) > 30:
+            continue
+        fact_evidence_rows = evidence_rows.get(fact_id) or [{"source_content_id": None, "evidence_class": "support"}]
+        for left, right in combinations(event_entities, 2):
+            entity_a = min(int(left), int(right))
+            entity_b = max(int(left), int(right))
+            if entity_a == entity_b:
+                continue
+            for evidence in fact_evidence_rows[:5]:
+                source_content_id = evidence.get("source_content_id")
+                content_context = content_context_map.get(int(source_content_id)) if source_content_id is not None else None
+                bridge_row = _official_bridge_row(
+                    bridge_kind="event_fact",
+                    bridge_id=fact_id,
+                    entity_a=entity_a,
+                    entity_b=entity_b,
+                    default_content_type="official_document",
+                    source_content_id=int(source_content_id) if source_content_id is not None else None,
+                    source_url=None,
+                    source_category="official_site",
+                    seen_at=row[4],
+                    title=row[2] or f"Event fact #{fact_id}",
+                    body_text=row[3],
+                    evidence_class=evidence.get("evidence_class"),
+                    content_context=content_context,
+                )
+                bridge_row["event_id"] = event_id
+                bridge_row["fact_id"] = fact_id
+                bridge_row["bridge_support_unit"] = f"event_fact:{event_id}:{fact_id}"
+                bridge_row["support_unit"] = f"event_fact:{event_id}:{fact_id}"
+                support_rows[(entity_a, entity_b)].append(bridge_row)
+    return support_rows
+
+
 def _merge_membership_map(target: dict[int, set[int]], source: dict[int, set[int]]) -> dict[int, set[int]]:
     for entity_id, values in source.items():
         target[int(entity_id)].update(int(value) for value in values)
@@ -767,6 +862,38 @@ def _bridge_rows_to_maps(
             membership_map[int(entity_b)].add(bridge_id_int)
             pair_map[(int(entity_a), int(entity_b))].add(bridge_id_int)
     return membership_map, pair_map
+
+
+def _event_fact_rows_to_maps(
+    rows_map: dict[tuple[int, int], list[dict[str, Any]]],
+) -> tuple[
+    dict[int, set[int]],
+    dict[tuple[int, int], set[int]],
+    dict[int, set[int]],
+    dict[tuple[int, int], set[int]],
+]:
+    event_membership_map: dict[int, set[int]] = defaultdict(set)
+    event_pair_map: dict[tuple[int, int], set[int]] = defaultdict(set)
+    fact_membership_map: dict[int, set[int]] = defaultdict(set)
+    fact_pair_map: dict[tuple[int, int], set[int]] = defaultdict(set)
+    for pair, rows in rows_map.items():
+        entity_a, entity_b = pair
+        for row in rows:
+            if row.get("bridge_kind") != "event_fact":
+                continue
+            event_id = row.get("event_id")
+            fact_id = row.get("fact_id") or row.get("bridge_id")
+            if event_id is not None:
+                event_id_int = int(event_id)
+                event_membership_map[int(entity_a)].add(event_id_int)
+                event_membership_map[int(entity_b)].add(event_id_int)
+                event_pair_map[(int(entity_a), int(entity_b))].add(event_id_int)
+            if fact_id is not None:
+                fact_id_int = int(fact_id)
+                fact_membership_map[int(entity_a)].add(fact_id_int)
+                fact_membership_map[int(entity_b)].add(fact_id_int)
+                fact_pair_map[(int(entity_a), int(entity_b))].add(fact_id_int)
+    return event_membership_map, event_pair_map, fact_membership_map, fact_pair_map
 
 
 def _has_existing_non_candidate_relation(conn, entity_a: int, entity_b: int) -> bool:
@@ -820,6 +947,9 @@ def _merge_support_rows(
         if row.get("bridge_kind"):
             existing["_bridge_types"].add(str(row["bridge_kind"]))
             existing["_bridge_units"].add(str(row.get("bridge_support_unit") or f"{row['bridge_kind']}:{row.get('bridge_id')}"))
+        for field in ("event_id", "fact_id"):
+            if existing.get(field) is None and row.get(field) is not None:
+                existing[field] = row[field]
         for field in ("content_type", "source_category", "source_url", "seen_at", "title", "body_text"):
             if not existing.get(field) and row.get(field):
                 existing[field] = row[field]
@@ -1026,6 +1156,8 @@ def _structural_score(
         return 0.5
     if structural_seed_kind == "disclosure":
         return 0.45
+    if structural_seed_kind == "event_fact":
+        return 0.65
     return 0.0
 
 
@@ -1087,6 +1219,17 @@ def _candidate_state(
     if candidate_type == "same_case_cluster" and not has_nonseed_bridge:
         return "seed_only" if structural_seed_kind else "pending"
     if (
+        candidate_type != "same_case_cluster"
+        and explain_path
+        and shortest_bridge_path
+        and support_hard_evidence_count >= 1
+        and support_items >= 1
+        and support_domains >= 1
+        and has_nonseed_bridge
+        and has_official_bridge
+    ):
+        return "promoted"
+    if (
         explain_path
         and shortest_bridge_path
         and calibrated_score >= PROMOTION_SCORE_THRESHOLD
@@ -1114,6 +1257,8 @@ def _candidate_state(
 
 def _build_explain_path(
     *,
+    shared_event_ids: list[int],
+    shared_fact_ids: list[int],
     shared_content_ids: list[int],
     shared_claim_cluster_ids: list[int],
     shared_case_ids: list[int],
@@ -1129,6 +1274,10 @@ def _build_explain_path(
     entity_semantic_score: float,
 ) -> list[dict[str, Any]]:
     path: list[dict[str, Any]] = []
+    if shared_event_ids:
+        path.append({"node_type": "Event", "ids": shared_event_ids[:5]})
+    if shared_fact_ids:
+        path.append({"node_type": "Fact", "ids": shared_fact_ids[:5]})
     if shared_claim_cluster_ids:
         path.append({"node_type": "ClaimCluster", "ids": shared_claim_cluster_ids[:5]})
     if shared_content_ids:
@@ -1162,6 +1311,8 @@ def _build_shortest_bridge_path(
     *,
     entity_a: int,
     entity_b: int,
+    shared_event_ids: list[int],
+    shared_fact_ids: list[int],
     shared_content_rows: list[dict[str, Any]],
     shared_claim_cluster_ids: list[int],
     shared_case_ids: list[int],
@@ -1185,6 +1336,10 @@ def _build_shortest_bridge_path(
         graph.add_edge(node_a, bridge, weight=weight)
         graph.add_edge(bridge, node_b, weight=weight)
 
+    for event_id in shared_event_ids[:6]:
+        add_bridge("Event", int(event_id), 0.78)
+    for fact_id in shared_fact_ids[:6]:
+        add_bridge("Fact", int(fact_id), 0.62)
     for claim_cluster_id in shared_claim_cluster_ids[:6]:
         add_bridge("ClaimCluster", int(claim_cluster_id), 1.35)
     for row in shared_content_rows[:12]:
@@ -1475,6 +1630,15 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
             content_context_map=content_context_map,
             organization_lookup=organization_lookup,
         )
+        event_fact_bridge_support_map = _load_event_fact_bridge_support_rows(
+            conn,
+            content_context_map=content_context_map,
+        )
+        for pair, rows in event_fact_bridge_support_map.items():
+            official_bridge_support_map[pair].extend(rows)
+        event_bridge_membership_map, event_pair_map, fact_bridge_membership_map, fact_pair_map = _event_fact_rows_to_maps(
+            official_bridge_support_map
+        )
         disclosure_bridge_membership_map, disclosure_bridge_pair_map = _bridge_rows_to_maps(
             official_bridge_support_map,
             bridge_kind="disclosure",
@@ -1498,8 +1662,12 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
         pair_keys.update(restriction_pair_map)
         pair_keys.update(affiliation_pair_map)
         pair_keys.update(disclosure_pair_map)
+        pair_keys.update(event_pair_map)
+        pair_keys.update(fact_pair_map)
 
         bridge_memberships = {
+            "Event": event_bridge_membership_map,
+            "Fact": fact_bridge_membership_map,
             "Case": case_map,
             "Bill": bill_map,
             "Contract": contract_map,
@@ -1532,6 +1700,8 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
                 structural_seed_kind = "affiliation"
             elif (entity_a, entity_b) in disclosure_pair_map:
                 structural_seed_kind = "disclosure"
+            elif (entity_a, entity_b) in fact_pair_map or (entity_a, entity_b) in event_pair_map:
+                structural_seed_kind = "event_fact"
             elif (entity_a, entity_b) in bill_seed_pairs:
                 structural_seed_kind = "bill"
             elif (entity_a, entity_b) in case_seed_pairs or (entity_a, entity_b) in risk_seed_pairs:
@@ -1562,6 +1732,8 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
             shared_affiliation_ids = sorted(affiliation_pair_map.get((entity_a, entity_b), set()))
             shared_disclosure_ids = sorted(disclosure_pair_map.get((entity_a, entity_b), set()))
             shared_asset_ids = sorted(asset_map.get(entity_a, set()) & asset_map.get(entity_b, set()))
+            shared_event_ids = sorted(event_pair_map.get((entity_a, entity_b), set()))
+            shared_fact_ids = sorted(fact_pair_map.get((entity_a, entity_b), set()))
 
             case_overlap = len(shared_case_ids)
             bill_overlap = len(shared_bill_ids)
@@ -1727,6 +1899,8 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
                 4,
             )
             explain_path = _build_explain_path(
+                shared_event_ids=shared_event_ids,
+                shared_fact_ids=shared_fact_ids,
                 shared_content_ids=shared_content_ids,
                 shared_claim_cluster_ids=shared_claim_cluster_ids,
                 shared_case_ids=shared_case_ids,
@@ -1744,6 +1918,8 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
             shortest_bridge_path = _build_shortest_bridge_path(
                 entity_a=entity_a,
                 entity_b=entity_b,
+                shared_event_ids=shared_event_ids,
+                shared_fact_ids=shared_fact_ids,
                 shared_content_rows=support_rows,
                 shared_claim_cluster_ids=shared_claim_cluster_ids,
                 shared_case_ids=shared_case_ids,
@@ -1765,6 +1941,16 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
                 for node in explain_path
             }
             official_bridge_types = bridge_types & OFFICIAL_PROMOTION_BRIDGE_TYPES
+            event_consistency_score = round(min(1.0, len(shared_event_ids) / 2.0), 4)
+            fact_support_score = round(
+                min(1.0, min(0.55, len(shared_fact_ids) * 0.35) + min(0.45, support_hard_evidence_count * 0.15)),
+                4,
+            )
+            official_bridge_score = round(
+                min(1.0, min(0.55, len(official_bridge_types) * 0.30) + min(0.45, support_hard_evidence_count * 0.20)),
+                4,
+            )
+            telegram_penalty = 1.0 if support_rows and all((row.get("source_category") or "") == "telegram" for row in support_rows) else 0.0
             entity_quality_score, entity_block_reason = _pair_entity_quality(
                 entity_a_type,
                 entity_a_name,
@@ -1815,9 +2001,11 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
                 promotion_block_reason = promotion_block_reason or "official_bridge_missing"
             elif metrics["support_items"] > 0 and metrics["support_sources"] >= 2 and metrics["support_domains"] == 0:
                 promotion_block_reason = promotion_block_reason or "fake_domain_diversity"
-            elif metrics["support_items"] > 0 and dedupe_support_score < 0.45 and metrics["support_sources"] < 2:
+            elif metrics["support_items"] > 0 and dedupe_support_score < 0.50:
                 promotion_block_reason = promotion_block_reason or "duplicate_amplified_support"
-            official_bridge_bonus = 0.03 * min(1.0, len(official_bridge_types))
+            if metrics["support_items"] > 0 and dedupe_support_score < 0.50:
+                promotion_block_reason = promotion_block_reason or "duplicate_amplified_support"
+            official_bridge_bonus = 0.10 * official_bridge_score
             calibrated_score = round(
                 min(
                     1.0,
@@ -1832,7 +2020,10 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
                     + 0.05 * dedupe_support_score
                     + 0.05 * real_host_diversity_score
                     + 0.05 * bridge_diversity_score
+                    + 0.05 * event_consistency_score
+                    + 0.07 * fact_support_score
                     + official_bridge_bonus
+                    - 0.06 * telegram_penalty
                 ),
                 4,
             )
@@ -1881,6 +2072,9 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
                 ),
                 "duplicate_count_total": metrics["duplicate_count_total"],
                 "bridge_types": [str(node.get("node_type") or "") for node in explain_path],
+                "bridge_kinds": sorted({str(row.get("bridge_kind") or "") for row in support_rows if row.get("bridge_kind")}),
+                "event_ids": shared_event_ids[:10],
+                "fact_ids": shared_fact_ids[:10],
             }
             metadata = {
                 "shared_claims": shared_claims,
@@ -1896,6 +2090,8 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
                 "affiliation_overlap": len(shared_affiliation_ids),
                 "disclosure_overlap": len(shared_disclosure_ids),
                 "asset_overlap": len(shared_asset_ids),
+                "event_overlap": len(shared_event_ids),
+                "fact_overlap": len(shared_fact_ids),
                 "same_vote_count": same_votes,
                 "shared_vote_count": shared_vote_count,
                 "same_vote_ratio": round(vote_overlap_ratio, 4),
@@ -1906,6 +2102,10 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
                 "explain_path": explain_path,
                 "shortest_bridge_path": shortest_bridge_path,
                 "promotion_block_reason": promotion_block_reason,
+                "event_consistency_score": event_consistency_score,
+                "fact_support_score": fact_support_score,
+                "official_bridge_score": official_bridge_score,
+                "telegram_penalty": telegram_penalty,
             }
 
             cur = conn.execute(
@@ -1965,8 +2165,9 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
                     candidate_id, structural_score, content_support_score, source_diversity_score,
                     semantic_support_score, shared_claim_cluster_score, evidence_quality_score,
                     entity_quality_score, dedupe_support_score, real_host_diversity_score, bridge_diversity_score,
+                    event_consistency_score, fact_support_score, official_bridge_score, telegram_penalty,
                     temporal_score, role_compatibility_score, calibrated_score, explain_path_json, metadata_json, updated_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     candidate_id,
@@ -1980,6 +2181,10 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
                     dedupe_support_score,
                     real_host_diversity_score,
                     bridge_diversity_score,
+                    event_consistency_score,
+                    fact_support_score,
+                    official_bridge_score,
+                    telegram_penalty,
                     metrics["temporal_proximity"],
                     metrics["role_compatibility"],
                     calibrated_score,
@@ -2000,8 +2205,9 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
                 conn.execute(
                     """
                     INSERT INTO relation_support(
-                        candidate_id, support_kind, support_class, content_item_id, source_id, domain, category, metadata_json
-                    ) VALUES(?,?,?,?,?,?,?,?)
+                        candidate_id, support_kind, support_class, content_item_id, source_id, domain, category,
+                        event_id, fact_id, metadata_json
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?)
                     """,
                     (
                         candidate_id,
@@ -2011,6 +2217,8 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
                         row["source_id"],
                         row.get("domain"),
                         row["source_category"],
+                        row.get("event_id"),
+                        row.get("fact_id"),
                         json.dumps(
                             {
                                 "seen_at": row["seen_at"],
@@ -2020,6 +2228,8 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
                                 "content_type": row.get("content_type"),
                                 "bridge_kind": row.get("bridge_kind"),
                                 "bridge_id": row.get("bridge_id"),
+                                "event_id": row.get("event_id"),
+                                "fact_id": row.get("fact_id"),
                                 "is_official_bridge": bool(row.get("is_official_bridge")),
                             },
                             ensure_ascii=False,

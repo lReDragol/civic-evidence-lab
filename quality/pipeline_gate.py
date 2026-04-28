@@ -36,6 +36,8 @@ DEFAULT_CONFIG = {
 }
 GENERIC_RELATION_LOCATIONS = {"россии", "россия", "москва", "москвы", "рф"}
 PROMOTION_BRIDGE_TYPES = {
+    "Event",
+    "Fact",
     "Bill",
     "Contract",
     "VotePattern",

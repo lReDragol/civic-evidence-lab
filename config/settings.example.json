@@ -149,5 +149,21 @@
         "tag_drift_threshold": 0.35,
         "strict_gate": true,
         "report_path": "reports/classifier_audit_latest.json"
+    },
+
+    "ai_sweep": {
+        "key_file": "key.json",
+        "default_worker_count": 12,
+        "min_parallel_workers": 10,
+        "max_parallel_workers": 24,
+        "dead_key_threshold": 3,
+        "max_units_per_run": 0,
+        "provider_priority": [
+            "mistral",
+            "perplexity",
+            "groq",
+            "openrouter",
+            "openai"
+        ]
     }
 }

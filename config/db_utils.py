@@ -19,6 +19,14 @@ ADDITIVE_COLUMNS = {
     "content_items": {
         "classification_v3_processed": "INTEGER DEFAULT 0",
     },
+    "content_derivations": {
+        "campaign_id": "INTEGER",
+        "work_item_id": "INTEGER",
+        "event_context_json": "TEXT",
+        "fact_context_json": "TEXT",
+        "temporal_window_json": "TEXT",
+        "is_current": "INTEGER DEFAULT 0",
+    },
     "content_tag_votes": {
         "signal_layer": "TEXT DEFAULT 'raw'",
         "abstain_reason": "TEXT",
@@ -57,12 +65,18 @@ ADDITIVE_COLUMNS = {
     },
     "relation_support": {
         "support_class": "TEXT DEFAULT 'seed'",
+        "event_id": "INTEGER",
+        "fact_id": "INTEGER",
     },
     "relation_features": {
         "entity_quality_score": "REAL DEFAULT 0",
         "dedupe_support_score": "REAL DEFAULT 0",
         "real_host_diversity_score": "REAL DEFAULT 0",
         "bridge_diversity_score": "REAL DEFAULT 0",
+        "event_consistency_score": "REAL DEFAULT 0",
+        "fact_support_score": "REAL DEFAULT 0",
+        "official_bridge_score": "REAL DEFAULT 0",
+        "telegram_penalty": "REAL DEFAULT 0",
     },
     "source_sync_state": {
         "quality_state": "TEXT DEFAULT 'unknown'",
@@ -99,6 +113,15 @@ ADDITIVE_COLUMNS = {
         "recorded_at": "TEXT",
         "superseded_at": "TEXT",
     },
+    "ai_work_items": {
+        "campaign_id": "INTEGER",
+        "prompt_version": "TEXT NOT NULL DEFAULT 'ai-sweep-v1'",
+        "input_hash": "TEXT",
+        "sample_bucket": "TEXT",
+    },
+    "ai_task_attempts": {
+        "failure_kind": "TEXT",
+    },
 }
 
 ADDITIVE_SCHEMA_SQL = """
@@ -121,6 +144,178 @@ CREATE TABLE IF NOT EXISTS content_tag_votes (
 CREATE INDEX IF NOT EXISTS idx_content_tag_votes_item ON content_tag_votes(content_item_id);
 CREATE INDEX IF NOT EXISTS idx_content_tag_votes_tag ON content_tag_votes(normalized_tag);
 CREATE INDEX IF NOT EXISTS idx_content_tag_votes_vote ON content_tag_votes(vote_value);
+
+CREATE TABLE IF NOT EXISTS llm_keys (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    provider        TEXT NOT NULL,
+    api_key         TEXT NOT NULL,
+    key_hash        TEXT NOT NULL UNIQUE,
+    status          TEXT NOT NULL DEFAULT 'active',
+    failure_count   INTEGER NOT NULL DEFAULT 0,
+    last_error      TEXT,
+    last_failure_kind TEXT,
+    last_used_at    TEXT,
+    metadata_json   TEXT,
+    removed_at      TEXT,
+    created_at      TEXT DEFAULT (datetime('now')),
+    updated_at      TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_llm_keys_provider ON llm_keys(provider);
+CREATE INDEX IF NOT EXISTS idx_llm_keys_status ON llm_keys(status);
+
+CREATE TABLE IF NOT EXISTS llm_key_failures (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    key_id          INTEGER NOT NULL,
+    provider        TEXT NOT NULL,
+    failure_kind    TEXT NOT NULL,
+    failure_code    TEXT,
+    error_text      TEXT,
+    created_at      TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (key_id) REFERENCES llm_keys(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_llm_key_failures_key ON llm_key_failures(key_id);
+CREATE INDEX IF NOT EXISTS idx_llm_key_failures_provider ON llm_key_failures(provider);
+
+CREATE TABLE IF NOT EXISTS llm_provider_models (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    provider        TEXT NOT NULL,
+    model_name      TEXT NOT NULL,
+    capability_tier INTEGER NOT NULL DEFAULT 1,
+    stage_roles_json TEXT,
+    supports_web_search INTEGER NOT NULL DEFAULT 0,
+    supports_reasoning INTEGER NOT NULL DEFAULT 0,
+    supports_background INTEGER NOT NULL DEFAULT 0,
+    is_active       INTEGER NOT NULL DEFAULT 1,
+    metadata_json   TEXT,
+    created_at      TEXT DEFAULT (datetime('now')),
+    updated_at      TEXT DEFAULT (datetime('now')),
+    UNIQUE(provider, model_name)
+);
+CREATE INDEX IF NOT EXISTS idx_llm_provider_models_provider ON llm_provider_models(provider);
+CREATE INDEX IF NOT EXISTS idx_llm_provider_models_web ON llm_provider_models(supports_web_search, is_active);
+
+CREATE TABLE IF NOT EXISTS llm_provider_health (
+    provider        TEXT PRIMARY KEY,
+    status          TEXT NOT NULL DEFAULT 'unknown',
+    active_key_count INTEGER NOT NULL DEFAULT 0,
+    last_checked_at TEXT,
+    last_success_at TEXT,
+    metadata_json   TEXT,
+    updated_at      TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS ai_sweep_campaigns (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    campaign_key    TEXT NOT NULL UNIQUE,
+    campaign_seed   TEXT NOT NULL,
+    mode            TEXT NOT NULL DEFAULT 'pilot',
+    provider_mode   TEXT NOT NULL DEFAULT 'conservative',
+    sample_size     INTEGER NOT NULL DEFAULT 0,
+    selection_json  TEXT,
+    prompt_versions_json TEXT,
+    status          TEXT NOT NULL DEFAULT 'planned',
+    created_at      TEXT DEFAULT (datetime('now')),
+    updated_at      TEXT DEFAULT (datetime('now')),
+    last_run_at     TEXT,
+    completed_at    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_ai_sweep_campaigns_status ON ai_sweep_campaigns(status);
+
+CREATE TABLE IF NOT EXISTS ai_work_items (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    pipeline_run_id INTEGER,
+    campaign_id     INTEGER,
+    unit_kind       TEXT NOT NULL,
+    unit_key        TEXT NOT NULL,
+    stage           TEXT NOT NULL,
+    unit_ref_id     INTEGER,
+    canonical_content_id INTEGER,
+    event_id        INTEGER,
+    review_task_id  INTEGER,
+    prompt_version  TEXT NOT NULL DEFAULT 'ai-sweep-v1',
+    input_hash      TEXT,
+    sample_bucket   TEXT,
+    priority        INTEGER NOT NULL DEFAULT 50,
+    status          TEXT NOT NULL DEFAULT 'pending',
+    lease_owner     TEXT,
+    lease_expires_at TEXT,
+    attempt_count   INTEGER NOT NULL DEFAULT 0,
+    provider        TEXT,
+    model_name      TEXT,
+    payload_json    TEXT,
+    result_json     TEXT,
+    error_text      TEXT,
+    created_at      TEXT DEFAULT (datetime('now')),
+    updated_at      TEXT DEFAULT (datetime('now')),
+    completed_at    TEXT,
+    FOREIGN KEY (pipeline_run_id) REFERENCES pipeline_runs(id) ON DELETE SET NULL,
+    FOREIGN KEY (campaign_id) REFERENCES ai_sweep_campaigns(id) ON DELETE SET NULL,
+    UNIQUE(unit_kind, unit_key, stage)
+);
+CREATE INDEX IF NOT EXISTS idx_ai_work_items_status ON ai_work_items(status);
+CREATE INDEX IF NOT EXISTS idx_ai_work_items_stage ON ai_work_items(stage);
+CREATE INDEX IF NOT EXISTS idx_ai_work_items_pipeline ON ai_work_items(pipeline_run_id);
+CREATE INDEX IF NOT EXISTS idx_ai_work_items_campaign ON ai_work_items(campaign_id, status);
+
+CREATE TABLE IF NOT EXISTS ai_task_attempts (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    work_item_id    INTEGER NOT NULL,
+    provider        TEXT,
+    model_name      TEXT,
+    llm_key_id      INTEGER,
+    status          TEXT NOT NULL,
+    failure_kind    TEXT,
+    error_text      TEXT,
+    output_json     TEXT,
+    started_at      TEXT DEFAULT (datetime('now')),
+    finished_at     TEXT,
+    FOREIGN KEY (work_item_id) REFERENCES ai_work_items(id) ON DELETE CASCADE,
+    FOREIGN KEY (llm_key_id) REFERENCES llm_keys(id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ai_task_attempts_work_item ON ai_task_attempts(work_item_id);
+CREATE INDEX IF NOT EXISTS idx_ai_task_attempts_key ON ai_task_attempts(llm_key_id);
+
+CREATE TABLE IF NOT EXISTS event_candidates (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    unit_kind       TEXT NOT NULL,
+    unit_key        TEXT NOT NULL,
+    content_item_id INTEGER,
+    content_cluster_id INTEGER,
+    suggested_event_id INTEGER,
+    candidate_state TEXT NOT NULL DEFAULT 'suggested',
+    confidence      REAL DEFAULT 0,
+    suggestion_json TEXT,
+    model_provider  TEXT,
+    model_name      TEXT,
+    prompt_version  TEXT,
+    status          TEXT NOT NULL DEFAULT 'open',
+    created_at      TEXT DEFAULT (datetime('now')),
+    updated_at      TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (content_item_id) REFERENCES content_items(id) ON DELETE SET NULL,
+    FOREIGN KEY (content_cluster_id) REFERENCES content_clusters(id) ON DELETE SET NULL,
+    FOREIGN KEY (suggested_event_id) REFERENCES events(id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_event_candidates_state ON event_candidates(candidate_state, status);
+CREATE INDEX IF NOT EXISTS idx_event_candidates_event ON event_candidates(suggested_event_id);
+
+CREATE TABLE IF NOT EXISTS event_merge_reviews (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_a_id      INTEGER NOT NULL,
+    event_b_id      INTEGER NOT NULL,
+    suggested_action TEXT NOT NULL DEFAULT 'merge',
+    confidence      REAL DEFAULT 0,
+    machine_reason  TEXT,
+    payload_json    TEXT,
+    status          TEXT NOT NULL DEFAULT 'open',
+    reviewed_at     TEXT,
+    reviewer        TEXT,
+    created_at      TEXT DEFAULT (datetime('now')),
+    updated_at      TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (event_a_id) REFERENCES events(id) ON DELETE CASCADE,
+    FOREIGN KEY (event_b_id) REFERENCES events(id) ON DELETE CASCADE,
+    UNIQUE(event_a_id, event_b_id)
+);
+CREATE INDEX IF NOT EXISTS idx_event_merge_reviews_status ON event_merge_reviews(status);
 
 CREATE TABLE IF NOT EXISTS semantic_neighbors (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -179,6 +374,14 @@ CREATE TABLE IF NOT EXISTS relation_features (
     semantic_support_score REAL DEFAULT 0,
     shared_claim_cluster_score REAL DEFAULT 0,
     evidence_quality_score REAL DEFAULT 0,
+    entity_quality_score REAL DEFAULT 0,
+    dedupe_support_score REAL DEFAULT 0,
+    real_host_diversity_score REAL DEFAULT 0,
+    bridge_diversity_score REAL DEFAULT 0,
+    event_consistency_score REAL DEFAULT 0,
+    fact_support_score REAL DEFAULT 0,
+    official_bridge_score REAL DEFAULT 0,
+    telegram_penalty REAL DEFAULT 0,
     temporal_score REAL DEFAULT 0,
     role_compatibility_score REAL DEFAULT 0,
     calibrated_score REAL DEFAULT 0,
@@ -430,6 +633,8 @@ CREATE INDEX IF NOT EXISTS idx_source_fixtures_active ON source_fixtures(is_acti
 CREATE TABLE IF NOT EXISTS content_derivations (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     content_item_id INTEGER NOT NULL,
+    campaign_id     INTEGER,
+    work_item_id    INTEGER,
     derivation_type TEXT NOT NULL,
     model_provider  TEXT NOT NULL DEFAULT 'deterministic',
     model_name      TEXT NOT NULL DEFAULT 'event-pipeline-v1',
@@ -437,8 +642,12 @@ CREATE TABLE IF NOT EXISTS content_derivations (
     input_hash      TEXT NOT NULL,
     output_text     TEXT,
     output_json     TEXT,
+    event_context_json TEXT,
+    fact_context_json TEXT,
+    temporal_window_json TEXT,
     confidence      REAL DEFAULT 0,
     status          TEXT DEFAULT 'ready',
+    is_current      INTEGER DEFAULT 0,
     created_at      TEXT DEFAULT (datetime('now')),
     updated_at      TEXT DEFAULT (datetime('now')),
     FOREIGN KEY (content_item_id) REFERENCES content_items(id) ON DELETE CASCADE,
@@ -653,6 +862,27 @@ def ensure_additive_schema(conn: sqlite3.Connection):
         index_name="idx_relation_support_class",
         columns_sql="support_class",
         required_columns=("support_class",),
+    )
+    _create_index_if_columns_exist(
+        conn,
+        table_name="relation_support",
+        index_name="idx_relation_support_event_fact",
+        columns_sql="event_id, fact_id",
+        required_columns=("event_id", "fact_id"),
+    )
+    _create_index_if_columns_exist(
+        conn,
+        table_name="content_derivations",
+        index_name="idx_content_derivations_current",
+        columns_sql="content_item_id, derivation_type, is_current",
+        required_columns=("content_item_id", "derivation_type", "is_current"),
+    )
+    _create_index_if_columns_exist(
+        conn,
+        table_name="ai_task_attempts",
+        index_name="idx_ai_task_attempts_failure_kind",
+        columns_sql="failure_kind",
+        required_columns=("failure_kind",),
     )
     _create_index_if_columns_exist(
         conn,

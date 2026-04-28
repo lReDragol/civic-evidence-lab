@@ -28,6 +28,7 @@
     sidebarCollapsed: true,
     tasksCollapsed: true,
     taskTab: "queue",
+    relationMapViewport: null,
   };
 
   const ui = {};
@@ -64,6 +65,7 @@
     ui.tasksGroups = document.getElementById("tasks-groups");
     ui.jobDetailCard = document.getElementById("job-detail-card");
     ui.toastStack = document.getElementById("toast-stack");
+    ui.aiSweepBtn = document.getElementById("ai-sweep-btn");
     ui.toggleSourcesBtn = document.getElementById("toggle-sources-btn");
     ui.toggleTasksBtn = document.getElementById("toggle-tasks-btn");
     ui.schedulerToggleBtn = document.getElementById("scheduler-toggle-btn");
@@ -190,6 +192,11 @@
 
   function bindShellEvents() {
     document.getElementById("manual-refresh-btn").addEventListener("click", manualRefresh);
+    if (ui.aiSweepBtn) {
+      ui.aiSweepBtn.addEventListener("click", () => {
+        bridgeVoid("runJob", "ai_full_sweep");
+      });
+    }
     document.getElementById("refresh-sources-btn").addEventListener("click", requestSources);
     document.getElementById("export-obsidian-btn").addEventListener("click", () => {
       bridgeVoid("exportObsidian");
@@ -277,10 +284,13 @@
     });
   }
 
-  function scheduleRelationMapStageSync() {
+  function scheduleRelationMapStageSync(options = {}) {
+    const shouldRefit = Boolean(options.refit);
     requestAnimationFrame(() => {
       syncRelationMapStage();
-      refitVisibleGraphs();
+      if (shouldRefit) {
+        refitVisibleGraphs();
+      }
     });
   }
 
@@ -2886,10 +2896,23 @@
         return;
       }
       if (graph.mode === "relation-map") {
+        if (graphRoot.dataset.graphNeedsFit === "false") {
+          return;
+        }
         resetGraphViewport(graph);
+        graphRoot.dataset.graphNeedsFit = "false";
         updateGraphEdges(graph);
       }
     });
+  }
+
+  function relationGraphSignature(graphRoot) {
+    return [
+      state.filters.relations.layer || "all",
+      state.filters.relations.map_group || "all",
+      graphRoot.querySelectorAll(".node-graph-node").length,
+      graphRoot.querySelectorAll(".node-graph-edge-group").length,
+    ].join(":");
   }
 
   function initializeEvidenceGraph(graphRoot) {
@@ -2922,7 +2945,15 @@
       nodes: new Map(),
       edges: [],
     };
+    const graphSignature = relationGraphSignature(graphRoot);
+    const savedViewport =
+      graph.mode === "relation-map" &&
+      state.relationMapViewport &&
+      state.relationMapViewport.signature === graphSignature
+        ? state.relationMapViewport
+        : null;
     graphRoot.__graphState = graph;
+    graphRoot.dataset.graphNeedsFit = savedViewport ? "false" : "true";
 
     scene.style.width = `${graph.width}px`;
     scene.style.height = `${graph.height}px`;
@@ -3026,7 +3057,15 @@
       resetGraphViewport(graph);
     });
 
-    resetGraphViewport(graph);
+    if (savedViewport) {
+      graph.scale = Number(savedViewport.scale || 1);
+      graph.panX = Number(savedViewport.panX || 0);
+      graph.panY = Number(savedViewport.panY || 0);
+      applyGraphTransform(graph);
+    } else {
+      resetGraphViewport(graph);
+      graphRoot.dataset.graphNeedsFit = "false";
+    }
     updateGraphEdges(graph);
   }
 
@@ -3174,6 +3213,15 @@
 
   function applyGraphTransform(graph) {
     graph.scene.style.transform = `translate(${graph.panX}px, ${graph.panY}px) scale(${graph.scale})`;
+    if (graph.mode === "relation-map") {
+      state.relationMapViewport = {
+        signature: relationGraphSignature(graph.root),
+        scale: graph.scale,
+        panX: graph.panX,
+        panY: graph.panY,
+      };
+      graph.root.dataset.graphNeedsFit = "false";
+    }
   }
 
   function openGraphPopover(graph, node) {

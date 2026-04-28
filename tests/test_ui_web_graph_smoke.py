@@ -275,6 +275,46 @@ class UiWebGraphSmokeTests(unittest.TestCase):
             finally:
                 browser.close()
 
+    def test_relation_map_preserves_viewport_when_shell_panels_toggle(self):
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            try:
+                page = browser.new_page(viewport={"width": 1920, "height": 1040})
+                page.goto(UI_WEB_INDEX)
+                page.wait_for_timeout(700)
+                page.get_by_role("button", name="Аналитика").click()
+                page.get_by_role("button", name="Связи").click()
+                page.get_by_role("button", name="Карта").click()
+                page.wait_for_timeout(700)
+
+                zoom_in = page.locator(
+                    ".relation-map-stage [data-graph-root][data-graph-mode='relation-map'] [data-graph-action='zoom-in']"
+                ).first
+                zoom_in.click()
+                zoom_in.click()
+                page.wait_for_timeout(180)
+                transform_before = page.locator(".relation-map-stage [data-graph-scene]").first.get_attribute("style")
+
+                page.get_by_role("button", name="Панель").click()
+                page.wait_for_timeout(320)
+                transform_after_tasks = page.locator(".relation-map-stage [data-graph-scene]").first.get_attribute("style")
+                page.get_by_role("button", name="Источники").click()
+                page.wait_for_timeout(320)
+                transform_after_sources = page.locator(".relation-map-stage [data-graph-scene]").first.get_attribute("style")
+
+                self.assertEqual(
+                    transform_after_tasks,
+                    transform_before,
+                    msg="opening the task drawer should resize map bounds without resetting user zoom/pan",
+                )
+                self.assertEqual(
+                    transform_after_sources,
+                    transform_before,
+                    msg="opening the sources drawer should resize map bounds without resetting user zoom/pan",
+                )
+            finally:
+                browser.close()
+
     def test_entity_drawer_uses_full_height_and_wide_overlay(self):
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(headless=True)

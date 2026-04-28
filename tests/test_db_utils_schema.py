@@ -89,6 +89,20 @@ class DbUtilsSchemaTests(unittest.TestCase):
                 self.assertIn("dedupe_support_score", columns("relation_features"))
                 self.assertIn("real_host_diversity_score", columns("relation_features"))
                 self.assertIn("bridge_diversity_score", columns("relation_features"))
+                self.assertIn("campaign_id", columns("ai_work_items"))
+                self.assertIn("prompt_version", columns("ai_work_items"))
+                self.assertIn("input_hash", columns("ai_work_items"))
+                self.assertIn("sample_bucket", columns("ai_work_items"))
+                self.assertIn("campaign_id", columns("content_derivations"))
+                self.assertIn("work_item_id", columns("content_derivations"))
+                self.assertIn("is_current", columns("content_derivations"))
+                self.assertIn("failure_kind", columns("ai_task_attempts"))
+                self.assertIn("event_consistency_score", columns("relation_features"))
+                self.assertIn("fact_support_score", columns("relation_features"))
+                self.assertIn("official_bridge_score", columns("relation_features"))
+                self.assertIn("telegram_penalty", columns("relation_features"))
+                self.assertIn("event_id", columns("relation_support"))
+                self.assertIn("fact_id", columns("relation_support"))
 
                 self.assertTrue(
                     conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='content_tag_votes'").fetchone()
@@ -101,6 +115,33 @@ class DbUtilsSchemaTests(unittest.TestCase):
                 )
                 self.assertTrue(
                     conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='relation_features'").fetchone()
+                )
+                self.assertTrue(
+                    conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='llm_keys'").fetchone()
+                )
+                self.assertTrue(
+                    conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='llm_key_failures'").fetchone()
+                )
+                self.assertTrue(
+                    conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='llm_provider_models'").fetchone()
+                )
+                self.assertTrue(
+                    conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='llm_provider_health'").fetchone()
+                )
+                self.assertTrue(
+                    conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='ai_sweep_campaigns'").fetchone()
+                )
+                self.assertTrue(
+                    conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='ai_work_items'").fetchone()
+                )
+                self.assertTrue(
+                    conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='ai_task_attempts'").fetchone()
+                )
+                self.assertTrue(
+                    conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='event_candidates'").fetchone()
+                )
+                self.assertTrue(
+                    conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='event_merge_reviews'").fetchone()
                 )
             finally:
                 conn.close()

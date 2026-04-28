@@ -633,6 +633,52 @@ def create_bill_promotion_db(db_path: Path):
         conn.close()
 
 
+def create_event_fact_official_bridge_db(db_path: Path):
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+        conn.executescript(
+            """
+            INSERT INTO sources(id, name, category, url, is_active) VALUES
+                (1, 'Official Docs', 'official_site', 'https://official.example.test/events', 1);
+
+            INSERT INTO entities(id, entity_type, canonical_name) VALUES
+                (120, 'organization', 'Роскомнадзор'),
+                (121, 'organization', 'Telegram');
+
+            INSERT INTO content_items(id, source_id, content_type, title, body_text, url, status) VALUES
+                (1201, 1, 'restriction_record', 'Ограничение доступа', 'Официальный документ об ограничении доступа к Telegram',
+                 'https://official.example.test/events/1201', 'official_document');
+
+            INSERT INTO events(
+                id, canonical_title, event_type, summary_short, status, event_date_start, confidence
+            ) VALUES
+                (1202, 'Ограничение доступа к Telegram', 'internet_restriction',
+                 'Официальный документ фиксирует ограничение доступа.', 'active', '2026-04-20T08:00:00', 0.95);
+
+            INSERT INTO event_items(event_id, content_item_id, item_role, source_strength)
+            VALUES(1202, 1201, 'official_doc', 'hard');
+
+            INSERT INTO event_entities(event_id, entity_id, role, confidence)
+            VALUES
+                (1202, 120, 'issuer', 0.97),
+                (1202, 121, 'target', 0.96);
+
+            INSERT INTO event_facts(
+                id, event_id, fact_type, canonical_text, polarity, valid_from, observed_at, confidence
+            ) VALUES
+                (1203, 1202, 'restriction', 'Роскомнадзор ограничил доступ к Telegram.', 'negative',
+                 '2026-04-20T08:00:00', '2026-04-20T08:00:00', 0.94);
+
+            INSERT INTO fact_evidence(fact_id, content_item_id, document_content_id, evidence_type, evidence_class, source_strength)
+            VALUES(1203, 1201, 1201, 'official_document', 'hard', 'hard');
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 class RelationLayerTests(unittest.TestCase):
     def test_relation_extractor_requires_independent_sources_and_cleans_old_rows(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1217,6 +1263,45 @@ class RelationLayerTests(unittest.TestCase):
             self.assertIn("ClaimCluster", row[8])
             self.assertIn("Bill", row[8])
             self.assertEqual(promoted, [("same_bill_cluster",)])
+
+    def test_relation_candidate_builder_promotes_event_fact_official_bridge(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "relations.db"
+            create_event_fact_official_bridge_db(db_path)
+
+            result = rebuild_relation_candidates({"db_path": str(db_path)})
+
+            conn = sqlite3.connect(db_path)
+            try:
+                row = conn.execute(
+                    """
+                    SELECT candidate_type, candidate_state, promotion_state, support_items, support_sources, support_domains,
+                           support_hard_evidence_count, explain_path_json, evidence_mix_json
+                    FROM relation_candidates
+                    ORDER BY id
+                    LIMIT 1
+                    """
+                ).fetchone()
+                support = conn.execute(
+                    """
+                    SELECT support_kind, support_class, event_id, fact_id
+                    FROM relation_support
+                    ORDER BY id
+                    """
+                ).fetchall()
+            finally:
+                conn.close()
+
+            self.assertEqual(result["promoted_relations"], 1)
+            self.assertEqual(row[0], "likely_association")
+            self.assertEqual(row[1:3], ("promoted", "promoted"))
+            self.assertEqual(row[3:6], (1, 1, 1))
+            self.assertGreaterEqual(row[6], 1)
+            self.assertIn("Event", row[7])
+            self.assertIn("Fact", row[7])
+            self.assertIn("OfficialDocument", row[7])
+            self.assertIn('"event_fact"', row[8])
+            self.assertIn(("event_fact", "evidence", 1202, 1203), [tuple(item) for item in support])
 
 
 if __name__ == "__main__":

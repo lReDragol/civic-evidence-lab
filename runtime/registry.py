@@ -305,6 +305,10 @@ def _event_pipeline(settings: dict[str, Any]):
     return __import__("analysis.event_pipeline", fromlist=["build_event_pipeline"]).build_event_pipeline(settings)
 
 
+def _ai_full_sweep(settings: dict[str, Any]):
+    return __import__("analysis.ai_sweep", fromlist=["run_ai_full_sweep"]).run_ai_full_sweep(settings)
+
+
 def _asr(settings: dict[str, Any]):
     return __import__("media_pipeline.asr", fromlist=["process_untranscribed_videos"]).process_untranscribed_videos()
 
@@ -494,6 +498,7 @@ JOB_SPECS = [
     JobSpec("llm", "LLM-классификатор", "Анализ", 43200, "llm_interval_seconds", "analysis", timeout_seconds=7200, scheduled=False, visible=False, runner=_llm),
     JobSpec("semantic_index", "Semantic index", "Анализ", 43200, "semantic_index_interval_seconds", "analysis", timeout_seconds=7200, runner=_semantic_index),
     JobSpec("event_pipeline", "Event pipeline", "Анализ", 43200, "event_pipeline_interval_seconds", "analysis", timeout_seconds=7200, runner=_event_pipeline),
+    JobSpec("ai_full_sweep", "AI Sweep", "AI", 86400, "ai_full_sweep_interval_seconds", "ai", timeout_seconds=43200, scheduled=False, runner=_ai_full_sweep),
     JobSpec("asr", "ASR (Whisper)", "Медиа", 3600, None, "media", timeout_seconds=7200, runner=_asr),
     JobSpec("ocr", "OCR (PaddleOCR)", "Медиа", 3600, None, "media", timeout_seconds=7200, runner=_ocr),
     JobSpec("ner", "NER (Natasha)", "Анализ", 7200, "ner_interval_seconds", "analysis", timeout_seconds=3600, runner=_ner),

@@ -298,11 +298,33 @@ class WebDashboardWindow(QMainWindow):
         except json.JSONDecodeError:
             data = {}
         if success and data.get("ok", True):
-            suffix = f" · new {data.get('items_new')}" if data.get("items_new") else ""
-            self._append_log(f"Задача завершена: {job_id}{suffix}", level="success")
+            if job_id == "ai_full_sweep":
+                completed_units = int(data.get("completed_units") or 0)
+                items_seen = int(data.get("items_seen") or 0)
+                attempts = int(data.get("attempts") or 0)
+                workers = int(data.get("worker_count") or 0)
+                suffix = f" · units {completed_units}/{items_seen} · attempts {attempts}" if items_seen else ""
+                self._append_log(f"AI Sweep завершён{suffix}", level="success")
+                QMessageBox.information(
+                    self,
+                    "AI Sweep",
+                    (
+                        "AI Sweep завершён.\n\n"
+                        f"Обработано unit-ов: {completed_units} из {items_seen}\n"
+                        f"Попыток LLM: {attempts}\n"
+                        f"Параллельных workers: {workers}"
+                    ),
+                )
+            else:
+                suffix = f" · new {data.get('items_new')}" if data.get("items_new") else ""
+                self._append_log(f"Задача завершена: {job_id}{suffix}", level="success")
         else:
             message = error[:260] if error else (payload[:260] if payload else f"Ошибка {job_id}")
-            self._append_log(f"Ошибка {job_id}: {message}", level="error")
+            if job_id == "ai_full_sweep":
+                self._append_log(f"Ошибка AI Sweep: {message}", level="error")
+                QMessageBox.critical(self, "AI Sweep", message)
+            else:
+                self._append_log(f"Ошибка {job_id}: {message}", level="error")
         self.bridge.emit_bootstrap()
         self._refresh_frontend()
         self._update_statusbar()

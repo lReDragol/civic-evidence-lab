@@ -3162,6 +3162,11 @@ button:disabled {
   align-content: center;
 }
 
+.top-panel {
+  position: relative;
+  z-index: 32 !important;
+}
+
 .top-actions .secondary-btn {
   width: 100%;
   min-width: 0;

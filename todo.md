@@ -2032,3 +2032,20 @@ tass.ru (иногда)
 - [x] Расширить snapshot/export под event layer: `tools/build_analysis_snapshot.py` считает `events/event_facts`, а `tools/export_obsidian_graph.py` экспортирует отдельные `Events/` и `Facts/` notes.
 - [x] Прогнать live event pipeline и проверить витрины: в `db/news_unified.db` сейчас `events=1141`, `event_facts=44`, `event_items=2518`, `event_entities=671`, `event_timeline=2518`; в `db/news_analysis.db` event layer материализован; в vault `D:\Obsidian\новости` созданы `Events=1142` и `Facts=45` notes.
 - [x] Закрепить event rollout тестами и smoke-проверками: `tests/test_event_platform.py` добавлен, UI smoke покрывает `Events` screen, полный suite после event rollout = `136/136 OK`.
+
+## 25) AI Sweep foundation
+
+- [x] Добавить operational key-pool слой: `llm_keys`, `llm_key_failures`, `llm_provider_models`, `llm_provider_health`.
+- [x] Сделать tolerant import `key.json` в DB-backed active pool, а не читать `key.json` как runtime source of truth.
+- [x] Зафиксировать hard-remove политику для мёртвых ключей: после порога ошибок ключ уходит в `removed` и повторный import из `key.json` не реанимирует его.
+- [x] Добавить `analysis/ai_sweep.py` с canonical work units (`content_cluster`, singleton `content_item`, `event`, `review_task`) и stage pipeline `clean_factual_text -> structured_extract -> event_link_hint -> tag_reasoning -> relation_reasoning -> event_synthesis`.
+- [x] Добавить operational tables `ai_work_items`, `ai_task_attempts`, `event_candidates`, `event_merge_reviews`.
+- [x] Подключить `ai_full_sweep` в `runtime/registry.py` как manual AI job.
+- [x] Добавить stage-aware provider router для `openai / perplexity / groq / mistral / openrouter`: prompt по stage, JSON envelope parsing, fallback к stage-shaped output.
+- [x] Добавить UI-кнопку `AI Sweep` в web shell и completion notification в desktop shell.
+- [x] Добавить autoscale worker policy: default `12`, minimum `10`, ceiling `24`, масштабирование вверх при большом backlog и живом key pool.
+- [x] Закрепить AI-sweep слой тестами: `tests/test_ai_key_pool.py`, `tests/test_ai_sweep.py`, `tests/test_provider_router.py`; полный suite после этого шага = `147/147 OK`.
+- [x] Прогнать live `ai_full_sweep` на реальных ключах для 1% canonical units: campaign `pilot:ai-pilot-2026-04-27`, sample size `232`, completed stage runs `872`, reports `ai_sweep_pilot_*`.
+- [x] Довести idempotency live pilot-run: повторный `enqueue_ai_work_items` на том же campaign теперь даёт `items_new=0`, `items_reset=0`, `items_skipped=872`.
+- [x] Исправить provider/prompt перекосы pilot-run: `clean_factual_text` и `structured_extract` переведены на `ai-sweep-v2-*`; затем `tag_reasoning` и `event_link_hint` переведены на `ai-sweep-v2-*` и повторно прогнаны только по затронутым stage-ам (`items_reset=320`, `worker_count=12`).
+- [x] Сформировать prompt-review артефакт по live pilot-run: `reports/ai_sweep_prompt_review_v2_tags.md`.
