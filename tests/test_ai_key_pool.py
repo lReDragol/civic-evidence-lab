@@ -31,9 +31,9 @@ class AiKeyPoolTests(unittest.TestCase):
                 "  }\n"
                 "\"provider_counts\": {\"openai\": 1, \"mistral\": 2},\n"
                 "\"keys\": [\n"
-                "  {\"provider\": \"openai\", \"api_key\": \"sk-openai-1\", \"status\": \"active\"},\n"
-                "  {\"provider\": \"mistral\", \"api_key\": \"sk-mistral-1\", \"status\": \"active\"},\n"
-                "  {\"provider\": \"groq\", \"api_key\": \"sk-groq-1\", \"status\": \"active\"}\n"
+                "  {\"provider\": \"openai\", \"api_key\": \"fake-openai-key-1\", \"status\": \"active\"},\n"
+                "  {\"provider\": \"mistral\", \"api_key\": \"fake-mistral-key-1\", \"status\": \"active\"},\n"
+                "  {\"provider\": \"groq\", \"api_key\": \"fake-groq-key-1\", \"status\": \"active\"}\n"
                 "]\n"
                 "}\n",
                 encoding="utf-8",
@@ -70,7 +70,7 @@ class AiKeyPoolTests(unittest.TestCase):
                 cur = conn.execute(
                     """
                     INSERT INTO llm_keys(provider, api_key, key_hash, status, failure_count)
-                    VALUES('perplexity', 'pplx-1', 'hash-1', 'active', 0)
+                    VALUES('perplexity', 'fake-perplexity-key-1', 'hash-1', 'active', 0)
                     """
                 )
                 key_id = int(cur.lastrowid)
@@ -104,7 +104,7 @@ class AiKeyPoolTests(unittest.TestCase):
                 json.dumps(
                     {
                         "keys": [
-                            {"provider": "perplexity", "api_key": "pplx-removed", "status": "active"},
+                            {"provider": "perplexity", "api_key": "fake-perplexity-removed", "status": "active"},
                         ]
                     },
                     ensure_ascii=False,
@@ -119,16 +119,16 @@ class AiKeyPoolTests(unittest.TestCase):
                 conn.execute(
                     """
                     INSERT INTO llm_keys(provider, api_key, key_hash, status, failure_count, removed_at)
-                    VALUES('perplexity', 'pplx-removed', ?, 'removed', 3, '2026-04-27T00:00:00')
+                    VALUES('perplexity', 'fake-perplexity-removed', ?, 'removed', 3, '2026-04-27T00:00:00')
                     """
                     ,
-                    (_hash_key("perplexity", "pplx-removed"),),
+                    (_hash_key("perplexity", "fake-perplexity-removed"),),
                 )
                 conn.commit()
 
                 result = import_keys_from_file(conn, keys_path)
                 row = conn.execute(
-                    "SELECT status, failure_count, removed_at FROM llm_keys WHERE provider='perplexity' AND api_key='pplx-removed'"
+                    "SELECT status, failure_count, removed_at FROM llm_keys WHERE provider='perplexity' AND api_key='fake-perplexity-removed'"
                 ).fetchone()
             finally:
                 conn.close()

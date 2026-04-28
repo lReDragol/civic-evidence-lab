@@ -22,9 +22,10 @@ if str(PROJECT_ROOT) not in sys.path:
 from classifier.negative_filter import classify_negative_profile
 from classifier.tagger_v2 import infer_tags_v2
 
-DEFAULT_API_CONFIG = Path(r"D:\Python Program\ai_asistant\userdata\config.json")
-DEFAULT_SESSION_SOURCE = Path(r"D:\Python Program\ai_asistant\userdata\telegram\211729602_telethon.session")
 DEFAULT_SESSION_DIR = PROJECT_ROOT / "config" / "telegram_test_sessions"
+DEFAULT_API_CONFIG = PROJECT_ROOT / "config" / "settings.json"
+DEFAULT_SESSION_SOURCE = DEFAULT_SESSION_DIR / "source.session"
+DEFAULT_SESSION_NAME = "telegram_test"
 DEFAULT_DB = PROJECT_ROOT / "db" / "news_telegram_test.db"
 DEFAULT_MEDIA_DIR = PROJECT_ROOT / "processed" / "telegram_test"
 SCHEMA_PATH = PROJECT_ROOT / "db" / "schema.sql"
@@ -195,8 +196,8 @@ def collection_filter_decision(
 
 
 def load_api_credentials(api_config: Path) -> Tuple[int, str]:
-    env_api_id = os.getenv("DRAGO_TG_API_ID") or os.getenv("TELEGRAM_API_ID")
-    env_api_hash = os.getenv("DRAGO_TG_API_HASH") or os.getenv("TELEGRAM_API_HASH")
+    env_api_id = os.getenv("CIVIC_TG_API_ID") or os.getenv("TELEGRAM_API_ID")
+    env_api_hash = os.getenv("CIVIC_TG_API_HASH") or os.getenv("TELEGRAM_API_HASH")
     if env_api_id and env_api_hash:
         return int(env_api_id), str(env_api_hash)
 
@@ -753,8 +754,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reset", action="store_true", help="Delete the test DB before collecting")
     parser.add_argument("--api-config", default=str(DEFAULT_API_CONFIG))
     parser.add_argument("--session-source", default=str(DEFAULT_SESSION_SOURCE))
-    parser.add_argument("--session-name", default="campus5197")
-    parser.add_argument("--expected-username", default="campus5197")
+    parser.add_argument("--session-name", default=DEFAULT_SESSION_NAME)
+    parser.add_argument("--expected-username", default="")
     parser.add_argument("--refresh-session", action="store_true", help="Refresh local copy of the Telethon session")
     parser.add_argument("--per-channel", type=int, default=20)
     parser.add_argument("--source-limit", type=int, default=0, help="0 means all Telegram sources")

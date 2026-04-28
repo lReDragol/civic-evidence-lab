@@ -16,7 +16,7 @@ from runtime.task_scheduler import (
 
 class TaskSchedulerTests(unittest.TestCase):
     def test_build_wrapper_contents_uses_repo_root_python_and_no_preflight(self):
-        repo_root = Path(r"F:\новости")
+        repo_root = Path(r"C:\Projects\civic-evidence-lab")
         python_exe = Path(r"C:\Python313\python.exe")
 
         contents = build_wrapper_contents(repo_root=repo_root, python_exe=python_exe, no_preflight=True)
@@ -37,13 +37,13 @@ class TaskSchedulerTests(unittest.TestCase):
             self.assertNotIn("--no-preflight", text)
 
     def test_create_command_uses_expected_trigger_and_wrapper(self):
-        wrapper_path = Path(r"F:\новости\runtime\generated\daemon_task_wrapper.cmd")
+        wrapper_path = Path(r"C:\Projects\civic-evidence-lab\runtime\generated\daemon_task_wrapper.cmd")
 
         command = build_schtasks_create_command(
             task_name=r"CivicEvidenceLab\RuntimeDaemon",
             wrapper_path=wrapper_path,
             schedule="onlogon",
-            user="Drago",
+            user="test-user",
             force=True,
         )
 
@@ -51,7 +51,7 @@ class TaskSchedulerTests(unittest.TestCase):
         self.assertIn("/SC", command)
         self.assertIn("ONLOGON", command)
         self.assertIn("/RU", command)
-        self.assertIn("Drago", command)
+        self.assertIn("test-user", command)
         self.assertIn('/TR', command)
         self.assertTrue(any(str(wrapper_path) in part for part in command))
         self.assertIn("/F", command)

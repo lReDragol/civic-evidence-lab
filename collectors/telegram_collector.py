@@ -323,8 +323,8 @@ async def run_collect(settings: dict = None):
     api_id = settings.get("telegram_api_id")
     api_hash = settings.get("telegram_api_hash")
 
-    env_api_id = os.getenv("DRAGO_TG_API_ID") or os.getenv("TELEGRAM_API_ID")
-    env_api_hash = os.getenv("DRAGO_TG_API_HASH") or os.getenv("TELEGRAM_API_HASH")
+    env_api_id = os.getenv("CIVIC_TG_API_ID") or os.getenv("TELEGRAM_API_ID")
+    env_api_hash = os.getenv("CIVIC_TG_API_HASH") or os.getenv("TELEGRAM_API_HASH")
 
     if env_api_id:
         api_id = int(env_api_id)
@@ -332,7 +332,7 @@ async def run_collect(settings: dict = None):
         api_hash = env_api_hash
 
     if not api_id or not api_hash:
-        log.error("telegram_api_id/hash not set. Set in config/settings.json or env DRAGO_TG_API_ID / DRAGO_TG_API_HASH")
+        log.error("telegram_api_id/hash not set. Set in config/settings.json or env CIVIC_TG_API_ID / CIVIC_TG_API_HASH")
         return {"ok": False, "fatal_errors": ["telegram_api_credentials_missing"]}
 
     session_dir = Path(settings.get("telegram_session_dir", str(Path(__file__).resolve().parent.parent / "config")))

@@ -49,7 +49,7 @@ class ProviderRouterTests(unittest.TestCase):
             result = run_ai_task(
                 provider="perplexity",
                 model="sonar-reasoning-pro",
-                api_key="pplx-test",
+                api_key="fake-px-key",
                 task={"stage": "clean_factual_text", "unit": {"unit_key": "content:1"}, "payload": {"title": "x"}},
             )
 
@@ -74,7 +74,7 @@ class ProviderRouterTests(unittest.TestCase):
             result = run_ai_task(
                 provider="groq",
                 model="groq/compound",
-                api_key="groq-test",
+                api_key="fake-gq-key",
                 task={"stage": "event_synthesis", "unit": {"unit_key": "event:1"}, "payload": {"title": "x"}},
             )
 

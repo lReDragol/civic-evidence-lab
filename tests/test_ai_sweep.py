@@ -516,9 +516,9 @@ class AiSweepTests(unittest.TestCase):
                 "{\n"
                 "  }\n"
                 "\"keys\": [\n"
-                "  {\"provider\": \"groq\", \"api_key\": \"sk-groq-1\", \"status\": \"active\"},\n"
-                "  {\"provider\": \"perplexity\", \"api_key\": \"pplx-1\", \"status\": \"active\"},\n"
-                "  {\"provider\": \"openai\", \"api_key\": \"sk-openai-1\", \"status\": \"active\"}\n"
+                "  {\"provider\": \"groq\", \"api_key\": \"fake-groq-key-1\", \"status\": \"active\"},\n"
+                "  {\"provider\": \"perplexity\", \"api_key\": \"fake-perplexity-key-1\", \"status\": \"active\"},\n"
+                "  {\"provider\": \"openai\", \"api_key\": \"fake-openai-key-1\", \"status\": \"active\"}\n"
                 "]\n"
                 "}\n",
                 encoding="utf-8",
@@ -838,7 +838,7 @@ class AiSweepTests(unittest.TestCase):
             key_path.write_text(
                 "{\n"
                 "\"keys\": [\n"
-                "  {\"provider\": \"groq\", \"api_key\": \"sk-groq-1\", \"status\": \"active\"}\n"
+                "  {\"provider\": \"groq\", \"api_key\": \"fake-groq-key-1\", \"status\": \"active\"}\n"
                 "]\n"
                 "}\n",
                 encoding="utf-8",
