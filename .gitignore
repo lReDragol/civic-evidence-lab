@@ -1,3 +1,12 @@
+key.json
+keys.json
+*.key.json
+*.keys.json
+*.token
+.env
+.env.*
+!.env.example
+secrets/
 config/secrets.json
 config/settings.json
 config/settings.local.json
@@ -15,6 +24,11 @@ __pycache__/
 .ruff_cache/
 .venv/
 venv/
+*.rar
+*.zip
+*.7z
+*.bak
+*.tmp
 app.log
 logs/
 runtime/generated/
@@ -25,9 +39,7 @@ db/backups/
 db/*.db
 db/*.db-*
 obsidian_export*/
-reports/*.json
-reports/ui_before/
-reports/ui_after/
+reports/
 config/telegram_test_sessions/
 processed/telegram_test/
 tools/_check_*.py
