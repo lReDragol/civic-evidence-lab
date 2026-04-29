@@ -103,6 +103,25 @@ OFFICIAL_PROMOTION_BRIDGE_TYPES = {
 OFFICIAL_SEED_KINDS = {"restriction", "affiliation", "disclosure", "event_fact"}
 OFFICIAL_CANDIDATE_CONTENT_TYPES = {"restriction_record", "declaration", "official_document"}
 NON_CONTENT_PATH_TYPES = PROMOTION_BRIDGE_TYPES | {"OfficialDocument"}
+EVENT_ACTOR_ROLES = {
+    "issuer",
+    "executor",
+    "regulator",
+    "authority",
+    "agency",
+    "court",
+    "official",
+    "decision_maker",
+}
+EVENT_TARGET_ROLES = {
+    "target",
+    "affected",
+    "subject",
+    "recipient",
+    "regulated",
+    "defendant",
+    "plaintiff",
+}
 
 
 def _now_iso() -> str:
@@ -116,6 +135,18 @@ def _parse_json(raw_text: str | None, default: Any):
         return json.loads(raw_text)
     except (TypeError, json.JSONDecodeError):
         return default
+
+
+def _normalize_role(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def _event_fact_role_pair_is_direct_relation(role_a: Any, role_b: Any) -> bool:
+    left = _normalize_role(role_a)
+    right = _normalize_role(role_b)
+    return (left in EVENT_ACTOR_ROLES and right in EVENT_TARGET_ROLES) or (
+        right in EVENT_ACTOR_ROLES and left in EVENT_TARGET_ROLES
+    )
 
 
 def _normalize_domain(url: str | None, source_id: int | None = None) -> str | None:
@@ -765,18 +796,19 @@ def _load_event_fact_bridge_support_rows(
                     "source_strength": row[4],
                 }
             )
-    entity_rows: dict[int, list[int]] = defaultdict(list)
+    entity_rows: dict[int, list[dict[str, Any]]] = defaultdict(list)
     for row in conn.execute(
         """
-        SELECT event_id, entity_id
+        SELECT event_id, entity_id, COALESCE(role, '') AS role
         FROM event_entities
         WHERE entity_id IS NOT NULL
         ORDER BY event_id, entity_id
         """
     ).fetchall():
         entity_id = int(row[1])
-        if entity_id not in entity_rows[int(row[0])]:
-            entity_rows[int(row[0])].append(entity_id)
+        event_id = int(row[0])
+        if entity_id not in {entry["entity_id"] for entry in entity_rows[event_id]}:
+            entity_rows[event_id].append({"entity_id": entity_id, "role": row[2]})
     for row in conn.execute(
         """
         SELECT
@@ -791,13 +823,15 @@ def _load_event_fact_bridge_support_rows(
     ).fetchall():
         fact_id = int(row[0])
         event_id = int(row[1])
-        event_entities = sorted(set(entity_rows.get(event_id, [])))
+        event_entities = entity_rows.get(event_id, [])
         if len(event_entities) < 2 or len(event_entities) > 30:
             continue
         fact_evidence_rows = evidence_rows.get(fact_id) or [{"source_content_id": None, "evidence_class": "support"}]
         for left, right in combinations(event_entities, 2):
-            entity_a = min(int(left), int(right))
-            entity_b = max(int(left), int(right))
+            if not _event_fact_role_pair_is_direct_relation(left.get("role"), right.get("role")):
+                continue
+            entity_a = min(int(left["entity_id"]), int(right["entity_id"]))
+            entity_b = max(int(left["entity_id"]), int(right["entity_id"]))
             if entity_a == entity_b:
                 continue
             for evidence in fact_evidence_rows[:5]:

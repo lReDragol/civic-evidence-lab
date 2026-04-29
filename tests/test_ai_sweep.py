@@ -85,19 +85,110 @@ class AiSweepTests(unittest.TestCase):
         self.assertEqual(_detect_failure_kind("schema_violation: source-only stage returned external_context"), "schema_violation")
         self.assertEqual(_detect_failure_kind('401 invalid api key'), "auth")
 
-    def test_run_provider_budget_skips_exhausted_provider_for_stage(self):
+    def test_run_provider_budget_keeps_transient_failures_local_to_item(self):
         from analysis.ai_sweep import RunProviderBudget
 
         budget = RunProviderBudget(max_failures_per_provider_stage=2)
         priority = ["mistral", "groq", "openrouter"]
 
         self.assertEqual(budget.allowed_priority("structured_extract", priority), priority)
-        budget.record_failure("structured_extract", "mistral", "timeout")
-        self.assertEqual(budget.allowed_priority("structured_extract", priority), priority)
-        budget.record_failure("structured_extract", "mistral", "rate")
+        for _ in range(10):
+            budget.record_failure("structured_extract", "mistral", "timeout")
+            budget.record_failure("structured_extract", "mistral", "rate")
 
-        self.assertEqual(budget.allowed_priority("structured_extract", priority), ["groq", "openrouter"])
+        self.assertEqual(budget.allowed_priority("structured_extract", priority), priority)
         self.assertEqual(budget.allowed_priority("tag_reasoning", priority), priority)
+
+    def test_run_provider_budget_keeps_schema_violations_local_to_item(self):
+        from analysis.ai_sweep import RunProviderBudget
+
+        budget = RunProviderBudget(max_failures_per_provider_stage=5)
+        priority = ["mistral", "groq", "openrouter"]
+
+        for _ in range(20):
+            budget.record_failure("structured_extract", "mistral", "schema_violation")
+
+        self.assertEqual(budget.allowed_priority("structured_extract", priority), priority)
+
+    def test_run_provider_budget_hard_skips_unsupported_tool_provider(self):
+        from analysis.ai_sweep import RunProviderBudget
+
+        budget = RunProviderBudget(max_failures_per_provider_stage=25)
+        priority = ["mistral", "perplexity", "groq"]
+
+        budget.record_failure("event_link_hint", "mistral", "unsupported_tool")
+
+        self.assertEqual(budget.allowed_priority("event_link_hint", priority), ["perplexity", "groq"])
+        self.assertEqual(budget.allowed_priority("structured_extract", priority), priority)
+
+    def test_stage_provider_priority_keeps_web_models_out_of_source_only_tags(self):
+        from analysis.ai_sweep import _stage_provider_priority
+
+        priority = _stage_provider_priority("tag_reasoning", {})
+
+        self.assertNotIn("perplexity", priority)
+        self.assertNotIn("openai", priority)
+        self.assertLess(priority.index("mistral"), priority.index("groq"))
+
+    def test_choose_key_for_stage_filters_to_allowed_provider_priority(self):
+        from llm.key_pool import bootstrap_provider_catalog, choose_key_for_stage
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "ai.db"
+            create_db(db_path)
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            try:
+                bootstrap_provider_catalog(conn)
+                conn.execute(
+                    """
+                    INSERT INTO llm_keys(provider, api_key, key_hash, status)
+                    VALUES('perplexity', 'pplx-key', 'pplx-hash', 'active')
+                    """
+                )
+                conn.commit()
+                blocked = choose_key_for_stage(conn, stage="structured_extract", provider_priority=["mistral", "groq"])
+                allowed = choose_key_for_stage(conn, stage="relation_reasoning", provider_priority=["perplexity"])
+            finally:
+                conn.close()
+
+            self.assertIsNone(blocked)
+            self.assertIsNotNone(allowed)
+            self.assertEqual(allowed["provider"], "perplexity")
+
+    def test_backfill_failure_kinds_reclassifies_legacy_provider_model_rows(self):
+        from analysis.ai_sweep import backfill_ai_attempt_failure_kinds
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "ai.db"
+            create_db(db_path)
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            try:
+                conn.executescript(
+                    """
+                    INSERT INTO ai_work_items(id, unit_kind, unit_key, stage, prompt_version, status)
+                    VALUES(7001, 'content_item', 'content:12', 'structured_extract', 'ai-sweep-v3-extract', 'completed');
+                    INSERT INTO ai_task_attempts(work_item_id, provider, model_name, status, failure_kind, error_text)
+                    VALUES(
+                        7001,
+                        'mistral',
+                        'mistral-medium',
+                        'failed',
+                        'provider_model',
+                        '400 {"message":"WebSearchTool connector is not supported","type":"invalid_tools"}'
+                    );
+                    """
+                )
+                conn.commit()
+
+                updated = backfill_ai_attempt_failure_kinds(conn)
+                row = conn.execute("SELECT failure_kind FROM ai_task_attempts WHERE work_item_id=7001").fetchone()
+            finally:
+                conn.close()
+
+            self.assertEqual(updated, 1)
+            self.assertEqual(row["failure_kind"], "unsupported_tool")
 
     def test_ai_sweep_doctor_reports_provider_stage_health_without_mutating(self):
         from analysis.ai_sweep import build_ai_sweep_doctor
@@ -196,6 +287,131 @@ class AiSweepTests(unittest.TestCase):
                     "confidence": 0.8,
                 },
             )
+
+    def test_worker_uses_deterministic_fallback_when_source_only_stage_has_no_allowed_key(self):
+        from analysis.ai_sweep import RunProviderBudget, _worker_run
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "ai.db"
+            create_db(db_path)
+            conn = sqlite3.connect(db_path)
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO ai_work_items(id, campaign_id, unit_kind, unit_key, stage, prompt_version, input_hash, status, payload_json)
+                    VALUES(900, 1, 'content_item', 'content:14', 'structured_extract', 'ai-sweep-v3-extract', 'hash-1', 'running', '{}')
+                    """
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            payload = {
+                "title": "Одиночный пост",
+                "body_text": "Отдельный материал без кластера",
+                "content_type": "post",
+                "candidate_events": [],
+            }
+            result = _worker_run(
+                {"db_path": str(db_path), "ensure_schema_on_connect": False},
+                {"unit_kind": "content_item", "unit_key": "content:14", "content_item_id": 14},
+                "structured_extract",
+                "ai-sweep-v3-extract",
+                "hash-1",
+                payload,
+                900,
+                RunProviderBudget(max_failures_per_provider_stage=3),
+            )
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["provider"], "deterministic")
+            self.assertEqual(result["model"], "source-only-fallback")
+            self.assertEqual(result["result"]["output_json"]["fallback_reason"], "no_active_keys_for_stage")
+            self.assertIn("Одиночный пост", result["result"]["output_text"])
+
+    def test_worker_preserves_provider_failures_before_deterministic_fallback(self):
+        from analysis.ai_sweep import RunProviderBudget, _worker_run
+        from llm.key_pool import bootstrap_provider_catalog
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "ai.db"
+            create_db(db_path)
+            conn = sqlite3.connect(db_path)
+            try:
+                bootstrap_provider_catalog(conn)
+                conn.execute(
+                    """
+                    INSERT INTO llm_keys(provider, api_key, key_hash, status)
+                    VALUES('mistral', 'test-key', 'mistral-test-key', 'active')
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO ai_work_items(id, campaign_id, unit_kind, unit_key, stage, prompt_version, input_hash, status, payload_json)
+                    VALUES(902, 1, 'content_item', 'content:14', 'structured_extract', 'ai-sweep-v3-extract', 'hash-3', 'running', '{}')
+                    """
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            payload = {
+                "title": "Одиночный пост",
+                "body_text": "Отдельный материал без кластера",
+                "content_type": "post",
+                "candidate_events": [],
+            }
+
+            with patch("analysis.ai_sweep.run_ai_task", side_effect=ValueError("schema_violation: source-only stage returned external_context")):
+                result = _worker_run(
+                    {"db_path": str(db_path), "ensure_schema_on_connect": False, "ai_sweep": {"max_failures_per_provider_per_item": 1}},
+                    {"unit_kind": "content_item", "unit_key": "content:14", "content_item_id": 14},
+                    "structured_extract",
+                    "ai-sweep-v3-extract",
+                    "hash-3",
+                    payload,
+                    902,
+                    RunProviderBudget(max_failures_per_provider_stage=10),
+                )
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["provider"], "deterministic")
+            self.assertEqual(result["attempts"][0]["provider"], "mistral")
+            self.assertEqual(result["attempts"][0]["status"], "failed")
+            self.assertEqual(result["attempts"][0]["failure_kind"], "schema_violation")
+            self.assertEqual(result["attempts"][-1]["provider"], "deterministic")
+
+    def test_worker_does_not_use_deterministic_fallback_for_relation_reasoning(self):
+        from analysis.ai_sweep import RunProviderBudget, _worker_run
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "ai.db"
+            create_db(db_path)
+            conn = sqlite3.connect(db_path)
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO ai_work_items(id, campaign_id, unit_kind, unit_key, stage, prompt_version, input_hash, status, payload_json)
+                    VALUES(901, 1, 'review_task', 'review:1', 'relation_reasoning', 'ai-sweep-v3-relations', 'hash-2', 'running', '{}')
+                    """
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            result = _worker_run(
+                {"db_path": str(db_path), "ensure_schema_on_connect": False},
+                {"unit_kind": "review_task", "unit_key": "review:1", "review_task_id": 1},
+                "relation_reasoning",
+                "ai-sweep-v3-relations",
+                "hash-2",
+                {"review_payload": {"candidate_id": 1}},
+                901,
+                RunProviderBudget(max_failures_per_provider_stage=3),
+            )
+
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["error"], "no_active_keys_for_stage")
 
     def test_prompt_review_uses_current_prompt_versions_instead_of_stale_v2_text(self):
         from analysis.ai_sweep import PROMPT_VERSIONS, build_ai_sweep_prompt_review
@@ -406,7 +622,7 @@ class AiSweepTests(unittest.TestCase):
             self.assertEqual(refreshed[2], row[2])
             self.assertEqual(refreshed[3], "2026-04-27T12:00:00")
 
-    def test_enqueue_ai_work_items_resets_stage_when_prompt_version_changes(self):
+    def test_enqueue_ai_work_items_versions_stage_when_prompt_version_changes(self):
         from analysis.ai_sweep import enqueue_ai_work_items
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -451,20 +667,101 @@ class AiSweepTests(unittest.TestCase):
                     "prompt_versions": {"clean_factual_text": "ai-sweep-v4-cleaner"},
                 },
             }
-            enqueue_ai_work_items(changed_settings)
+            changed = enqueue_ai_work_items(changed_settings)
 
             conn = sqlite3.connect(db_path)
             try:
-                refreshed = conn.execute(
+                original = conn.execute(
                     "SELECT status, prompt_version, completed_at FROM ai_work_items WHERE id=?",
                     (int(row[0]),),
                 ).fetchone()
+                versions = conn.execute(
+                    """
+                    SELECT status, prompt_version, completed_at
+                    FROM ai_work_items
+                    WHERE unit_kind='content_item' AND stage='clean_factual_text'
+                    ORDER BY id
+                    """
+                ).fetchall()
             finally:
                 conn.close()
 
-            self.assertEqual(refreshed[0], "pending")
-            self.assertEqual(refreshed[1], "ai-sweep-v4-cleaner")
-            self.assertIsNone(refreshed[2])
+            self.assertGreater(changed["items_new"], 0)
+            self.assertEqual(original[0], "completed")
+            self.assertEqual(original[1], row[1])
+            self.assertEqual(original[2], "2026-04-27T12:00:00")
+            self.assertTrue(any(version[1] == "ai-sweep-v4-cleaner" and version[0] == "pending" for version in versions))
+
+    def test_enqueue_ai_work_items_isolates_attempts_by_campaign(self):
+        from analysis.ai_sweep import enqueue_ai_work_items
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "ai.db"
+            create_db(db_path)
+            settings = {
+                "db_path": str(db_path),
+                "ensure_schema_on_connect": True,
+                "ai_sweep": {
+                    "campaign_seed": "ai-pilot-2026-04-27",
+                    "campaign_key": "pilot:ai-pilot-2026-04-27",
+                },
+            }
+            enqueue_ai_work_items(settings)
+            conn = sqlite3.connect(db_path)
+            try:
+                first_row = conn.execute(
+                    """
+                    SELECT id, campaign_id
+                    FROM ai_work_items
+                    WHERE unit_kind='content_item' AND stage='clean_factual_text'
+                    ORDER BY id LIMIT 1
+                    """
+                ).fetchone()
+                conn.execute(
+                    """
+                    INSERT INTO ai_task_attempts(work_item_id, provider, model_name, status, failure_kind, error_text)
+                    VALUES(?, 'mistral', 'mistral-test', 'failed', 'timeout', 'timeout')
+                    """,
+                    (int(first_row[0]),),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            second_settings = {
+                **settings,
+                "ai_sweep": {
+                    **settings["ai_sweep"],
+                    "campaign_seed": "ai-pilot-2026-04-29",
+                    "campaign_key": "pilot:ai-pilot-2026-04-29",
+                },
+            }
+            enqueue_ai_work_items(second_settings)
+
+            conn = sqlite3.connect(db_path)
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT id, campaign_id
+                    FROM ai_work_items
+                    WHERE unit_kind='content_item' AND stage='clean_factual_text'
+                    ORDER BY id
+                    """
+                ).fetchall()
+                attempt_campaign = conn.execute(
+                    """
+                    SELECT aw.campaign_id
+                    FROM ai_task_attempts ata
+                    JOIN ai_work_items aw ON aw.id=ata.work_item_id
+                    WHERE ata.id=1
+                    """
+                ).fetchone()[0]
+            finally:
+                conn.close()
+
+            campaign_ids = {int(row[1]) for row in rows}
+            self.assertGreaterEqual(len(campaign_ids), 2)
+            self.assertEqual(int(attempt_campaign), int(first_row[1]))
 
     def test_enqueue_ai_work_items_keeps_event_synthesis_completed_when_only_generated_summary_changed(self):
         from analysis.ai_sweep import enqueue_ai_work_items
@@ -902,6 +1199,58 @@ class AiSweepTests(unittest.TestCase):
             self.assertIsNone(candidate["suggested_event_id"])
             self.assertIn("gate_failed", candidate["suggestion_json"])
 
+    def test_event_link_hint_promotes_create_candidate_to_existing_when_candidate_context_passes_gates(self):
+        from analysis.ai_sweep import _build_unit_context, _candidate_events_for_unit, _persist_event_candidate
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "ai.db"
+            create_db(db_path)
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            try:
+                unit = {
+                    "unit_kind": "content_cluster",
+                    "unit_key": "cluster:telegram-block",
+                    "cluster_id": 101,
+                    "canonical_content_id": 12,
+                }
+                context = _build_unit_context(conn, unit)
+                payload = {
+                    "candidate_events": _candidate_events_for_unit(conn, unit, context),
+                    "title": context["content_row"]["title"],
+                    "body_text": context["content_row"]["body_text"],
+                    "published_at": context["content_row"]["published_at"],
+                }
+                updated = _persist_event_candidate(
+                    conn,
+                    unit,
+                    "ai-sweep-v3-event-link",
+                    {
+                        "provider": "mistral",
+                        "model": "mistral-medium",
+                        "confidence": 0.72,
+                        "output_json": {
+                            "action": "create_event_candidate",
+                            "reason": "model was conservative",
+                            "external_context": [],
+                        },
+                    },
+                    payload=payload,
+                )
+                conn.commit()
+                candidate = conn.execute(
+                    "SELECT candidate_state, suggested_event_id, suggestion_json FROM event_candidates ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+                suggestion = json.loads(candidate["suggestion_json"])
+            finally:
+                conn.close()
+
+            self.assertEqual(updated, 1)
+            self.assertEqual(candidate["candidate_state"], "link_existing")
+            self.assertEqual(candidate["suggested_event_id"], 201)
+            self.assertTrue(suggestion["deterministic_override"]["accepted"])
+            self.assertEqual(suggestion["deterministic_override"]["from_action"], "create_event_candidate")
+
     def test_candidate_events_include_timeline_roles_facts_and_document_context(self):
         from analysis.ai_sweep import _build_unit_context, _candidate_events_for_unit
 
@@ -943,6 +1292,78 @@ class AiSweepTests(unittest.TestCase):
             self.assertIn("entity_roles", candidate)
             self.assertIn("facts", candidate)
             self.assertIn("official_docs", candidate)
+
+    def test_candidate_events_do_not_drop_relevant_late_event_after_first_200_rows(self):
+        from analysis.ai_sweep import _build_unit_context, _candidate_events_for_unit
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "ai.db"
+            create_db(db_path)
+
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            try:
+                for index in range(300):
+                    event_id = 1000 + index
+                    conn.execute(
+                        """
+                        INSERT INTO events(
+                            id, canonical_title, event_type, summary_short, status,
+                            event_date_start, event_date_end, first_observed_at, last_observed_at, confidence
+                        ) VALUES(?,?,?,?,?,?,?,?,?,?)
+                        """,
+                        (
+                            event_id,
+                            f"Нерелевантное старое событие {index}",
+                            "background",
+                            "Нет совпадений",
+                            "active",
+                            "2026-01-01T00:00:00",
+                            "2026-01-01T01:00:00",
+                            "2026-01-01T00:00:00",
+                            "2026-01-01T01:00:00",
+                            0.5,
+                        ),
+                    )
+                conn.execute(
+                    """
+                    INSERT INTO events(
+                        id, canonical_title, event_type, summary_short, status,
+                        event_date_start, event_date_end, first_observed_at, last_observed_at, confidence
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        5000,
+                        "Отдельный материал без кластера",
+                        "public_statement",
+                        "Случайный комментатор сделал отдельное заявление",
+                        "active",
+                        "2026-04-22T10:00:00",
+                        "2026-04-22T10:00:00",
+                        "2026-04-22T10:00:00",
+                        "2026-04-22T10:00:00",
+                        0.8,
+                    ),
+                )
+                conn.execute(
+                    "INSERT INTO event_entities(event_id, entity_id, role, confidence) VALUES(5000, 303, 'commentator', 0.9)"
+                )
+                conn.commit()
+
+                unit = {
+                    "unit_kind": "content_item",
+                    "unit_key": "content:14",
+                    "content_item_id": 14,
+                    "canonical_content_id": 14,
+                    "title": "Одиночный пост",
+                    "published_at": "2026-04-22T10:00:00",
+                }
+                context = _build_unit_context(conn, unit)
+                candidates = _candidate_events_for_unit(conn, unit, context)
+            finally:
+                conn.close()
+
+            self.assertTrue(any(candidate["event_id"] == 5000 for candidate in candidates))
 
     def test_run_ai_full_sweep_tolerates_invalid_event_link_id_from_model(self):
         from analysis.ai_sweep import run_ai_full_sweep

@@ -140,10 +140,13 @@ def _prompt_version_for_stage(stage: str, settings: dict[str, Any]) -> str:
 
 
 def _stage_provider_priority(stage: str, settings: dict[str, Any]) -> list[str]:
+    overrides = dict(_ai_settings(settings).get("stage_provider_priority") or {})
+    if stage in overrides and isinstance(overrides[stage], list):
+        return [str(provider) for provider in overrides[stage] if str(provider).strip()]
     stage_specific = {
         "clean_factual_text": ["mistral", "groq", "openrouter"],
         "structured_extract": ["mistral", "groq", "openrouter"],
-        "event_link_hint": ["mistral", "groq", "openrouter", "openai"],
+        "event_link_hint": ["mistral", "groq", "openrouter"],
         "tag_reasoning": ["mistral", "groq", "openrouter"],
         "relation_reasoning": ["perplexity", "openai", "openrouter"],
         "event_synthesis": ["openai", "perplexity", "openrouter"],
@@ -152,12 +155,15 @@ def _stage_provider_priority(stage: str, settings: dict[str, Any]) -> list[str]:
 
 
 BUDGETED_FAILURE_KINDS = {
-    "rate",
-    "timeout",
     "provider_model",
     "invalid_model",
     "unsupported_tool",
     "bad_response_shape",
+}
+HARD_PROVIDER_STAGE_FAILURE_LIMITS = {
+    "unsupported_tool": 1,
+    "invalid_model": 1,
+    "bad_response_shape": 3,
 }
 
 
@@ -167,19 +173,27 @@ class RunProviderBudget:
     def __init__(self, *, max_failures_per_provider_stage: int = 25) -> None:
         self.max_failures_per_provider_stage = max(1, int(max_failures_per_provider_stage or 1))
         self._failures: dict[tuple[str, str], int] = {}
+        self._failures_by_kind: dict[tuple[str, str, str], int] = {}
         self._lock = threading.Lock()
 
     def record_failure(self, stage: str, provider: str, failure_kind: str) -> None:
         if failure_kind not in BUDGETED_FAILURE_KINDS:
             return
         key = (str(stage), str(provider))
+        kind_key = (str(stage), str(provider), str(failure_kind))
         with self._lock:
             self._failures[key] = self._failures.get(key, 0) + 1
+            self._failures_by_kind[kind_key] = self._failures_by_kind.get(kind_key, 0) + 1
 
     def is_exhausted(self, stage: str, provider: str) -> bool:
         key = (str(stage), str(provider))
         with self._lock:
-            return self._failures.get(key, 0) >= self.max_failures_per_provider_stage
+            if self._failures.get(key, 0) >= self.max_failures_per_provider_stage:
+                return True
+            for failure_kind, limit in HARD_PROVIDER_STAGE_FAILURE_LIMITS.items():
+                if self._failures_by_kind.get((str(stage), str(provider), failure_kind), 0) >= limit:
+                    return True
+            return False
 
     def allowed_priority(self, stage: str, provider_priority: list[str]) -> list[str]:
         return [provider for provider in provider_priority if not self.is_exhausted(stage, provider)]
@@ -773,7 +787,6 @@ def _candidate_events_for_unit(conn: sqlite3.Connection, unit: dict[str, Any], c
                first_observed_at, last_observed_at
         FROM events
         ORDER BY COALESCE(event_date_start, first_observed_at, ''), id
-        LIMIT 200
         """
     ).fetchall()
     candidates: list[dict[str, Any]] = []
@@ -1326,22 +1339,14 @@ def _upsert_work_item(
         """
         SELECT id, campaign_id, prompt_version, input_hash, status
         FROM ai_work_items
-        WHERE unit_kind=? AND unit_key=? AND stage=?
+        WHERE campaign_id=? AND unit_kind=? AND unit_key=? AND stage=? AND prompt_version=? AND input_hash=?
         LIMIT 1
         """,
-        (unit["unit_kind"], unit["unit_key"], stage),
+        (campaign_id, unit["unit_kind"], unit["unit_key"], stage, prompt_version, input_hash),
     ).fetchone()
     if existing:
-        existing_campaign_id = int(existing[1] or 0)
-        existing_prompt = str(existing[2] or "")
-        existing_input_hash = str(existing[3] or "")
         existing_status = str(existing[4] or "pending")
-        same_identity = (
-            existing_campaign_id == int(campaign_id)
-            and existing_prompt == prompt_version
-            and existing_input_hash == input_hash
-        )
-        if same_identity and existing_status == "completed":
+        if existing_status == "completed":
             conn.execute(
                 """
                 UPDATE ai_work_items
@@ -1351,7 +1356,7 @@ def _upsert_work_item(
                 (_json_dumps(payload), now_iso(), int(existing[0])),
             )
             return {"inserted": 0, "reset": 0, "skipped": 1}
-        reset = (not same_identity) or existing_status in {"failed", "stale", "needs_retry", "low_confidence"}
+        reset = existing_status in {"failed", "stale", "needs_retry", "low_confidence"}
         conn.execute(
             """
             UPDATE ai_work_items
@@ -1394,6 +1399,21 @@ def _upsert_work_item(
             ),
         )
         return {"inserted": 0, "reset": 1 if reset else 0, "skipped": 0}
+    conn.execute(
+        """
+        UPDATE ai_work_items
+        SET status='stale',
+            lease_owner=NULL,
+            lease_expires_at=NULL,
+            updated_at=?
+        WHERE campaign_id=?
+          AND unit_kind=?
+          AND unit_key=?
+          AND stage=?
+          AND status IN ('pending', 'running', 'failed', 'needs_retry', 'low_confidence')
+        """,
+        (now_iso(), campaign_id, unit["unit_kind"], unit["unit_key"], stage),
+    )
     conn.execute(
         """
         INSERT INTO ai_work_items(
@@ -1827,7 +1847,70 @@ def _event_link_gate(
     return "standalone", None, gate
 
 
-def _persist_event_candidate(conn: sqlite3.Connection, unit: dict[str, Any], prompt_version: str, result: dict[str, Any]) -> int:
+def _deterministic_event_link_override(
+    conn: sqlite3.Connection,
+    unit: dict[str, Any],
+    payload: dict[str, Any] | None,
+    output_json: dict[str, Any],
+) -> tuple[str, int | None, dict[str, Any]] | None:
+    candidates = (payload or {}).get("candidate_events") or []
+    if not isinstance(candidates, list):
+        return None
+    for candidate in candidates[:5]:
+        if not isinstance(candidate, dict):
+            continue
+        raw_event_id = candidate.get("event_id") or candidate.get("id")
+        try:
+            event_id = int(raw_event_id)
+        except (TypeError, ValueError):
+            continue
+        reasons = {str(value) for value in (candidate.get("overlap_reasons") or [])}
+        has_entity = "entity_overlap" in reasons
+        has_time = "temporal_proximity" in reasons
+        has_text_anchor = "title_or_summary_anchor" in reasons
+        has_document_anchor = bool(candidate.get("official_docs") or candidate.get("facts"))
+        if not has_entity or not (has_time or has_text_anchor or has_document_anchor):
+            continue
+        gated_state, gated_event_id, gate = _event_link_gate(
+            conn,
+            unit,
+            event_id,
+            {
+                **output_json,
+                "reason": " ".join(
+                    [
+                        str(output_json.get("reason") or ""),
+                        str(candidate.get("canonical_title") or ""),
+                        str(candidate.get("summary_short") or ""),
+                    ]
+                ),
+            },
+        )
+        if gated_state == "link_existing":
+            return gated_state, gated_event_id, {
+                "accepted": True,
+                "candidate_event_id": event_id,
+                "candidate_reasons": sorted(reasons),
+                "gate": gate,
+            }
+        if gated_state == "merge_review":
+            return gated_state, gated_event_id, {
+                "accepted": True,
+                "candidate_event_id": event_id,
+                "candidate_reasons": sorted(reasons),
+                "gate": gate,
+            }
+    return None
+
+
+def _persist_event_candidate(
+    conn: sqlite3.Connection,
+    unit: dict[str, Any],
+    prompt_version: str,
+    result: dict[str, Any],
+    work_item_id: int | None = None,
+    payload: dict[str, Any] | None = None,
+) -> int:
     output_json = result.get("output_json")
     if not isinstance(output_json, dict):
         return 0
@@ -1867,26 +1950,46 @@ def _persist_event_candidate(conn: sqlite3.Connection, unit: dict[str, Any], pro
                 output_json["gate_failed"] = True
             candidate_state = gated_state
             suggested_event_id = gated_event_id
+    elif candidate_state in {"create_candidate", "standalone"}:
+        override = _deterministic_event_link_override(conn, unit, payload, output_json)
+        if override is not None:
+            override_state, override_event_id, override_payload = override
+            output_json["deterministic_override"] = {
+                **override_payload,
+                "from_action": raw_action or candidate_state,
+            }
+            candidate_state = override_state
+            suggested_event_id = override_event_id
+    campaign_id = None
+    if work_item_id is not None:
+        campaign_row = conn.execute("SELECT campaign_id FROM ai_work_items WHERE id=?", (int(work_item_id),)).fetchone()
+        if campaign_row and campaign_row[0] is not None:
+            campaign_id = int(campaign_row[0])
     row = conn.execute(
         """
         SELECT id
         FROM event_candidates
-        WHERE unit_kind=? AND unit_key=? AND COALESCE(suggested_event_id, 0)=COALESCE(?, 0)
+        WHERE COALESCE(campaign_id, 0)=COALESCE(?, 0)
+          AND unit_kind=?
+          AND unit_key=?
+          AND COALESCE(suggested_event_id, 0)=COALESCE(?, 0)
         ORDER BY id DESC
         LIMIT 1
         """,
-        (unit["unit_kind"], unit["unit_key"], suggested_event_id),
+        (campaign_id, unit["unit_kind"], unit["unit_key"], suggested_event_id),
     ).fetchone()
     if row:
         candidate_id = int(row[0])
         conn.execute(
             """
             UPDATE event_candidates
-            SET content_item_id=?, content_cluster_id=?, suggested_event_id=?, candidate_state=?, confidence=?, suggestion_json=?,
+            SET campaign_id=?, work_item_id=?, content_item_id=?, content_cluster_id=?, suggested_event_id=?, candidate_state=?, confidence=?, suggestion_json=?,
                 model_provider=?, model_name=?, prompt_version=?, status='open', updated_at=?
             WHERE id=?
             """,
             (
+                campaign_id,
+                int(work_item_id) if work_item_id is not None else None,
                 unit.get("content_item_id") or unit.get("canonical_content_id"),
                 unit.get("cluster_id"),
                 suggested_event_id,
@@ -1904,11 +2007,13 @@ def _persist_event_candidate(conn: sqlite3.Connection, unit: dict[str, Any], pro
         cur = conn.execute(
         """
         INSERT INTO event_candidates(
-            unit_kind, unit_key, content_item_id, content_cluster_id, suggested_event_id, candidate_state,
+            campaign_id, work_item_id, unit_kind, unit_key, content_item_id, content_cluster_id, suggested_event_id, candidate_state,
             confidence, suggestion_json, model_provider, model_name, prompt_version, status, created_at, updated_at
-        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
+            campaign_id,
+            int(work_item_id) if work_item_id is not None else None,
             unit["unit_kind"],
             unit["unit_key"],
             unit.get("content_item_id") or unit.get("canonical_content_id"),
@@ -2056,13 +2161,20 @@ def _persist_result(
     if stage in DERIVATION_STAGES:
         return _persist_content_derivation(conn, unit, stage, prompt_version, input_hash, result, payload, work_item_id)
     if stage == "event_link_hint":
-        return _persist_event_candidate(conn, unit, prompt_version, result)
+        return _persist_event_candidate(conn, unit, prompt_version, result, work_item_id, payload)
     if stage == "event_synthesis":
         return _persist_event_synthesis(conn, unit, result)
     return 0
 
 
 SOURCE_ONLY_STAGES = {
+    "clean_factual_text",
+    "structured_extract",
+    "event_link_hint",
+    "tag_reasoning",
+    "event_synthesis",
+}
+DETERMINISTIC_SOURCE_ONLY_FALLBACK_STAGES = {
     "clean_factual_text",
     "structured_extract",
     "event_link_hint",
@@ -2089,6 +2201,105 @@ def _validate_stage_result(stage: str, result: dict[str, Any]) -> None:
         if value in (None, "", [], {}):
             continue
         raise ValueError(f"schema_violation: source-only stage returned {key}")
+
+
+def _fallback_text_from_payload(payload: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for key in ("title", "body_text", "machine_reason"):
+        value = _normalize_space(payload.get(key))
+        if value:
+            parts.append(value)
+    event_context = payload.get("event_context")
+    if isinstance(event_context, dict):
+        for key in ("canonical_title", "summary_short", "event_type"):
+            value = _normalize_space(event_context.get(key))
+            if value:
+                parts.append(value)
+    for item in payload.get("cluster_items") or []:
+        if not isinstance(item, dict):
+            continue
+        value = _normalize_space(item.get("title"))
+        if value:
+            parts.append(value)
+        if len(parts) >= 8:
+            break
+    return _normalize_space(" ".join(parts))[:4000]
+
+
+def _deterministic_source_only_result(stage: str, prompt_version: str, payload: dict[str, Any], reason: str) -> dict[str, Any] | None:
+    if stage not in DETERMINISTIC_SOURCE_ONLY_FALLBACK_STAGES:
+        return None
+    text = _fallback_text_from_payload(payload)
+    if stage == "clean_factual_text":
+        output_json = {
+            "cleaned_text": text,
+            "source_facts": [text] if text else [],
+            "removed_noise": [],
+            "external_context": [],
+        }
+        output_text = text
+    elif stage == "structured_extract":
+        output_json = {
+            "actors": [],
+            "organizations": [],
+            "dates": [],
+            "locations": [],
+            "actions": [],
+            "legal_basis": [],
+            "affected_groups": [],
+            "explicit_claims": [text] if text else [],
+            "uncertainty_markers": [],
+            "document_anchors": [],
+            "source_facts": [text] if text else [],
+            "external_context": [],
+        }
+        output_text = text
+    elif stage == "event_link_hint":
+        output_json = {
+            "action": "standalone",
+            "event_id": None,
+            "reason": "deterministic fallback: no allowed source-only provider was available",
+            "matched_signals": [],
+            "candidate_event_ids_considered": [
+                item.get("id")
+                for item in payload.get("candidate_events") or []
+                if isinstance(item, dict) and item.get("id") is not None
+            ],
+            "external_context": [],
+            "abstain_reason": reason,
+        }
+        output_text = str(output_json["reason"])
+    elif stage == "tag_reasoning":
+        output_json = {
+            "tags": [],
+            "abstain_tags": [],
+            "rationale": "deterministic fallback abstained because no allowed source-only provider was available",
+            "signal_layers": [],
+            "abstain_reason": reason,
+            "external_context": [],
+        }
+        output_text = str(output_json["rationale"])
+    else:
+        output_json = {
+            "summary_short": text[:280],
+            "summary_long": text,
+            "timeline": [],
+            "participants": [],
+            "open_questions": [],
+            "source_facts": [text] if text else [],
+            "external_context": [],
+        }
+        output_text = str(output_json["summary_short"])
+    output_json["fallback_reason"] = reason
+    output_json["prompt_version"] = prompt_version
+    return {
+        "provider": "deterministic",
+        "model": "source-only-fallback",
+        "output_text": output_text,
+        "output_json": output_json,
+        "confidence": 0.35,
+        "citations": [],
+    }
 
 
 def _detect_failure_kind(error_text: str) -> str:
@@ -2175,6 +2386,27 @@ def _worker_run(
                 }
             stage_priority = provider_budget.allowed_priority(stage, priority) if provider_budget else priority
             if not stage_priority:
+                fallback = _deterministic_source_only_result(
+                    stage,
+                    prompt_version,
+                    payload,
+                    "stage_provider_budget_exhausted",
+                )
+                if fallback is not None:
+                    return {
+                        "ok": True,
+                        "work_item_id": work_item_id,
+                        "unit": unit,
+                        "stage": stage,
+                        "prompt_version": prompt_version,
+                        "input_hash": input_hash,
+                        "payload": payload,
+                    "provider": fallback["provider"],
+                    "model": fallback["model"],
+                    "key_id": None,
+                    "result": fallback,
+                    "attempts": failures + [{"provider": fallback["provider"], "model": fallback["model"], "key_id": None, "status": "ok"}],
+                }
                 return {
                     "ok": False,
                     "work_item_id": work_item_id,
@@ -2188,6 +2420,27 @@ def _worker_run(
                 }
             chosen = choose_key_for_stage(conn, stage=stage, provider_priority=stage_priority, exclude_key_ids=exclude)
             if not chosen:
+                fallback = _deterministic_source_only_result(
+                    stage,
+                    prompt_version,
+                    payload,
+                    "no_active_keys_for_stage",
+                )
+                if fallback is not None:
+                    return {
+                        "ok": True,
+                        "work_item_id": work_item_id,
+                        "unit": unit,
+                        "stage": stage,
+                        "prompt_version": prompt_version,
+                        "input_hash": input_hash,
+                        "payload": payload,
+                        "provider": fallback["provider"],
+                        "model": fallback["model"],
+                        "key_id": None,
+                        "result": fallback,
+                        "attempts": failures + [{"provider": fallback["provider"], "model": fallback["model"], "key_id": None, "status": "ok"}],
+                    }
                 return {
                     "ok": False,
                     "work_item_id": work_item_id,
@@ -2388,7 +2641,7 @@ def backfill_ai_attempt_failure_kinds(conn: sqlite3.Connection) -> int:
         SELECT id, error_text
         FROM ai_task_attempts
         WHERE status <> 'ok'
-          AND (failure_kind IS NULL OR TRIM(failure_kind)='' OR failure_kind='provider')
+          AND (failure_kind IS NULL OR TRIM(failure_kind)='' OR failure_kind IN ('provider', 'provider_model'))
         """
     ).fetchall()
     updated = 0

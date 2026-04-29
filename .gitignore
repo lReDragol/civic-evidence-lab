@@ -14,6 +14,8 @@ config/secrets.json
 config/secrets.*.json
 config/settings.json
 config/settings.local.json
+*.session
+*.session-journal
 config/*.session
 config/*.session-journal
 config/telegram_test_sessions/
@@ -27,6 +29,8 @@ config/telegram_test_sessions/
 *.sqlite-*
 *.sqlite3
 *.sqlite3-*
+*.db3
+*.dump
 db/*.db
 db/*.db-*
 db/backups/
@@ -65,8 +69,12 @@ venv/
 *.zip
 *.7z
 *.bak
+*.backup
+*.backup.*
+*.orig
 *.tmp
 *.temp
+*.pid
 _tmp_*.txt
 
 # Local planning notes and generated agent plans
@@ -79,7 +87,17 @@ news_calendar_pyside6.py
 news_tagging.py
 news_unified_pipeline.py
 
-# One-off exploratory scripts
+# Local/manual test harnesses and one-off exploratory scripts.
+# Keep the real unit/integration test suite under tests/ tracked.
+/test_*.py
+/*_test.py
+/debug_*.py
+/quick_*.py
+/scratch_*.py
+/tmp_*.py
+/check_*.py
+/verify_*.py
+tools/telegram_test_collect.py
 tools/_check_*.py
 tools/_explore_*.py
 tools/_find_*.py
@@ -87,7 +105,9 @@ tools/_test_*.py
 tools/debug_*.py
 tools/discover_*.py
 tools/explore_*.py
+tools/manual_*.py
 tools/quick_*.py
+tools/smoke_*.py
 tools/test_*.py
 tools/check_inv*.py
 tools/check_kremlin*.py

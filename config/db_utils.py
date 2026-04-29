@@ -119,6 +119,10 @@ ADDITIVE_COLUMNS = {
         "input_hash": "TEXT",
         "sample_bucket": "TEXT",
     },
+    "event_candidates": {
+        "campaign_id": "INTEGER",
+        "work_item_id": "INTEGER",
+    },
     "ai_task_attempts": {
         "failure_kind": "TEXT",
     },
@@ -250,7 +254,7 @@ CREATE TABLE IF NOT EXISTS ai_work_items (
     completed_at    TEXT,
     FOREIGN KEY (pipeline_run_id) REFERENCES pipeline_runs(id) ON DELETE SET NULL,
     FOREIGN KEY (campaign_id) REFERENCES ai_sweep_campaigns(id) ON DELETE SET NULL,
-    UNIQUE(unit_kind, unit_key, stage)
+    UNIQUE(campaign_id, unit_kind, unit_key, stage, prompt_version, input_hash)
 );
 CREATE INDEX IF NOT EXISTS idx_ai_work_items_status ON ai_work_items(status);
 CREATE INDEX IF NOT EXISTS idx_ai_work_items_stage ON ai_work_items(stage);
@@ -277,6 +281,8 @@ CREATE INDEX IF NOT EXISTS idx_ai_task_attempts_key ON ai_task_attempts(llm_key_
 
 CREATE TABLE IF NOT EXISTS event_candidates (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    campaign_id     INTEGER,
+    work_item_id    INTEGER,
     unit_kind       TEXT NOT NULL,
     unit_key        TEXT NOT NULL,
     content_item_id INTEGER,
@@ -291,12 +297,15 @@ CREATE TABLE IF NOT EXISTS event_candidates (
     status          TEXT NOT NULL DEFAULT 'open',
     created_at      TEXT DEFAULT (datetime('now')),
     updated_at      TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (campaign_id) REFERENCES ai_sweep_campaigns(id) ON DELETE SET NULL,
+    FOREIGN KEY (work_item_id) REFERENCES ai_work_items(id) ON DELETE SET NULL,
     FOREIGN KEY (content_item_id) REFERENCES content_items(id) ON DELETE SET NULL,
     FOREIGN KEY (content_cluster_id) REFERENCES content_clusters(id) ON DELETE SET NULL,
     FOREIGN KEY (suggested_event_id) REFERENCES events(id) ON DELETE SET NULL
 );
 CREATE INDEX IF NOT EXISTS idx_event_candidates_state ON event_candidates(candidate_state, status);
 CREATE INDEX IF NOT EXISTS idx_event_candidates_event ON event_candidates(suggested_event_id);
+CREATE INDEX IF NOT EXISTS idx_event_candidates_campaign ON event_candidates(campaign_id, candidate_state);
 
 CREATE TABLE IF NOT EXISTS event_merge_reviews (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -804,6 +813,123 @@ def _create_index_if_columns_exist(
     conn.execute(f"CREATE INDEX IF NOT EXISTS {index_name} ON {table_name}({columns_sql})")
 
 
+def _unique_index_columns(conn: sqlite3.Connection, table_name: str) -> list[tuple[str, ...]]:
+    indexes: list[tuple[str, ...]] = []
+    try:
+        rows = conn.execute(f"PRAGMA index_list({table_name})").fetchall()
+    except sqlite3.DatabaseError:
+        return indexes
+    for row in rows:
+        try:
+            is_unique = bool(row[2])
+            index_name = row[1]
+        except (IndexError, TypeError):
+            continue
+        if not is_unique:
+            continue
+        try:
+            cols = tuple(str(info[2]) for info in conn.execute(f"PRAGMA index_info({index_name})").fetchall())
+        except sqlite3.DatabaseError:
+            continue
+        indexes.append(cols)
+    return indexes
+
+
+def _ensure_ai_work_items_campaign_identity(conn: sqlite3.Connection):
+    """Migrate legacy ai_work_items uniqueness from unit/stage to campaign+version.
+
+    Older builds had UNIQUE(unit_kind, unit_key, stage). That made a new pilot
+    campaign overwrite the previous campaign_id on the same work item, so
+    ai_task_attempts appeared to move between campaigns. Rebuilding the table
+    preserves row ids and attempt FKs while changing the identity contract.
+    """
+
+    columns = _table_columns(conn, "ai_work_items")
+    if not columns:
+        return
+    desired = ("campaign_id", "unit_kind", "unit_key", "stage", "prompt_version", "input_hash")
+    if desired in _unique_index_columns(conn, "ai_work_items"):
+        return
+
+    conn.commit()
+    foreign_keys_row = conn.execute("PRAGMA foreign_keys").fetchone()
+    foreign_keys_enabled = bool(foreign_keys_row and foreign_keys_row[0])
+    legacy_alter_row = conn.execute("PRAGMA legacy_alter_table").fetchone()
+    legacy_alter_enabled = bool(legacy_alter_row and legacy_alter_row[0])
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.execute("PRAGMA legacy_alter_table=ON")
+    try:
+        conn.execute("BEGIN")
+        conn.execute("ALTER TABLE ai_work_items RENAME TO ai_work_items_legacy")
+        conn.execute(
+            """
+            CREATE TABLE ai_work_items (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                pipeline_run_id INTEGER,
+                campaign_id     INTEGER,
+                unit_kind       TEXT NOT NULL,
+                unit_key        TEXT NOT NULL,
+                stage           TEXT NOT NULL,
+                unit_ref_id     INTEGER,
+                canonical_content_id INTEGER,
+                event_id        INTEGER,
+                review_task_id  INTEGER,
+                prompt_version  TEXT NOT NULL DEFAULT 'ai-sweep-v1',
+                input_hash      TEXT,
+                sample_bucket   TEXT,
+                priority        INTEGER NOT NULL DEFAULT 50,
+                status          TEXT NOT NULL DEFAULT 'pending',
+                lease_owner     TEXT,
+                lease_expires_at TEXT,
+                attempt_count   INTEGER NOT NULL DEFAULT 0,
+                provider        TEXT,
+                model_name      TEXT,
+                payload_json    TEXT,
+                result_json     TEXT,
+                error_text      TEXT,
+                created_at      TEXT DEFAULT (datetime('now')),
+                updated_at      TEXT DEFAULT (datetime('now')),
+                completed_at    TEXT,
+                FOREIGN KEY (pipeline_run_id) REFERENCES pipeline_runs(id) ON DELETE SET NULL,
+                FOREIGN KEY (campaign_id) REFERENCES ai_sweep_campaigns(id) ON DELETE SET NULL,
+                UNIQUE(campaign_id, unit_kind, unit_key, stage, prompt_version, input_hash)
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO ai_work_items(
+                id, pipeline_run_id, campaign_id, unit_kind, unit_key, stage, unit_ref_id,
+                canonical_content_id, event_id, review_task_id, prompt_version, input_hash,
+                sample_bucket, priority, status, lease_owner, lease_expires_at, attempt_count,
+                provider, model_name, payload_json, result_json, error_text, created_at,
+                updated_at, completed_at
+            )
+            SELECT
+                id, pipeline_run_id, campaign_id, unit_kind, unit_key, stage, unit_ref_id,
+                canonical_content_id, event_id, review_task_id,
+                COALESCE(prompt_version, 'ai-sweep-v1'), input_hash,
+                sample_bucket, priority, status, lease_owner, lease_expires_at, attempt_count,
+                provider, model_name, payload_json, result_json, error_text, created_at,
+                updated_at, completed_at
+            FROM ai_work_items_legacy
+            """
+        )
+        conn.execute("DROP TABLE ai_work_items_legacy")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_ai_work_items_status ON ai_work_items(status)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_ai_work_items_stage ON ai_work_items(stage)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_ai_work_items_pipeline ON ai_work_items(pipeline_run_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_ai_work_items_campaign ON ai_work_items(campaign_id, status)")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.execute(f"PRAGMA legacy_alter_table={'ON' if legacy_alter_enabled else 'OFF'}")
+        if foreign_keys_enabled:
+            conn.execute("PRAGMA foreign_keys=ON")
+
+
 def ensure_additive_schema(conn: sqlite3.Connection):
     for table_name, columns in ADDITIVE_COLUMNS.items():
         existing = _table_columns(conn, table_name)
@@ -814,6 +940,7 @@ def ensure_additive_schema(conn: sqlite3.Connection):
                 continue
             conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_sql}")
     conn.executescript(ADDITIVE_SCHEMA_SQL)
+    _ensure_ai_work_items_campaign_identity(conn)
     _create_index_if_columns_exist(
         conn,
         table_name="claims",

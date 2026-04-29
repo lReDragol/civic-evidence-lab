@@ -472,12 +472,14 @@ def choose_key_for_stage(
     if not candidates:
         return None
     priority = list(provider_priority or ["mistral", "perplexity", "groq", "openrouter", "openai"])
+    if priority:
+        allowed_providers = set(priority)
+        candidates = [item for item in candidates if item["provider"] in allowed_providers]
+        if not candidates:
+            return None
 
     def rank(item: dict[str, Any]) -> tuple[int, int, int, str, int]:
-        try:
-            provider_rank = priority.index(item["provider"])
-        except ValueError:
-            provider_rank = len(priority) + 1
+        provider_rank = priority.index(item["provider"]) if item["provider"] in priority else len(priority) + 1
         stage_roles = set(item.get("stage_roles") or [])
         role_bonus = 0 if stage in stage_roles or "overflow" in stage_roles else 1
         return (

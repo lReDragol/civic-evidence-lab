@@ -1333,6 +1333,31 @@ class RelationLayerTests(unittest.TestCase):
             self.assertIn('"event_fact"', row[8])
             self.assertIn(("event_fact", "evidence", 1202, 1203), [tuple(item) for item in support])
 
+    def test_relation_candidate_builder_does_not_promote_event_fact_between_non_actor_roles(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "relations.db"
+            create_event_fact_official_bridge_db(db_path)
+            conn = sqlite3.connect(db_path)
+            try:
+                conn.execute("UPDATE event_entities SET role='affected' WHERE entity_id=120")
+                conn.execute("UPDATE event_entities SET role='target' WHERE entity_id=121")
+                conn.commit()
+            finally:
+                conn.close()
+
+            result = rebuild_relation_candidates({"db_path": str(db_path)})
+
+            conn = sqlite3.connect(db_path)
+            try:
+                candidate_count = conn.execute("SELECT COUNT(*) FROM relation_candidates").fetchone()[0]
+                support_count = conn.execute("SELECT COUNT(*) FROM relation_support").fetchone()[0]
+            finally:
+                conn.close()
+
+            self.assertEqual(result["promoted_relations"], 0)
+            self.assertEqual(candidate_count, 0)
+            self.assertEqual(support_count, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

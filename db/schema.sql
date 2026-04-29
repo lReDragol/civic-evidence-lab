@@ -841,7 +841,7 @@ CREATE TABLE IF NOT EXISTS ai_work_items (
     completed_at    TEXT,
     FOREIGN KEY (pipeline_run_id) REFERENCES pipeline_runs(id) ON DELETE SET NULL,
     FOREIGN KEY (campaign_id) REFERENCES ai_sweep_campaigns(id) ON DELETE SET NULL,
-    UNIQUE(unit_kind, unit_key, stage)
+    UNIQUE(campaign_id, unit_kind, unit_key, stage, prompt_version, input_hash)
 );
 CREATE INDEX IF NOT EXISTS idx_ai_work_items_status ON ai_work_items(status);
 CREATE INDEX IF NOT EXISTS idx_ai_work_items_stage ON ai_work_items(stage);
@@ -868,6 +868,8 @@ CREATE INDEX IF NOT EXISTS idx_ai_task_attempts_key ON ai_task_attempts(llm_key_
 
 CREATE TABLE IF NOT EXISTS event_candidates (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    campaign_id     INTEGER,
+    work_item_id    INTEGER,
     unit_kind       TEXT NOT NULL,
     unit_key        TEXT NOT NULL,
     content_item_id INTEGER,
@@ -882,12 +884,15 @@ CREATE TABLE IF NOT EXISTS event_candidates (
     status          TEXT NOT NULL DEFAULT 'open',
     created_at      TEXT DEFAULT (datetime('now')),
     updated_at      TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (campaign_id) REFERENCES ai_sweep_campaigns(id) ON DELETE SET NULL,
+    FOREIGN KEY (work_item_id) REFERENCES ai_work_items(id) ON DELETE SET NULL,
     FOREIGN KEY (content_item_id) REFERENCES content_items(id) ON DELETE SET NULL,
     FOREIGN KEY (content_cluster_id) REFERENCES content_clusters(id) ON DELETE SET NULL,
     FOREIGN KEY (suggested_event_id) REFERENCES events(id) ON DELETE SET NULL
 );
 CREATE INDEX IF NOT EXISTS idx_event_candidates_state ON event_candidates(candidate_state, status);
 CREATE INDEX IF NOT EXISTS idx_event_candidates_event ON event_candidates(suggested_event_id);
+CREATE INDEX IF NOT EXISTS idx_event_candidates_campaign ON event_candidates(campaign_id, candidate_state);
 
 CREATE TABLE IF NOT EXISTS event_merge_reviews (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
