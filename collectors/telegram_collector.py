@@ -7,7 +7,7 @@ import re
 import sqlite3
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Mapping, Optional
 
 sys_path = str(Path(__file__).resolve().parent.parent)
 if sys_path not in os.sys.path:
@@ -15,6 +15,8 @@ if sys_path not in os.sys.path:
 
 from config.db_utils import get_db, load_settings, ensure_dirs
 from db.file_store import materialize_attachment
+from classifier.negative_filter import classify_negative_profile
+from classifier.tagger_v2 import infer_tags_v2
 from runtime.state import record_dead_letter, update_source_sync_state
 
 log = logging.getLogger(__name__)
@@ -26,6 +28,258 @@ try:
 except ImportError:
     HAVE_PYROGRAM = False
     log.error("pyrogram not installed")
+
+
+RUSSIA_CONTEXT_PATTERNS = [
+    r"\bросси[яйиюе]\b",
+    r"\bроссийск",
+    r"(?<![а-яёa-z])рф(?![а-яёa-z])",
+    r"\bгосдум",
+    r"\bгосударственн[а-яё]+\s+дум",
+    r"\bправительств[а-яё]*\s+рф\b",
+    r"\bкремл",
+    r"\bминцифр",
+    r"\bминфин",
+    r"\bминюст",
+    r"\bроскомнадзор",
+    r"(?<![а-яёa-z])ркн(?![а-яёa-z])",
+    r"\bфсб\b",
+    r"\bмвд\b",
+    r"\bпрокуратур",
+    r"\bдепутат",
+    r"\bшадаев",
+    r"\bлантратов",
+    r"\bпарфенов",
+    r"\bпарфёнов",
+    r"\bтасс\b",
+    r"\b\.ru\b|\b\.рф\b|\b\.su\b",
+]
+
+POLICY_NEGATIVE_PATTERNS = [
+    (r"\bштраф", 3.0, "restriction/fines"),
+    (r"\bзапрет|\bогранич|\bблокиров|\bзаблокир|\bзамедл|\bроскомнадзор|(?<![а-яёa-z])ркн(?![а-яёa-z])", 3.5, "restriction/censorship"),
+    (r"\bvpn\b|\bвпн\b|\bтрафик|\bинтернет|\bмессенджер", 2.5, "restriction/internet"),
+    (r"\bперсональн[а-яё]+\s+данн|\bутечк[а-яё]+\s+персональн", 2.5, "restriction/privacy"),
+    (r"\bgoogle analytics\b|\bтрансграничн[а-яё]+\s+передач", 2.0, "restriction/privacy"),
+    (r"\bналог|\bплат[ауые]\b|\bсбор\b|\bтариф", 2.0, "economic/harm"),
+    (r"\bтрадиционн[а-яё]+\s+ценност|\bпрокатн[а-яё]+\s+удостоверен", 2.5, "restriction/culture_control"),
+]
+
+DOCUMENT_SIGNAL_PATTERNS = [
+    r"\bдокумент",
+    r"\bскриншот",
+    r"\bписьм[ооае]",
+    r"\bтребовани[ея]",
+    r"\bуведомлени[ея]",
+    r"\bпредписани[ея]",
+    r"\bпостановлени[ея]",
+    r"\bприказ",
+    r"\bдепутатск[а-яё]+\s+запрос",
+    r"\bофициальн[а-яё]+\s+запрос",
+    r"(?<![а-яёa-z])№\s*\d+",
+    r"\b\d{1,2}\.\d{1,2}\.\d{4}\b",
+    r"\bфз\b|\b\d+\s*-\s*фз\b",
+]
+
+LOW_VALUE_TELEGRAM_PATTERNS = [
+    (r"^\s*(доброе утро|добрый вечер|спокойной ночи)[!.…\s]*$", "greeting_only"),
+    (r"\bрозыгрыш\b|\bконкурс\b|\bподарок\b|\bгороскоп\b|\bмем\b", "entertainment_or_giveaway"),
+    (r"\bреклам|\bпромокод|\bскидк|\bкупить\b|\bзаказать\b", "promo_or_ad"),
+]
+
+
+def _normalize_text(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").replace("ё", "е").lower()).strip()
+
+
+def _source_value(source: Optional[Mapping], key: str) -> str:
+    if not source:
+        return ""
+    try:
+        return str(source[key] or "")
+    except Exception:
+        getter = getattr(source, "get", None)
+        return str(getter(key, "") if getter else "")
+
+
+def _pattern_matches(text: str, patterns: list[str]) -> list[str]:
+    return [pattern for pattern in patterns if re.search(pattern, text, flags=re.IGNORECASE | re.UNICODE)]
+
+
+def _flatten_tags(tag_map) -> list[str]:
+    return [tag for tags in (tag_map or {}).values() for tag, _score in tags]
+
+
+def classify_message_relevance(
+    text: str,
+    *,
+    has_media: bool,
+    source: Optional[Mapping] = None,
+    store_mode: str = "all",
+) -> dict:
+    """Precision-first gate for Telegram ingestion.
+
+    The gate is deliberately conservative: global tech/politics posts are dropped
+    unless they contain Russian actors, Russian institutions, or Russian legal context.
+    """
+    normalized = _normalize_text(text)
+    source_context = _normalize_text(
+        " ".join(
+            [
+                _source_value(source, "name"),
+                _source_value(source, "url"),
+                _source_value(source, "subcategory"),
+                _source_value(source, "political_alignment"),
+                _source_value(source, "notes"),
+            ]
+        )
+    )
+    tag_map = infer_tags_v2(text or "")
+    tag_names = _flatten_tags(tag_map)
+    negative_profile = classify_negative_profile(text or "", source=source, tag_names=tag_names)
+
+    russia_matches = _pattern_matches(f"{normalized} {source_context}", RUSSIA_CONTEXT_PATTERNS)
+    low_value_reasons = [reason for pattern, reason in LOW_VALUE_TELEGRAM_PATTERNS if re.search(pattern, normalized, flags=re.IGNORECASE | re.UNICODE)]
+
+    policy_score = 0.0
+    navigation_tags: list[str] = []
+    for pattern, score, tag in POLICY_NEGATIVE_PATTERNS:
+        if re.search(pattern, normalized, flags=re.IGNORECASE | re.UNICODE):
+            policy_score += score
+            navigation_tags.append(tag)
+
+    document_matches = _pattern_matches(normalized, DOCUMENT_SIGNAL_PATTERNS)
+    is_document_like = bool(has_media and (document_matches or policy_score >= 4.0))
+
+    text_len = len(normalized)
+    reasons: list[str] = list(dict.fromkeys(low_value_reasons))
+    is_russia_related = bool(russia_matches)
+    if not is_russia_related:
+        reasons.append("not_russia_related")
+    if text_len < 35 and not has_media:
+        reasons.append("too_short_without_media")
+
+    is_negative = bool(negative_profile.get("is_negative_public_interest"))
+    is_policy_adverse = policy_score >= 4.0
+    is_document_adverse = is_document_like and (is_policy_adverse or is_negative or bool(document_matches and policy_score >= 2.5))
+
+    mode = (store_mode or "all").strip().lower()
+    if mode == "all":
+        keep = True
+    elif mode == "filtered":
+        keep = not low_value_reasons and is_russia_related
+    elif mode == "news_only":
+        keep = not low_value_reasons and is_russia_related and (is_negative or is_policy_adverse or is_document_like)
+    elif mode == "negative_only":
+        keep = not low_value_reasons and is_russia_related and (is_negative or is_policy_adverse or is_document_adverse)
+        if not (is_negative or is_policy_adverse or is_document_adverse):
+            reasons.append("not_negative_public_interest")
+    else:
+        keep = True
+
+    return {
+        "keep": bool(keep),
+        "mode": mode,
+        "reasons": sorted(set(reasons)),
+        "is_russia_related": is_russia_related,
+        "russia_reasons": russia_matches[:12],
+        "is_negative_public_interest": is_negative,
+        "negative_profile": negative_profile,
+        "policy_score": round(policy_score, 2),
+        "navigation_tags": sorted(set(navigation_tags + list(negative_profile.get("risk_tags") or []))),
+        "is_document_like": is_document_like,
+        "document_reasons": document_matches[:12],
+        "tag_names": tag_names,
+        "quality": {
+            "text_length": text_len,
+            "has_media": bool(has_media),
+            "low_value_reasons": low_value_reasons,
+        },
+    }
+
+
+def _insert_relevance_votes(conn: sqlite3.Connection, content_id: int, relevance: dict) -> None:
+    votes: list[tuple[str, str, str, float, str, str | None]] = []
+    for tag in relevance.get("navigation_tags") or []:
+        votes.append((str(tag), "support", "telegram_relevance", 0.85, "telegram_relevance", None))
+    if relevance.get("is_document_like"):
+        votes.append(("document/screenshot", "support", "telegram_relevance", 0.95, "telegram_document_gate", None))
+        votes.append(("document/authenticity_review", "support", "telegram_relevance", 0.9, "telegram_document_gate", None))
+    if not relevance.get("keep"):
+        for reason in relevance.get("reasons") or ["filtered"]:
+            votes.append((f"filter/{reason}", "reject", "telegram_relevance", 0.9, "telegram_relevance", str(reason)))
+
+    for tag_name, vote_value, signal_layer, confidence, voter_name, abstain_reason in votes:
+        namespace = tag_name.split("/", 1)[0] if "/" in tag_name else None
+        conn.execute(
+            """
+            INSERT INTO content_tag_votes(
+                content_item_id, voter_name, tag_name, namespace, normalized_tag, vote_value,
+                signal_layer, abstain_reason, confidence_raw, evidence_text, metadata_json
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                content_id,
+                voter_name,
+                tag_name,
+                namespace,
+                tag_name,
+                vote_value,
+                signal_layer,
+                abstain_reason,
+                confidence,
+                "; ".join(relevance.get("document_reasons") or relevance.get("russia_reasons") or [])[:500],
+                json.dumps({"relevance": relevance}, ensure_ascii=False),
+            ),
+        )
+
+
+def _enqueue_document_review(
+    conn: sqlite3.Connection,
+    *,
+    content_id: int,
+    source_id: int,
+    external_id: str,
+    public_url: str,
+    relevance: dict,
+) -> None:
+    if not relevance.get("is_document_like"):
+        return
+    task_key = f"telegram-document:{source_id}:{external_id}"
+    conn.execute(
+        """
+        INSERT INTO review_tasks(
+            task_key, queue_key, subject_type, subject_id, candidate_payload,
+            suggested_action, confidence, machine_reason, source_links_json, status
+        ) VALUES(?,?,?,?,?,?,?,?,?, 'open')
+        ON CONFLICT(task_key) DO UPDATE SET
+            candidate_payload=excluded.candidate_payload,
+            confidence=MAX(review_tasks.confidence, excluded.confidence),
+            machine_reason=excluded.machine_reason,
+            source_links_json=excluded.source_links_json,
+            updated_at=datetime('now')
+        """,
+        (
+            task_key,
+            "documents",
+            "content_item",
+            content_id,
+            json.dumps(
+                {
+                    "source_id": source_id,
+                    "external_id": external_id,
+                    "document_reasons": relevance.get("document_reasons") or [],
+                    "navigation_tags": relevance.get("navigation_tags") or [],
+                    "policy_score": relevance.get("policy_score"),
+                },
+                ensure_ascii=False,
+            ),
+            "verify_document_screenshot",
+            0.9,
+            "Telegram post has media and official-document signals; OCR/search/authenticity verification required.",
+            json.dumps([public_url], ensure_ascii=False),
+        ),
+    )
 
 
 def _get_source_id(conn: sqlite3.Connection, url: str) -> Optional[int]:
@@ -65,6 +319,17 @@ async def collect_channel(app: Client, channel_url: str, source_id: int, conn: s
 
     source_key = _telegram_source_key(source_id)
     source_name = handle
+    source_row = conn.execute(
+        """
+        SELECT id, name, url, subcategory, is_official, credibility_tier, owner,
+               bias_notes, political_alignment, notes
+        FROM sources
+        WHERE id=?
+        """,
+        (source_id,),
+    ).fetchone()
+    store_mode = str(settings.get("telegram_store_mode", "all") or "all")
+
     try:
         peer = await app.get_chat(handle)
         source_name = getattr(peer, "title", handle) or handle
@@ -101,6 +366,14 @@ async def collect_channel(app: Client, channel_url: str, source_id: int, conn: s
 
         text = msg.text or msg.caption or ""
         date_iso = msg.date.isoformat() if msg.date else ""
+        public_url = f"https://t.me/{handle.lstrip('@')}/{msg.id}"
+        has_media = bool(msg.media or msg.photo or msg.video or msg.document)
+        relevance = classify_message_relevance(
+            text,
+            has_media=has_media,
+            source=source_row,
+            store_mode=store_mode,
+        )
 
         payload = {
             "message_id": msg.id,
@@ -111,12 +384,16 @@ async def collect_channel(app: Client, channel_url: str, source_id: int, conn: s
             "post_author": msg.post_author,
             "grouped_id": msg.grouped_id,
             "reply_to_message_id": msg.reply_to_message_id if msg.reply_to_message else None,
-            "has_media": bool(msg.media),
+            "has_media": has_media,
             "source_title": source_name,
             "channel_handle": handle,
+            "relevance": relevance,
         }
         raw_json = json.dumps(payload, ensure_ascii=False, default=str)
         hash_sha = hashlib.sha256(raw_json.encode("utf-8")).hexdigest()
+
+        if not relevance.get("keep", True):
+            continue
 
         cur = conn.execute(
             """INSERT INTO raw_source_items(source_id, external_id, raw_payload, collected_at, hash_sha256, is_processed)
@@ -133,9 +410,18 @@ async def collect_channel(app: Client, channel_url: str, source_id: int, conn: s
         cur2 = conn.execute(
             """INSERT INTO content_items(source_id, raw_item_id, external_id, content_type, title, body_text, published_at, collected_at, url, status)
                VALUES(?,?,?,?,?,?,?,?,?,'raw_signal')""",
-            (source_id, raw_id, ext_id, "post", title, text, date_iso, datetime.now().isoformat(), channel_url),
+            (source_id, raw_id, ext_id, "post", title, text, date_iso, datetime.now().isoformat(), public_url),
         )
         content_id = cur2.lastrowid
+        _insert_relevance_votes(conn, content_id, relevance)
+        _enqueue_document_review(
+            conn,
+            content_id=content_id,
+            source_id=source_id,
+            external_id=ext_id,
+            public_url=public_url,
+            relevance=relevance,
+        )
 
         media_paths = []
         ts = msg.date.strftime("%Y-%m") if msg.date else "unknown"

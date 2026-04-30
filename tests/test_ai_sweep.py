@@ -85,18 +85,29 @@ class AiSweepTests(unittest.TestCase):
         self.assertEqual(_detect_failure_kind("schema_violation: source-only stage returned external_context"), "schema_violation")
         self.assertEqual(_detect_failure_kind('401 invalid api key'), "auth")
 
-    def test_run_provider_budget_keeps_transient_failures_local_to_item(self):
+    def test_run_provider_budget_keeps_transient_failures_local_below_threshold(self):
         from analysis.ai_sweep import RunProviderBudget
 
-        budget = RunProviderBudget(max_failures_per_provider_stage=2)
+        budget = RunProviderBudget(max_failures_per_provider_stage=2, max_transient_failures_per_provider_stage=3)
         priority = ["mistral", "groq", "openrouter"]
 
         self.assertEqual(budget.allowed_priority("structured_extract", priority), priority)
-        for _ in range(10):
-            budget.record_failure("structured_extract", "mistral", "timeout")
-            budget.record_failure("structured_extract", "mistral", "rate")
+        budget.record_failure("structured_extract", "mistral", "timeout")
+        budget.record_failure("structured_extract", "mistral", "rate")
 
         self.assertEqual(budget.allowed_priority("structured_extract", priority), priority)
+        self.assertEqual(budget.allowed_priority("tag_reasoning", priority), priority)
+
+    def test_run_provider_budget_skips_transient_failure_storm_for_stage(self):
+        from analysis.ai_sweep import RunProviderBudget
+
+        budget = RunProviderBudget(max_failures_per_provider_stage=25, max_transient_failures_per_provider_stage=3)
+        priority = ["mistral", "groq", "openrouter"]
+
+        for _ in range(3):
+            budget.record_failure("structured_extract", "mistral", "timeout")
+
+        self.assertEqual(budget.allowed_priority("structured_extract", priority), ["groq", "openrouter"])
         self.assertEqual(budget.allowed_priority("tag_reasoning", priority), priority)
 
     def test_run_provider_budget_keeps_schema_violations_local_to_item(self):
@@ -329,6 +340,26 @@ class AiSweepTests(unittest.TestCase):
             self.assertEqual(result["result"]["output_json"]["fallback_reason"], "no_active_keys_for_stage")
             self.assertIn("Одиночный пост", result["result"]["output_text"])
 
+    def test_structured_extract_fallback_extracts_document_signals_from_source_text(self):
+        from analysis.ai_sweep import _deterministic_source_only_result
+
+        result = _deterministic_source_only_result(
+            "structured_extract",
+            "ai-sweep-v3-extract",
+            {
+                "title": "Штрафы до 15 млн рублей начал выписывать РКН владельцам сайтов",
+                "body_text": "Роскомнадзор направил требование по 152-ФЗ от 30.03.2026 о нарушении обработки персональных данных.",
+            },
+            "no_active_keys_for_stage",
+        )
+
+        output = result["output_json"]
+        self.assertIn("Роскомнадзор", output["organizations"])
+        self.assertIn("30.03.2026", output["dates"])
+        self.assertIn("152-ФЗ", output["legal_basis"])
+        self.assertIn("fine", output["actions"])
+        self.assertTrue(output["document_anchors"])
+
     def test_worker_preserves_provider_failures_before_deterministic_fallback(self):
         from analysis.ai_sweep import RunProviderBudget, _worker_run
         from llm.key_pool import bootstrap_provider_catalog
@@ -380,6 +411,88 @@ class AiSweepTests(unittest.TestCase):
             self.assertEqual(result["attempts"][0]["status"], "failed")
             self.assertEqual(result["attempts"][0]["failure_kind"], "schema_violation")
             self.assertEqual(result["attempts"][-1]["provider"], "deterministic")
+
+    def test_worker_retries_transient_mistral_failure_before_source_only_fallback(self):
+        from analysis.ai_sweep import RunProviderBudget, _worker_run
+        from llm.key_pool import bootstrap_provider_catalog
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "ai.db"
+            create_db(db_path)
+            conn = sqlite3.connect(db_path)
+            try:
+                bootstrap_provider_catalog(conn)
+                conn.executemany(
+                    """
+                    INSERT INTO llm_keys(provider, api_key, key_hash, status)
+                    VALUES('mistral', ?, ?, 'active')
+                    """,
+                    [("test-key-1", "mistral-test-key-1"), ("test-key-2", "mistral-test-key-2")],
+                )
+                conn.execute(
+                    """
+                    INSERT INTO ai_work_items(id, campaign_id, unit_kind, unit_key, stage, prompt_version, input_hash, status, payload_json)
+                    VALUES(903, 1, 'content_item', 'content:14', 'structured_extract', 'ai-sweep-v3-extract', 'hash-4', 'running', '{}')
+                    """
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            payload = {
+                "title": "Одиночный пост",
+                "body_text": "Отдельный материал без кластера",
+                "content_type": "post",
+                "candidate_events": [],
+            }
+            valid_response = {
+                "output_text": "Одиночный пост: отдельный материал без кластера.",
+                "output_json": {
+                    "actors": [],
+                    "organizations": [],
+                    "dates": [],
+                    "locations": [],
+                    "actions": [],
+                    "legal_basis": [],
+                    "affected_groups": [],
+                    "explicit_claims": [],
+                    "uncertainty_markers": [],
+                    "document_anchors": [],
+                },
+                "confidence": 0.7,
+            }
+
+            with patch(
+                "analysis.ai_sweep.run_ai_task",
+                side_effect=[
+                    TimeoutError("HTTPSConnectionPool(host='api.mistral.ai', port=443): Read timed out. (read timeout=120)"),
+                    valid_response,
+                ],
+            ):
+                result = _worker_run(
+                    {
+                        "db_path": str(db_path),
+                        "ensure_schema_on_connect": False,
+                        "ai_sweep": {
+                            "max_failures_per_provider_per_item": 1,
+                            "max_transient_failures_per_provider_per_item": 2,
+                        },
+                    },
+                    {"unit_kind": "content_item", "unit_key": "content:14", "content_item_id": 14},
+                    "structured_extract",
+                    "ai-sweep-v3-extract",
+                    "hash-4",
+                    payload,
+                    903,
+                    RunProviderBudget(max_failures_per_provider_stage=10),
+                )
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["provider"], "mistral")
+            self.assertEqual(result["attempts"][0]["status"], "failed")
+            self.assertEqual(result["attempts"][0]["failure_kind"], "timeout")
+            self.assertEqual(result["attempts"][-1]["status"], "ok")
+            self.assertNotEqual(result["provider"], "deterministic")
 
     def test_worker_does_not_use_deterministic_fallback_for_relation_reasoning(self):
         from analysis.ai_sweep import RunProviderBudget, _worker_run
@@ -1292,6 +1405,17 @@ class AiSweepTests(unittest.TestCase):
             self.assertIn("entity_roles", candidate)
             self.assertIn("facts", candidate)
             self.assertIn("official_docs", candidate)
+
+    def test_time_overlap_normalizes_offset_aware_and_naive_datetimes(self):
+        from analysis.ai_sweep import _time_overlap
+
+        self.assertTrue(
+            _time_overlap(
+                "2026-04-20T08:00:00+03:00",
+                "2026-04-20T05:00:00",
+                "2026-04-20T06:00:00",
+            )
+        )
 
     def test_candidate_events_do_not_drop_relevant_late_event_after_first_200_rows(self):
         from analysis.ai_sweep import _build_unit_context, _candidate_events_for_unit

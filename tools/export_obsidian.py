@@ -16,6 +16,30 @@ from runtime.state import get_runtime_metadata, set_runtime_metadata
 
 
 BAD_FILENAME_CHARS = '<>:"/\\|?*\n\r\t'
+EXPORTED_VAULT_DIRS = {
+    "Affiliations",
+    "Assets",
+    "Attachments",
+    "Bills",
+    "Cases",
+    "Claims",
+    "Content",
+    "Contracts",
+    "Disclosures",
+    "Entities",
+    "Events",
+    "Facts",
+    "Files",
+    "Profiles",
+    "Restrictions",
+    "ReviewPacks",
+    "Risks",
+    "Sources",
+    "Tags",
+    "VoteSessions",
+    "WeakLinks",
+}
+EXPORTED_VAULT_FILES = {"index.md"}
 
 
 def slugify(value: str, fallback: str = "note", max_len: int = 90) -> str:
@@ -60,6 +84,19 @@ def write_note(vault: Path, rel_path: str, body: str) -> str:
     ensure_dir(out_path.parent)
     out_path.write_text(body.rstrip() + "\n", encoding="utf-8")
     return rel_path.replace("\\", "/")
+
+
+def clean_exported_vault(vault: Path):
+    """Remove generated export content without touching Obsidian/user settings."""
+    ensure_dir(vault)
+    for dirname in EXPORTED_VAULT_DIRS:
+        path = vault / dirname
+        if path.exists():
+            shutil.rmtree(path)
+    for filename in EXPORTED_VAULT_FILES:
+        path = vault / filename
+        if path.exists() and path.is_file():
+            path.unlink()
 
 
 def connect(db_path: Path) -> sqlite3.Connection:
@@ -417,8 +454,11 @@ def export_obsidian(
     limit: Optional[int] = None,
     copy_media: bool = True,
     mode: str = "graph",
+    clean: bool = False,
 ):
     mode = (mode or "graph").strip().lower()
+    if clean:
+        clean_exported_vault(vault)
     if mode == "graph":
         from tools.export_obsidian_graph import export_graph_obsidian
 
@@ -465,6 +505,7 @@ def main():
     parser.add_argument("--limit", type=int, default=0, help="Limit exported content/claims/cases/entities for smoke tests")
     parser.add_argument("--mode", choices=("graph", "archive"), default="graph", help="Obsidian export mode")
     parser.add_argument("--no-media", action="store_true", help="Write notes without copying media files")
+    parser.add_argument("--clean", action="store_true", help="Remove generated notes/media before exporting; preserves .obsidian")
     args = parser.parse_args()
 
     db_path = Path(args.db)
@@ -475,6 +516,7 @@ def main():
         limit=args.limit or None,
         copy_media=not args.no_media,
         mode=args.mode,
+        clean=args.clean,
     )
     print(f"Obsidian export complete ({args.mode}): {vault}")
 

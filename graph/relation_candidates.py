@@ -138,7 +138,33 @@ def _parse_json(raw_text: str | None, default: Any):
 
 
 def _normalize_role(value: Any) -> str:
-    return str(value or "").strip().lower()
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return ""
+    if "unknown" in raw or "неизвест" in raw or "unspecified" in raw:
+        return raw
+    role_aliases = (
+        ("decision", "decision_maker"),
+        ("issuer", "issuer"),
+        ("исполн", "executor"),
+        ("executor", "executor"),
+        ("regulator", "regulator"),
+        ("authority", "authority"),
+        ("agency", "agency"),
+        ("court", "court"),
+        ("official", "official"),
+        ("target", "target"),
+        ("affected", "affected"),
+        ("subject", "subject"),
+        ("recipient", "recipient"),
+        ("regulated", "regulated"),
+        ("defendant", "defendant"),
+        ("plaintiff", "plaintiff"),
+    )
+    for marker, canonical in role_aliases:
+        if marker in raw:
+            return canonical
+    return raw
 
 
 def _event_fact_role_pair_is_direct_relation(role_a: Any, role_b: Any) -> bool:

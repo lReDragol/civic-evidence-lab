@@ -28,6 +28,48 @@ def create_db(db_path: Path):
 
 
 class IngestRuntimeStateTests(unittest.TestCase):
+    def test_telegram_relevance_keeps_russian_negative_documents_and_drops_global_noise(self):
+        source = {
+            "name": "YEP",
+            "url": "https://t.me/yep_news",
+            "subcategory": "media",
+            "political_alignment": "media",
+            "notes": "Telegram news channel",
+        }
+
+        rkn = telegram_collector.classify_message_relevance(
+            "Штрафы до 15 млн рублей начал выписывать РКН владельцам сайтов зоны .RU. "
+            "В требовании Роскомнадзора говорится о политике конфиденциальности, Google Analytics "
+            "и трансграничной передаче персональных данных.",
+            has_media=True,
+            source=source,
+            store_mode="negative_only",
+        )
+        self.assertTrue(rkn["keep"])
+        self.assertTrue(rkn["is_document_like"])
+        self.assertIn("restriction/censorship", rkn["navigation_tags"])
+
+        vpn = telegram_collector.classify_message_relevance(
+            "Депутат Госдумы Денис Парфенов направил главе Минцифры Максуту Шадаеву "
+            "официальный запрос после сообщений о планах ввести отдельную плату за VPN-трафик.",
+            has_media=True,
+            source=source,
+            store_mode="negative_only",
+        )
+        self.assertTrue(vpn["keep"])
+        self.assertTrue(vpn["is_document_like"])
+        self.assertIn("restriction/internet", vpn["navigation_tags"])
+
+        eu_google = telegram_collector.classify_message_relevance(
+            "Google should allow third-party search engines access to data, EU says. "
+            "Reuters reports that Brussels wants Google to share search data with competitors.",
+            has_media=True,
+            source=source,
+            store_mode="negative_only",
+        )
+        self.assertFalse(eu_google["keep"])
+        self.assertIn("not_russia_related", eu_google["reasons"])
+
     def test_watch_folder_success_updates_item_level_source_sync_state(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -224,6 +266,103 @@ class IngestRuntimeStateTests(unittest.TestCase):
             self.assertEqual(metadata["channel_handle"], "@testchan")
             self.assertEqual(metadata["collected"], 1)
 
+    def test_collect_channel_filters_noise_and_queues_document_review(self):
+        class FakeApp:
+            async def get_chat(self, handle):
+                return SimpleNamespace(id=77, title="YEP")
+
+            def get_chat_history(self, peer_id, limit=100, offset_id=0):
+                async def _gen():
+                    yield SimpleNamespace(
+                        id=102,
+                        text=(
+                            "Google should allow third-party search engines access to data, EU says. "
+                            "Reuters reports on Brussels and Google."
+                        ),
+                        caption=None,
+                        date=datetime(2026, 4, 30, 12, 5, 0),
+                        views=10,
+                        forwards=1,
+                        post_author=None,
+                        grouped_id=None,
+                        reply_to_message=None,
+                        media=True,
+                        photo=True,
+                        video=None,
+                        document=None,
+                    )
+                    yield SimpleNamespace(
+                        id=101,
+                        text=(
+                            "Штрафы до 15 млн рублей начал выписывать РКН владельцам сайтов зоны .RU. "
+                            "На скриншоте требование Роскомнадзора по политике конфиденциальности "
+                            "и Google Analytics."
+                        ),
+                        caption=None,
+                        date=datetime(2026, 4, 30, 12, 0, 0),
+                        views=20,
+                        forwards=2,
+                        post_author=None,
+                        grouped_id=None,
+                        reply_to_message=None,
+                        media=True,
+                        photo=True,
+                        video=None,
+                        document=None,
+                    )
+
+                return _gen()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            db_path = tmp_path / "news.db"
+            telegram_dir = tmp_path / "telegram"
+            create_db(db_path)
+            settings = {
+                "db_path": str(db_path),
+                "ensure_schema_on_connect": True,
+                "processed_telegram": str(telegram_dir),
+                "telegram_store_mode": "negative_only",
+            }
+            conn = get_db(settings)
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO sources(id, name, category, subcategory, url, access_method, is_active, credibility_tier)
+                    VALUES(1, 'YEP', 'telegram', 'media', 'https://t.me/yep_news', 'telegram', 1, 'B')
+                    """
+                )
+                conn.commit()
+
+                collected = asyncio.run(
+                    telegram_collector.collect_channel(
+                        FakeApp(),
+                        "https://t.me/yep_news",
+                        1,
+                        conn,
+                        settings,
+                        limit=10,
+                    )
+                )
+                content_rows = conn.execute(
+                    "SELECT id, external_id, title FROM content_items WHERE source_id=1 ORDER BY external_id"
+                ).fetchall()
+                tag_votes = conn.execute(
+                    "SELECT tag_name, vote_value, signal_layer FROM content_tag_votes ORDER BY tag_name"
+                ).fetchall()
+                review_rows = conn.execute(
+                    "SELECT queue_key, subject_type, suggested_action, status FROM review_tasks ORDER BY id"
+                ).fetchall()
+                attachments = conn.execute("SELECT attachment_type FROM attachments").fetchall()
+            finally:
+                conn.close()
+
+        self.assertEqual(collected, 1)
+        self.assertEqual([row["external_id"] for row in content_rows], ["101"])
+        self.assertEqual([row["attachment_type"] for row in attachments], ["photo"])
+        self.assertTrue(any(row["tag_name"] == "document/screenshot" and row["vote_value"] == "support" for row in tag_votes))
+        self.assertIn(("documents", "content_item", "verify_document_screenshot", "open"), [tuple(row) for row in review_rows])
+
     def test_ocr_missing_file_records_dead_letter_and_source_state(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -375,6 +514,94 @@ class IngestRuntimeStateTests(unittest.TestCase):
             self.assertEqual(state_row["state"], "warning")
             self.assertEqual(state_row["last_external_id"], "1")
             self.assertEqual(state_row["transport_mode"], "ocr")
+
+    def test_ocr_prioritizes_document_review_attachments(self):
+        class FakeEngine:
+            def ocr(self, image_path, **kwargs):
+                return [[[None, (f"ocr:{Path(image_path).name}", 0.99)]]]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            db_path = tmp_path / "news.db"
+            create_db(db_path)
+            settings = {
+                "db_path": str(db_path),
+                "ensure_schema_on_connect": True,
+            }
+            conn = get_db(settings)
+            try:
+                conn.execute("INSERT INTO sources(id, name, category, url, is_active) VALUES(1, 'Telegram', 'telegram', 'https://t.me/a', 1)")
+                for i in range(1, 101):
+                    image_path = tmp_path / f"normal-{i}.jpg"
+                    image_path.write_bytes(b"image")
+                    conn.execute(
+                        """
+                        INSERT INTO content_items(id, source_id, external_id, content_type, title, body_text, status)
+                        VALUES(?,?,?,?,?,?,?)
+                        """,
+                        (i, 1, str(i), "post", f"normal {i}", "", "raw_signal"),
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO attachments(content_item_id, file_path, attachment_type, hash_sha256, file_size, mime_type)
+                        VALUES(?,?,?,?,?,?)
+                        """,
+                        (i, str(image_path), "photo", f"h{i}", 5, "image/jpeg"),
+                    )
+
+                document_path = tmp_path / "document.jpg"
+                document_path.write_bytes(b"image")
+                conn.execute(
+                    """
+                    INSERT INTO content_items(id, source_id, external_id, content_type, title, body_text, status)
+                    VALUES(?,?,?,?,?,?,?)
+                    """,
+                    (200, 1, "200", "post", "document", "", "raw_signal"),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO attachments(content_item_id, file_path, attachment_type, hash_sha256, file_size, mime_type)
+                    VALUES(?,?,?,?,?,?)
+                    """,
+                    (200, str(document_path), "photo", "doc-hash", 5, "image/jpeg"),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO review_tasks(task_key, queue_key, subject_type, subject_id, suggested_action, status)
+                    VALUES('telegram-document:1:200', 'documents', 'content_item', 200, 'verify_document_screenshot', 'open')
+                    """
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            with patch("media_pipeline.ocr.get_ocr_engine", return_value=FakeEngine()):
+                previous_backend = getattr(ocr, "_ocr_backend", None)
+                ocr._ocr_backend = "paddleocr"
+                try:
+                    result = ocr.process_unprocessed_ocr(settings)
+                finally:
+                    ocr._ocr_backend = previous_backend
+
+            conn = get_db(settings)
+            try:
+                doc_ocr = conn.execute(
+                    "SELECT ocr_text FROM attachments WHERE content_item_id=200"
+                ).fetchone()["ocr_text"]
+                remaining_normals = conn.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM attachments
+                    WHERE content_item_id BETWEEN 1 AND 100
+                      AND (ocr_text IS NULL OR ocr_text='')
+                    """
+                ).fetchone()[0]
+            finally:
+                conn.close()
+
+            self.assertEqual(result["items_seen"], 100)
+            self.assertEqual(doc_ocr, "ocr:document.jpg")
+            self.assertGreaterEqual(remaining_normals, 1)
 
     def test_get_ocr_engine_retries_without_show_log(self):
         class FakePaddleOCR:

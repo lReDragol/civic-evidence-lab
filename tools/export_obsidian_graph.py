@@ -34,6 +34,21 @@ STRUCTURAL_RELATION_TYPES = {
     "voted_absent",
 }
 WEAK_RELATION_TYPES = {"mentioned_together"}
+OBSIDIAN_GRAPH_GROUPS = [
+    ("Events", 'path:"Events/" OR tag:#event', "#34D399"),
+    ("Facts", 'path:"Facts/" OR tag:#fact', "#22D3EE"),
+    ("People", 'path:"Entities/person/" OR tag:#person', "#FBBF24"),
+    ("Organizations", 'path:"Entities/organization/" OR tag:#organization OR tag:#org', "#60A5FA"),
+    ("Claims and Cases", 'path:"Claims/" OR path:"Cases/" OR tag:#claim OR tag:#case', "#F472B6"),
+    ("Restrictions", 'path:"Restrictions/" OR tag:#restriction', "#FB7185"),
+    ("Disclosures", 'path:"Disclosures/" OR tag:#disclosure OR tag:#income', "#A78BFA"),
+    ("Assets", 'path:"Assets/" OR tag:#asset', "#F97316"),
+    ("Affiliations", 'path:"Affiliations/" OR tag:#affiliation', "#A3E635"),
+    ("Official Documents", 'path:"Bills/" OR path:"VoteSessions/" OR path:"Contracts/" OR tag:#document', "#38BDF8"),
+    ("Sources", 'path:"Sources/" OR tag:#source', "#94A3B8"),
+    ("Content", 'path:"Content/" OR tag:#content', "#64748B"),
+    ("Weak Links", 'path:"WeakLinks/"', "#475569"),
+]
 
 
 def slugify(value: str, fallback: str = "note", max_len: int = 90) -> str:
@@ -79,6 +94,72 @@ def write_note(vault: Path, rel_path: str, body: str) -> str:
     ensure_dir(out_path.parent)
     out_path.write_text(body.rstrip() + "\n", encoding="utf-8")
     return rel_path.replace("\\", "/")
+
+
+def hex_to_obsidian_rgb(hex_color: str) -> int:
+    value = hex_color.strip().lstrip("#")
+    if len(value) != 6:
+        raise ValueError(f"Invalid graph group color: {hex_color}")
+    return int(value, 16)
+
+
+def obsidian_graph_group(label: str, query: str, hex_color: str) -> dict[str, Any]:
+    return {
+        "query": query,
+        "color": {
+            "a": 1,
+            "rgb": hex_to_obsidian_rgb(hex_color),
+        },
+        "label": label,
+    }
+
+
+def export_obsidian_graph_settings(vault: Path) -> Path:
+    """Write Obsidian graph groups while preserving unrelated vault settings."""
+    obsidian_dir = vault / ".obsidian"
+    ensure_dir(obsidian_dir)
+    graph_path = obsidian_dir / "graph.json"
+    if graph_path.exists():
+        try:
+            graph_config = json.loads(graph_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            graph_config = {}
+    else:
+        graph_config = {}
+
+    generated_queries = {query for _, query, _ in OBSIDIAN_GRAPH_GROUPS}
+    existing_groups = graph_config.get("colorGroups")
+    if not isinstance(existing_groups, list):
+        existing_groups = []
+    preserved_groups = [
+        group
+        for group in existing_groups
+        if isinstance(group, dict) and group.get("query") not in generated_queries
+    ]
+    graph_config.update(
+        {
+            "collapse-color-groups": False,
+            "colorGroups": preserved_groups
+            + [obsidian_graph_group(label, query, color) for label, query, color in OBSIDIAN_GRAPH_GROUPS],
+            "collapse-display": False,
+            "showTags": True,
+            "showAttachments": True,
+            "showArrow": False,
+            "textFadeMultiplier": -0.9,
+            "nodeSizeMultiplier": 1.08,
+            "lineSizeMultiplier": 0.55,
+            "collapse-forces": False,
+            "centerStrength": 0.35,
+            "repelStrength": 24,
+            "linkStrength": 0.85,
+            "linkDistance": 340,
+        }
+    )
+    graph_path.write_text(
+        json.dumps(graph_config, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return graph_path
 
 
 def connect(db_path: Path) -> sqlite3.Connection:
@@ -931,12 +1012,11 @@ def build_graph_context(conn: sqlite3.Connection) -> GraphContext:
                 (overlay["entity_a_id"], overlay["entity_b_id"], overlay["entity_b_name"], overlay["entity_b_type"]),
                 (overlay["entity_b_id"], overlay["entity_a_id"], overlay["entity_a_name"], overlay["entity_a_type"]),
             ):
+                relation_type = overlay.get("promoted_relation_type") or overlay.get("candidate_type")
                 strong_relations_by_entity[entity_id].append(
                     {
-                        "relation_type": overlay.get("promoted_relation_type") or overlay.get("candidate_type"),
-                        "label": relation_label(
-                            overlay.get("promoted_relation_type") or overlay.get("candidate_type")
-                        ),
+                        "relation_type": relation_type,
+                        "label": relation_label(relation_type, outgoing=entity_id == overlay["entity_a_id"]),
                         "other_entity_id": other_id,
                         "other_name": other_name,
                         "other_type": other_type,
@@ -2503,6 +2583,7 @@ def export_graph_obsidian(
         export_graph_weak_links(vault, ctx)
         export_graph_tags(vault, ctx)
         export_graph_files(vault, conn, copy_media=copy_media)
+        export_obsidian_graph_settings(vault)
         set_runtime_metadata(conn, "obsidian_built_from_pipeline_version", ctx.pipeline_version)
         set_runtime_metadata(conn, "obsidian_export_generated_at", generated_at)
     finally:

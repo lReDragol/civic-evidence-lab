@@ -3255,3 +3255,181 @@ button:disabled {
     white-space: normal;
   }
 }
+
+/* UI layout contract */
+:root {
+  --shell-drawer-top: 184px;
+  --shell-drawer-bottom: 14px;
+}
+
+.screen-panel {
+  position: relative !important;
+  grid-template-rows: auto minmax(0, 1fr) !important;
+  overflow: hidden !important;
+}
+
+.screen-root {
+  min-height: 0 !important;
+  height: 100% !important;
+  overflow: hidden !important;
+}
+
+.screen-stack {
+  position: relative;
+  height: 100%;
+  min-height: 0;
+}
+
+.screen-stack.drawer-open .master-pane {
+  width: calc(48% - 10px);
+  max-width: calc(48% - 10px);
+  min-width: 340px;
+}
+
+.detail-overlay-host {
+  position: absolute;
+  inset: 0;
+  z-index: 28;
+  pointer-events: none;
+  overflow: hidden;
+}
+
+.detail-overlay-host.has-detail {
+  pointer-events: none;
+}
+
+.detail-overlay-host .detail-drawer {
+  top: 10px !important;
+  right: 10px !important;
+  bottom: 10px !important;
+  left: auto !important;
+  width: 52% !important;
+  max-width: calc(100% - 20px) !important;
+  z-index: 2 !important;
+  pointer-events: auto;
+}
+
+.detail-overlay-host .detail-drawer-scrim {
+  inset: 0 !important;
+  z-index: 1 !important;
+  pointer-events: none !important;
+}
+
+.sidebar-panel,
+.tasks-panel {
+  top: var(--shell-drawer-top) !important;
+  bottom: var(--shell-drawer-bottom) !important;
+}
+
+#sidebar-resize,
+#tasks-resize {
+  top: calc(var(--shell-drawer-top) + 22px) !important;
+  bottom: calc(var(--shell-drawer-bottom) + 22px) !important;
+}
+
+.relation-map-host {
+  overflow: hidden !important;
+}
+
+.relation-map-screen {
+  height: 100% !important;
+  min-height: 0 !important;
+  overflow: hidden !important;
+}
+
+.relation-map-stage {
+  height: 100% !important;
+  min-height: 0 !important;
+}
+
+.relation-map-surface {
+  height: 100% !important;
+  min-height: 0 !important;
+}
+
+.relation-map-head-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.map-fullscreen-btn {
+  min-height: 32px;
+  white-space: nowrap;
+}
+
+.relation-map-overlay-host.fullscreen {
+  position: fixed !important;
+  inset: 14px !important;
+  left: 14px !important;
+  top: 14px !important;
+  right: 14px !important;
+  bottom: 14px !important;
+  width: auto !important;
+  height: auto !important;
+  z-index: 90 !important;
+  opacity: 1 !important;
+  pointer-events: auto !important;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 28px;
+  background:
+    radial-gradient(circle at 75% 8%, rgba(78, 242, 178, 0.12), transparent 34%),
+    linear-gradient(180deg, rgba(8, 15, 12, 0.98), rgba(3, 8, 6, 0.98));
+  box-shadow: 0 36px 110px rgba(0, 0, 0, 0.62);
+  backdrop-filter: blur(18px);
+}
+
+.relation-map-fullscreen-shell {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 12px;
+  height: 100%;
+  min-height: 0;
+  padding: 14px;
+}
+
+.relation-map-fullscreen-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  min-height: 54px;
+}
+
+.relation-map-fullscreen-head h2 {
+  margin: 2px 0 0;
+  font-size: 24px;
+  letter-spacing: -0.04em;
+}
+
+.relation-map-fullscreen-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.relation-map-fullscreen-shell > .relation-map-screen {
+  min-height: 0;
+}
+
+.relation-map-fullscreen-shell > .detail-drawer {
+  z-index: 5;
+}
+
+@media (max-width: 1220px) {
+  .screen-stack.drawer-open .master-pane {
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+  }
+
+  .detail-overlay-host .detail-drawer {
+    width: calc(100% - 16px) !important;
+    left: 8px !important;
+    right: 8px !important;
+    top: 8px !important;
+    bottom: 8px !important;
+  }
+}

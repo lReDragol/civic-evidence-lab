@@ -392,6 +392,101 @@ class ObsidianGraphExportTests(unittest.TestCase):
             self.assertIn("promoted official bridge", entity_text)
             self.assertIn("bridges Content, Disclosure, OfficialDocument", entity_text)
 
+    def test_graph_export_materializes_promoted_overlay_without_existing_relation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            db_path = tmp_path / "sample.db"
+            vault = tmp_path / "vault"
+            create_db(db_path)
+
+            conn = sqlite3.connect(db_path)
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO relation_candidates(
+                        entity_a_id, entity_b_id, candidate_type, origin, score,
+                        support_items, support_sources, support_domains, support_hard_evidence_count,
+                        candidate_state, promotion_state, evidence_mix_json, explain_path_json
+                    ) VALUES(
+                        4, 5, 'likely_association', 'candidate_builder:official_bridge', 0.94,
+                        1, 1, 1, 1,
+                        'promoted', 'promoted',
+                        '{"bridge_types":["Event","Fact","OfficialDocument"],"official_content_types":["procurement"]}',
+                        '[{"node_type":"Event","ids":[1]},{"node_type":"Fact","ids":[1]},{"node_type":"OfficialDocument","ids":[2]}]'
+                    )
+                    """
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            export_obsidian(db_path=db_path, vault=vault, mode="graph", copy_media=False)
+
+            entity_note = vault / "Entities" / "organization" / "4-State-Agency.md"
+            entity_text = entity_note.read_text(encoding="utf-8")
+            self.assertIn("[[Entities/organization/5-Vendor-LLC|Vendor LLC]]", entity_text)
+            self.assertIn("promoted official bridge", entity_text)
+            self.assertIn("bridges Event, Fact, OfficialDocument", entity_text)
+
+    def test_graph_export_writes_colored_graph_groups_and_preserves_settings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            db_path = tmp_path / "sample.db"
+            vault = tmp_path / "vault"
+            create_db(db_path)
+            obsidian_dir = vault / ".obsidian"
+            obsidian_dir.mkdir(parents=True)
+            (obsidian_dir / "graph.json").write_text(
+                json.dumps(
+                    {
+                        "search": "tag:#manual",
+                        "customSetting": "keep-me",
+                        "colorGroups": [
+                            {"query": "tag:#manual", "color": {"a": 1, "rgb": 123}},
+                            {"query": 'path:"Events/" OR tag:#event', "color": {"a": 1, "rgb": 999}},
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            export_obsidian(db_path=db_path, vault=vault, mode="graph", copy_media=False)
+
+            graph_config = json.loads((obsidian_dir / "graph.json").read_text(encoding="utf-8"))
+            self.assertEqual(graph_config["customSetting"], "keep-me")
+            self.assertTrue(graph_config["showTags"])
+            self.assertTrue(graph_config["showAttachments"])
+            self.assertLess(graph_config["lineSizeMultiplier"], 1)
+            queries = [group["query"] for group in graph_config["colorGroups"]]
+            self.assertIn("tag:#manual", queries)
+            self.assertEqual(queries.count('path:"Events/" OR tag:#event'), 1)
+            self.assertIn('path:"Entities/person/" OR tag:#person', queries)
+            self.assertIn('path:"Restrictions/" OR tag:#restriction', queries)
+
+    def test_clean_export_preserves_obsidian_and_user_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            db_path = tmp_path / "sample.db"
+            vault = tmp_path / "vault"
+            create_db(db_path)
+            obsidian_dir = vault / ".obsidian"
+            obsidian_dir.mkdir(parents=True)
+            (obsidian_dir / "app.json").write_text("{}", encoding="utf-8")
+            stale_content = vault / "Content" / "stale.md"
+            stale_content.parent.mkdir(parents=True)
+            stale_content.write_text("stale", encoding="utf-8")
+            custom_file = vault / "Custom" / "keep.md"
+            custom_file.parent.mkdir(parents=True)
+            custom_file.write_text("keep", encoding="utf-8")
+
+            export_obsidian(db_path=db_path, vault=vault, mode="graph", copy_media=False, clean=True)
+
+            self.assertFalse(stale_content.exists())
+            self.assertTrue((obsidian_dir / "app.json").exists())
+            self.assertTrue(custom_file.exists())
+            self.assertTrue((vault / "Content" / "2026-04" / "1-Deputy-voted-for-bill-123.md").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

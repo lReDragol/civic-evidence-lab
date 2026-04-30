@@ -29,6 +29,8 @@
     tasksCollapsed: true,
     taskTab: "queue",
     relationMapViewport: null,
+    relationMapFullscreen: false,
+    activeTextFilter: null,
   };
 
   const ui = {};
@@ -36,6 +38,7 @@
   const GRAPH_HEIGHT = 620;
   let sourceReloadTimer = null;
   let screenReloadTimer = null;
+  let pendingDetailOverlay = null;
 
   document.addEventListener("DOMContentLoaded", init);
 
@@ -59,6 +62,7 @@
     ui.summaryStrip = document.getElementById("summary-strip");
     ui.screenPanel = document.querySelector(".screen-panel");
     ui.screenRoot = document.getElementById("screen-root");
+    ui.detailOverlayHost = document.getElementById("detail-overlay-host");
     ui.screenEyebrow = document.getElementById("screen-eyebrow");
     ui.screenTitle = document.getElementById("screen-title");
     ui.screenCaption = document.getElementById("screen-caption");
@@ -151,11 +155,15 @@
   }
 
   function relationMapOverlayOpen() {
-    return state.section === "relations" && (state.filters.relations.view || "cards") === "map";
+    return (
+      state.section === "relations" &&
+      (state.filters.relations.view || "cards") === "map" &&
+      !!state.relationMapFullscreen
+    );
   }
 
   function interactiveRoots() {
-    const roots = [ui.screenRoot];
+    const roots = [ui.detailOverlayHost, ui.screenRoot];
     if (relationMapOverlayOpen() && ui.relationMapOverlayHost && !ui.relationMapOverlayHost.hidden) {
       roots.unshift(ui.relationMapOverlayHost);
     }
@@ -260,9 +268,15 @@
       if (closeVisibleGraphPopover()) {
         return;
       }
-      if (relationMapOverlayOpen() && state.detailDrawerOpen.relations) {
-        closeDetailDrawer("relations");
-        delete state.selectedRows.relations;
+      if (relationMapOverlayOpen()) {
+        state.relationMapFullscreen = false;
+        clearRelationMapOverlay();
+        renderScreen();
+        return;
+      }
+      if (state.detailDrawerOpen[state.section]) {
+        closeDetailDrawer(state.section);
+        delete state.selectedRows[state.section];
         renderScreen();
         return;
       }
@@ -280,6 +294,7 @@
     });
 
     window.addEventListener("resize", () => {
+      syncShellOverlayBounds();
       scheduleRelationMapStageSync();
     });
   }
@@ -341,6 +356,21 @@
     ui.schedulerToggleBtn.textContent = state.bootstrap.jobs.scheduler_running
       ? "Стоп план"
       : "Планировщик";
+    syncShellOverlayBounds();
+  }
+
+  function syncShellOverlayBounds() {
+    if (!ui.appShell || !ui.screenPanel) {
+      return;
+    }
+    const topPanel = ui.appShell.querySelector(".top-panel");
+    const topPanelRect = topPanel?.getBoundingClientRect();
+    if (!topPanelRect) {
+      return;
+    }
+    const top = Math.max(14, Math.round(topPanelRect.bottom + 10));
+    document.documentElement.style.setProperty("--shell-drawer-top", `${top}px`);
+    document.documentElement.style.setProperty("--shell-drawer-bottom", "14px");
   }
 
   function renderNavigation() {
@@ -683,6 +713,8 @@
     ui.appShell.dataset.section = state.section;
     ui.screenPanel?.classList.remove("relation-map-host");
     ui.screenRoot.classList.remove("relation-map-host");
+    pendingDetailOverlay = null;
+    clearDetailOverlay();
     clearRelationMapOverlay();
     renderSummary();
     ui.screenRoot.classList.remove("screen-root-enter");
@@ -723,9 +755,11 @@
       default:
         ui.screenRoot.innerHTML = emptyState("Экран не найден", "Выберите другой раздел.");
     }
+    flushDetailOverlay();
     bindDetailDrawer();
     bindJumpLinks();
     bindEvidenceGraphs();
+    restoreActiveTextFilter();
   }
 
   function clearRelationMapOverlay() {
@@ -736,6 +770,38 @@
     ui.relationMapOverlayHost.hidden = true;
     ui.relationMapOverlayHost.setAttribute("aria-hidden", "true");
     ui.relationMapOverlayHost.classList.remove("open");
+    ui.relationMapOverlayHost.classList.remove("fullscreen");
+    ui.relationMapOverlayHost.removeAttribute("style");
+  }
+
+  function clearDetailOverlay() {
+    if (!ui.detailOverlayHost) {
+      return;
+    }
+    ui.detailOverlayHost.innerHTML = "";
+    ui.detailOverlayHost.classList.remove("has-detail");
+    ui.detailOverlayHost.setAttribute("aria-hidden", "true");
+  }
+
+  function queueDetailOverlay(detail, detailOpen, options = {}) {
+    if (!detailOpen || !screenUsesDetailDrawer(state.section)) {
+      pendingDetailOverlay = null;
+      return;
+    }
+    pendingDetailOverlay = { detail, detailOpen, options };
+  }
+
+  function flushDetailOverlay() {
+    if (!ui.detailOverlayHost || !pendingDetailOverlay) {
+      return;
+    }
+    ui.detailOverlayHost.innerHTML = renderDetailDrawer(
+      pendingDetailOverlay.detail,
+      pendingDetailOverlay.detailOpen,
+      pendingDetailOverlay.options
+    );
+    ui.detailOverlayHost.classList.toggle("has-detail", !!pendingDetailOverlay.detailOpen);
+    ui.detailOverlayHost.setAttribute("aria-hidden", pendingDetailOverlay.detailOpen ? "false" : "true");
   }
 
   function renderOverviewScreen(payload) {
@@ -1520,20 +1586,29 @@
     if (view === "map") {
       ui.screenPanel?.classList.add("relation-map-host");
       ui.screenRoot.classList.add("relation-map-host");
-      ui.screenRoot.innerHTML = "";
+      ui.screenRoot.innerHTML = renderRelationMapScreen({
+        filters: filtersMarkup,
+        graph: renderRelationMapSection(payload.map_graph, mapGroup, { fullscreen: false }),
+        detail: detailMarkup,
+        detailOpen: drawerOpen,
+        fullscreen: false,
+      });
       if (ui.relationMapOverlayHost) {
-        ui.relationMapOverlayHost.hidden = false;
-        ui.relationMapOverlayHost.setAttribute("aria-hidden", "false");
-        ui.relationMapOverlayHost.classList.add("open");
-        ui.relationMapOverlayHost.innerHTML = renderRelationMapScreen({
-          filters: filtersMarkup,
-          graph: renderRelationMapSection(payload.map_graph, mapGroup),
-          detail: detailMarkup,
-          detailOpen: drawerOpen,
-        });
+        if (state.relationMapFullscreen) {
+          ui.relationMapOverlayHost.hidden = false;
+          ui.relationMapOverlayHost.setAttribute("aria-hidden", "false");
+          ui.relationMapOverlayHost.classList.add("open", "fullscreen");
+          ui.relationMapOverlayHost.innerHTML = renderRelationMapFullscreen({
+            graph: renderRelationMapSection(payload.map_graph, mapGroup, { fullscreen: true }),
+            detail: detailMarkup,
+            detailOpen: drawerOpen,
+          });
+        } else {
+          clearRelationMapOverlay();
+        }
       }
-      scheduleRelationMapStageSync();
     } else {
+      state.relationMapFullscreen = false;
       ui.screenRoot.innerHTML = renderMasterDetailLayout({
         filters: filtersMarkup,
         list:
@@ -1581,6 +1656,21 @@
     });
     bindViewSwitch("relations");
     bindRowSelection("relations");
+    queryInteractiveAll("[data-relation-map-fullscreen]").forEach((button) => {
+      button.addEventListener("click", (event) => {
+        event.preventDefault();
+        state.relationMapFullscreen = true;
+        renderScreen();
+      });
+    });
+    queryInteractiveAll("[data-relation-map-exit-fullscreen]").forEach((button) => {
+      button.addEventListener("click", (event) => {
+        event.preventDefault();
+        state.relationMapFullscreen = false;
+        clearRelationMapOverlay();
+        renderScreen();
+      });
+    });
     queryInteractiveAll("[data-map-group]").forEach((button) => {
       button.addEventListener("click", () => {
         state.filters.relations.map_group = button.dataset.mapGroup || "";
@@ -1808,6 +1898,9 @@
 
   function renderMasterDetailLayout({ filters, list, detail, selectionBanner = "", detailOpen = false }) {
     const drawerEnabled = screenUsesDetailDrawer(state.section);
+    if (drawerEnabled) {
+      queueDetailOverlay(detail, detailOpen);
+    }
     return `
       <div class="screen-stack ${drawerEnabled ? "drawer-enabled" : ""} ${detailOpen ? "drawer-open" : ""}">
         <section class="master-pane master-pane-overlay">
@@ -1817,12 +1910,14 @@
             <div class="table-list">${list}</div>
           </div>
         </section>
-        ${drawerEnabled ? renderDetailDrawer(detail, detailOpen) : ""}
       </div>
     `;
   }
 
-  function renderRelationMapScreen({ filters, graph, detail, detailOpen }) {
+  function renderRelationMapScreen({ filters, graph, detail, detailOpen, fullscreen = false }) {
+    if (!fullscreen) {
+      queueDetailOverlay(detail, detailOpen);
+    }
     return `
       <div class="relation-map-screen ${detailOpen ? "drawer-open" : ""}">
         ${filters || ""}
@@ -1830,8 +1925,25 @@
           <div class="relation-map-surface glass-panel">
             ${graph}
           </div>
-          ${renderDetailDrawer(detail, detailOpen, { variant: "map-variant" })}
         </div>
+      </div>
+    `;
+  }
+
+  function renderRelationMapFullscreen({ graph, detail, detailOpen }) {
+    return `
+      <div class="relation-map-fullscreen-shell">
+        <div class="relation-map-fullscreen-head">
+          <div>
+            <div class="eyebrow">Аналитика · связи</div>
+            <h2>Карта связей</h2>
+          </div>
+          <div class="relation-map-fullscreen-actions">
+            <button class="secondary-btn" data-relation-map-exit-fullscreen type="button">Закрыть карту</button>
+          </div>
+        </div>
+        ${renderRelationMapScreen({ filters: "", graph, detail, detailOpen, fullscreen: true })}
+        ${renderDetailDrawer(detail, detailOpen)}
       </div>
     `;
   }
@@ -2000,6 +2112,79 @@
     };
   }
 
+  function relationMapNodeScore(node, degree) {
+    const role = String(node?.role || "");
+    const group = relationMapNodeGroup(node).key;
+    const groupWeight = {
+      people: 32,
+      organizations: 30,
+      documents: 28,
+      restrictions: 26,
+      affiliations: 24,
+      claims: 20,
+      cases: 18,
+      entities: 16,
+      other: 4,
+    }[group] || 8;
+    const bridgeWeight = role.startsWith("bridge_") ? 34 : 0;
+    return groupWeight + bridgeWeight + (degree.get(node.id) || 0) * 5;
+  }
+
+  function capRelationMapGraph(graph, options = {}) {
+    if (!graph || !Array.isArray(graph.nodes) || !Array.isArray(graph.edges)) {
+      return graph;
+    }
+    const maxNodes = options.fullscreen ? 620 : 280;
+    const maxEdges = options.fullscreen ? 1400 : 560;
+    if (graph.nodes.length <= maxNodes && graph.edges.length <= maxEdges) {
+      return {
+        ...graph,
+        stats: {
+          ...(graph.stats || {}),
+          rendered_nodes: graph.nodes.length,
+          rendered_edges: graph.edges.length,
+        },
+      };
+    }
+    const degree = new Map(graph.nodes.map((node) => [node.id, 0]));
+    for (const edge of graph.edges) {
+      degree.set(edge.from, (degree.get(edge.from) || 0) + 1);
+      degree.set(edge.to, (degree.get(edge.to) || 0) + 1);
+    }
+    const keepIds = new Set(
+      [...graph.nodes]
+        .sort((a, b) => relationMapNodeScore(b, degree) - relationMapNodeScore(a, degree) || String(a.id).localeCompare(String(b.id)))
+        .slice(0, maxNodes)
+        .map((node) => node.id)
+    );
+    const scoredEdges = graph.edges
+      .filter((edge) => keepIds.has(edge.from) && keepIds.has(edge.to))
+      .sort((a, b) => {
+        const scoreA = (degree.get(a.from) || 0) + (degree.get(a.to) || 0);
+        const scoreB = (degree.get(b.from) || 0) + (degree.get(b.to) || 0);
+        return scoreB - scoreA;
+      })
+      .slice(0, maxEdges);
+    const edgeNodeIds = new Set();
+    scoredEdges.forEach((edge) => {
+      edgeNodeIds.add(edge.from);
+      edgeNodeIds.add(edge.to);
+    });
+    const nodes = graph.nodes.filter((node) => edgeNodeIds.has(node.id));
+    return {
+      ...graph,
+      nodes,
+      edges: scoredEdges,
+      stats: {
+        ...(graph.stats || {}),
+        rendered_nodes: nodes.length,
+        rendered_edges: scoredEdges.length,
+        total_nodes: graph.nodes.length,
+        total_edges: graph.edges.length,
+      },
+    };
+  }
+
   function relationPeerName(item, currentEntityId) {
     if (!item) {
       return "—";
@@ -2147,12 +2332,12 @@
     `;
   }
 
-  function renderRelationMapSection(graph, activeGroup = "") {
+  function renderRelationMapSection(graph, activeGroup = "", options = {}) {
     if (!graph || !Array.isArray(graph.nodes) || graph.nodes.length < 2 || !Array.isArray(graph.edges) || !graph.edges.length) {
       return emptyState("Карта пока пуста", "Измените фильтр или дождитесь новых связей.");
     }
     const groups = relationMapGroups(graph);
-    const focusedGraph = filterRelationMapGraph(graph, activeGroup);
+    const focusedGraph = capRelationMapGraph(filterRelationMapGraph(graph, activeGroup), options);
     const layout = layoutRelationMapGraph(focusedGraph);
     if (!layout.nodes.length || !layout.edges.length) {
       return emptyState("Карта пока пуста", "Измените фильтр или дождитесь новых связей.");
@@ -2165,14 +2350,17 @@
             <h3>Map связей</h3>
             <div class="node-graph-hint">Большая карта текущего фильтра: общие узлы показывают, как связи переплетаются между собой. Click по линии открывает связь, click по ноде показывает полный контекст.</div>
           </div>
-          <div class="relation-map-stats">
-            <span class="badge cyan">${escapeHtml(String(stats.filtered_nodes || stats.nodes || layout.nodes.length))}${stats.nodes && stats.filtered_nodes && stats.filtered_nodes !== stats.nodes ? ` / ${escapeHtml(String(stats.nodes))}` : ""} nodes</span>
-            <span class="badge emerald">${escapeHtml(String(stats.filtered_edges || stats.edges || layout.edges.length))}${stats.edges && stats.filtered_edges && stats.filtered_edges !== stats.edges ? ` / ${escapeHtml(String(stats.edges))}` : ""} edges</span>
-            ${
-              stats.bridge_nodes
-                ? `<span class="badge amber">${escapeHtml(String(stats.bridge_nodes))} bridges</span>`
-                : ""
-            }
+          <div class="relation-map-head-actions">
+            <div class="relation-map-stats">
+              <span class="badge cyan">${escapeHtml(String(stats.rendered_nodes || stats.filtered_nodes || stats.nodes || layout.nodes.length))}${stats.total_nodes && stats.rendered_nodes !== stats.total_nodes ? ` / ${escapeHtml(String(stats.total_nodes))}` : ""} nodes</span>
+              <span class="badge emerald">${escapeHtml(String(stats.rendered_edges || stats.filtered_edges || stats.edges || layout.edges.length))}${stats.total_edges && stats.rendered_edges !== stats.total_edges ? ` / ${escapeHtml(String(stats.total_edges))}` : ""} edges</span>
+              ${
+                stats.bridge_nodes
+                  ? `<span class="badge amber">${escapeHtml(String(stats.bridge_nodes))} bridges</span>`
+                  : ""
+              }
+            </div>
+            ${options.fullscreen ? "" : `<button class="ghost-chip map-fullscreen-btn" data-relation-map-fullscreen type="button">На весь экран</button>`}
           </div>
         </div>
         ${
@@ -2875,6 +3063,9 @@
     if (!host || !overlay || host.hidden) {
       return;
     }
+    if (host.classList.contains("fullscreen")) {
+      return;
+    }
     const screenPanelRect = ui.appShell.querySelector(".screen-panel")?.getBoundingClientRect();
     if (!screenPanelRect) {
       return;
@@ -2944,6 +3135,7 @@
       moved: false,
       nodes: new Map(),
       edges: [],
+      edgeUpdateFrame: 0,
     };
     const graphSignature = relationGraphSignature(graphRoot);
     const savedViewport =
@@ -3097,7 +3289,7 @@
       node.y = Math.max(node.height / 2, Math.min(graph.height - node.height / 2, baseY + deltaY));
       resolveLocalNodeCollisions(graph, node);
       updateGraphNodePosition(node);
-      updateGraphEdges(graph);
+      scheduleGraphEdgesUpdate(graph);
     };
 
     const onUp = (upEvent) => {
@@ -3176,6 +3368,16 @@
         edge.labelEl.setAttribute("x", String(curve.label.x));
         edge.labelEl.setAttribute("y", String(curve.label.y));
       }
+    });
+  }
+
+  function scheduleGraphEdgesUpdate(graph) {
+    if (!graph || graph.edgeUpdateFrame) {
+      return;
+    }
+    graph.edgeUpdateFrame = requestAnimationFrame(() => {
+      graph.edgeUpdateFrame = 0;
+      updateGraphEdges(graph);
     });
   }
 
@@ -3376,7 +3578,49 @@
     }
     input.addEventListener("input", (event) => {
       state.filters[section].query = event.target.value;
+      rememberActiveTextFilter(section, input);
       scheduleScreenReload();
+    });
+    input.addEventListener("focus", () => rememberActiveTextFilter(section, input));
+    input.addEventListener("keyup", () => rememberActiveTextFilter(section, input));
+    input.addEventListener("click", () => rememberActiveTextFilter(section, input));
+  }
+
+  function rememberActiveTextFilter(section, input) {
+    if (!input) {
+      return;
+    }
+    state.activeTextFilter = {
+      section,
+      inputId: input.id || "screen-query-input",
+      value: input.value || "",
+      selectionStart: input.selectionStart ?? input.value.length,
+      selectionEnd: input.selectionEnd ?? input.value.length,
+    };
+  }
+
+  function restoreActiveTextFilter() {
+    const remembered = state.activeTextFilter;
+    if (!remembered || remembered.section !== state.section || !remembered.inputId) {
+      return;
+    }
+    requestAnimationFrame(() => {
+      const input = queryInteractive(`#${CSS.escape(remembered.inputId)}`);
+      if (!input || remembered.section !== state.section) {
+        return;
+      }
+      if (input.value !== remembered.value) {
+        input.value = remembered.value;
+      }
+      input.focus({ preventScroll: true });
+      try {
+        input.setSelectionRange(
+          remembered.selectionStart ?? remembered.value.length,
+          remembered.selectionEnd ?? remembered.value.length
+        );
+      } catch (error) {
+        // Some input types do not support selection ranges.
+      }
     });
   }
 
@@ -3399,6 +3643,10 @@
         const [targetSection, nextView] = String(button.dataset.screenView || "").split(":");
         if (targetSection !== section || !nextView) {
           return;
+        }
+        if (section === "relations" && nextView !== "map") {
+          state.relationMapFullscreen = false;
+          clearRelationMapOverlay();
         }
         state.filters[section].view = nextView;
         await loadCurrentScreen();
@@ -3436,7 +3684,7 @@
 
   function scheduleScreenReload() {
     clearTimeout(screenReloadTimer);
-    screenReloadTimer = setTimeout(loadCurrentScreen, 180);
+    screenReloadTimer = setTimeout(loadCurrentScreen, 340);
   }
 
   async function manualRefresh() {

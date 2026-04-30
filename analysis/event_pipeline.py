@@ -38,6 +38,7 @@ EVENT_ROLE_TYPES = {
     "opponent",
     "court",
     "regulator",
+    "location",
 }
 CLAIM_TO_FACT_TYPE = {
     "restriction": "restriction",
@@ -51,6 +52,25 @@ CLAIM_TO_FACT_TYPE = {
     "protest": "protest",
     "appeal": "appeal",
 }
+TAG_FACT_PRIORITY = (
+    ("restriction/fines", "fine"),
+    ("restriction/privacy", "privacy_enforcement"),
+    ("restriction/internet", "internet_restriction"),
+    ("restriction/censorship", "restriction"),
+    ("negative:censorship_blocking", "restriction"),
+    ("negative:economic_harm", "economic_harm"),
+    ("economic/harm", "economic_harm"),
+)
+DOCUMENT_TAGS = {"document/screenshot", "document/authenticity_review", "document/official"}
+RESTRICTION_TAG_PREFIXES = ("restriction/", "negative:")
+REGULATOR_NAME_RE = re.compile(
+    r"(роскомнадзор|\bркн\b|минцифры|фсб|мвд|фас|фнс|минюст|правительств|госдум|совфед|прокуратур|следственн|кремл)",
+    re.IGNORECASE | re.UNICODE,
+)
+MEDIA_NAME_RE = re.compile(
+    r"(\bтасс\b|reuters|коммерсантъ?|медуз|bbc|рбк|интерфакс|ведомост)",
+    re.IGNORECASE | re.UNICODE,
+)
 
 
 def table_exists(conn, table_name: str) -> bool:
@@ -105,6 +125,85 @@ def _parse_json(raw_value: Any, default: Any):
         return json.loads(raw_value)
     except (json.JSONDecodeError, TypeError):
         return default
+
+
+def _tag_names(votes: list[dict[str, Any]]) -> set[str]:
+    tags: set[str] = set()
+    for vote in votes:
+        for key in ("normalized_tag", "tag_name"):
+            value = _normalize_space(vote.get(key)).lower()
+            if value:
+                tags.add(value)
+    return tags
+
+
+def _fact_type_from_tags(tags: set[str]) -> str | None:
+    for tag, fact_type in TAG_FACT_PRIORITY:
+        if tag in tags:
+            return fact_type
+    if any(tag.startswith(RESTRICTION_TAG_PREFIXES) for tag in tags):
+        return "restriction"
+    return None
+
+
+def _is_document_like(tags: set[str], item: dict[str, Any], attachment_meta: dict[str, Any] | None = None) -> bool:
+    content_type = str(item.get("content_type") or "").strip().lower()
+    status = str(item.get("content_status") or item.get("status") or "").strip().lower()
+    attachment_meta = attachment_meta or {}
+    return bool(
+        tags & DOCUMENT_TAGS
+        or content_type in OFFICIAL_CONTENT_TYPES
+        or status.startswith("official")
+        or int(attachment_meta.get("ocr_ready") or 0) > 0
+    )
+
+
+def _tag_fact_confidence(votes: list[dict[str, Any]], *, document_like: bool) -> float:
+    values = []
+    for vote in votes:
+        try:
+            values.append(float(vote.get("confidence_raw") or 0))
+        except (TypeError, ValueError):
+            continue
+    base = max(values) if values else 0.72
+    if document_like:
+        base = max(base, 0.82)
+    return round(min(0.95, max(0.55, base)), 4)
+
+
+def _tag_fact_text(item: dict[str, Any], cleaned_text: str) -> str:
+    title = _normalize_space(item.get("title"))
+    if title and cleaned_text and title.casefold() in cleaned_text.casefold():
+        return cleaned_text[:520]
+    sentence = _first_sentence(cleaned_text, max_len=260)
+    if title and sentence and sentence.casefold() not in title.casefold():
+        return _normalize_space(f"{title}. {sentence}")[:520]
+    if title:
+        return title[:420]
+    return sentence[:420]
+
+
+def _infer_event_role(mention: dict[str, Any], votes: list[dict[str, Any]]) -> str:
+    raw_role = str(mention.get("mention_type") or "").strip().lower()
+    entity_type = str(mention.get("entity_type") or "").strip().lower()
+    name = _normalize_space(mention.get("canonical_name"))
+    tags = _tag_names(votes)
+    is_restriction_context = any(tag.startswith(RESTRICTION_TAG_PREFIXES) for tag in tags)
+    if REGULATOR_NAME_RE.search(name):
+        return "regulator" if is_restriction_context else "issuer"
+    if MEDIA_NAME_RE.search(name):
+        return "commentator"
+    if raw_role in EVENT_ROLE_TYPES:
+        return raw_role
+    if entity_type == "location":
+        return "location"
+    if entity_type == "organization" and is_restriction_context:
+        if REGULATOR_NAME_RE.search(name):
+            return "regulator"
+        return "target"
+    if entity_type == "person":
+        return "commentator" if raw_role in {"quote", "speaker"} else "affected"
+    return "target"
 
 
 def _coalesce_datetime(item: dict[str, Any]) -> str:
@@ -224,10 +323,12 @@ def _canonical_content_groups(conn, limit: int | None = None) -> list[dict[str, 
                    cci.content_item_id, cci.is_canonical, cci.similarity_score,
                    ci.id AS id,
                    ci.source_id, ci.external_id, ci.content_type, ci.title, ci.body_text,
-                   ci.published_at, ci.collected_at, ci.url, ci.status AS content_status
+                   ci.published_at, ci.collected_at, ci.url, ci.status AS content_status,
+                   s.category AS source_category
             FROM content_clusters cc
             JOIN content_cluster_items cci ON cci.cluster_id = cc.id
             JOIN content_items ci ON ci.id = cci.content_item_id
+            LEFT JOIN sources s ON s.id = ci.source_id
             WHERE cc.status='active'
             ORDER BY cc.id, COALESCE(ci.published_at, ci.collected_at, '') ASC, ci.id ASC
             """
@@ -250,6 +351,57 @@ def _canonical_content_groups(conn, limit: int | None = None) -> list[dict[str, 
             )
             group["items"].append(dict(row))
         groups = list(grouped.values())
+        singleton_rows = conn.execute(
+            """
+            SELECT ci.id AS content_item_id, ci.id AS canonical_content_id, NULL AS cluster_id,
+                   'singleton:' || ci.id AS cluster_key, 'singleton' AS cluster_type, ci.title AS canonical_title,
+                   ci.published_at AS first_seen_at, ci.published_at AS last_seen_at,
+                   ci.id, ci.source_id, ci.external_id, ci.content_type, ci.title, ci.body_text,
+                   ci.published_at, ci.collected_at, ci.url, ci.status AS content_status,
+                   s.category AS source_category
+            FROM content_items ci
+            LEFT JOIN sources s ON s.id = ci.source_id
+            WHERE NOT EXISTS (
+                    SELECT 1 FROM content_cluster_items cci WHERE cci.content_item_id=ci.id
+                  )
+              AND (
+                    LOWER(COALESCE(ci.content_type, '')) IN (
+                        'restriction_record', 'official_document', 'registry_record', 'court_record',
+                        'procurement', 'bill', 'transcript', 'declaration', 'disclosure'
+                    )
+                    OR LOWER(COALESCE(ci.status, '')) LIKE 'official%'
+                    OR EXISTS (SELECT 1 FROM claims c WHERE c.content_item_id=ci.id)
+                    OR EXISTS (SELECT 1 FROM restriction_events re WHERE re.source_content_id=ci.id)
+                    OR EXISTS (
+                        SELECT 1 FROM content_tag_votes ctv
+                        WHERE ctv.content_item_id=ci.id
+                          AND ctv.vote_value IN ('support', 'supported', 'positive')
+                          AND (
+                              ctv.normalized_tag IN ('document/screenshot', 'document/authenticity_review', 'restriction/fines',
+                                                     'restriction/privacy', 'restriction/internet', 'restriction/censorship',
+                                                     'negative:censorship_blocking', 'negative:economic_harm', 'economic/harm')
+                              OR ctv.tag_name IN ('document/screenshot', 'document/authenticity_review', 'restriction/fines',
+                                                  'restriction/privacy', 'restriction/internet', 'restriction/censorship',
+                                                  'negative:censorship_blocking', 'negative:economic_harm', 'economic/harm')
+                          )
+                    )
+                  )
+            ORDER BY COALESCE(ci.published_at, ci.collected_at, '') ASC, ci.id ASC
+            """
+        ).fetchall()
+        for row in singleton_rows:
+            groups.append(
+                {
+                    "cluster_id": None,
+                    "cluster_key": row["cluster_key"],
+                    "cluster_type": "singleton",
+                    "canonical_content_id": row["canonical_content_id"],
+                    "canonical_title": row["canonical_title"],
+                    "first_seen_at": row["first_seen_at"],
+                    "last_seen_at": row["last_seen_at"],
+                    "items": [dict(row)],
+                }
+            )
     if not groups:
         for row in conn.execute(
             """
@@ -257,8 +409,10 @@ def _canonical_content_groups(conn, limit: int | None = None) -> list[dict[str, 
                    NULL AS cluster_key, NULL AS cluster_type, ci.title AS canonical_title,
                    ci.published_at AS first_seen_at, ci.published_at AS last_seen_at,
                    ci.id, ci.source_id, ci.external_id, ci.content_type, ci.title, ci.body_text,
-                   ci.published_at, ci.collected_at, ci.url, ci.status AS content_status
+                   ci.published_at, ci.collected_at, ci.url, ci.status AS content_status,
+                   s.category AS source_category
             FROM content_items ci
+            LEFT JOIN sources s ON s.id = ci.source_id
             ORDER BY COALESCE(ci.published_at, ci.collected_at, '') ASC, ci.id ASC
             """
         ).fetchall():
@@ -346,6 +500,34 @@ def build_event_pipeline(settings: dict[str, Any] | None = None, limit: int | No
         for row in restriction_rows:
             if row["source_content_id"] is not None:
                 restrictions_by_content[int(row["source_content_id"])].append(dict(row))
+
+        tag_vote_rows = conn.execute(
+            """
+            SELECT content_item_id, tag_name, namespace, normalized_tag, vote_value, confidence_raw, evidence_text, signal_layer
+            FROM content_tag_votes
+            WHERE vote_value IN ('support', 'supported', 'positive')
+            ORDER BY content_item_id, confidence_raw DESC, id ASC
+            """
+        ).fetchall() if table_exists(conn, "content_tag_votes") else []
+        tags_by_content: dict[int, list[dict[str, Any]]] = defaultdict(list)
+        for row in tag_vote_rows:
+            tags_by_content[int(row["content_item_id"])].append(dict(row))
+
+        attachment_rows = conn.execute(
+            """
+            SELECT content_item_id,
+                   COUNT(*) AS attachment_count,
+                   SUM(CASE WHEN ocr_text IS NOT NULL AND TRIM(ocr_text) <> '' THEN 1 ELSE 0 END) AS ocr_ready
+            FROM attachments
+            GROUP BY content_item_id
+            """
+        ).fetchall() if table_exists(conn, "attachments") else []
+        attachments_by_content: dict[int, dict[str, Any]] = {}
+        for row in attachment_rows:
+            attachments_by_content[int(row["content_item_id"])] = {
+                "attachment_count": int(row["attachment_count"] or 0),
+                "ocr_ready": int(row["ocr_ready"] or 0),
+            }
 
         groups = _canonical_content_groups(conn, limit=limit)
         derivations_written = 0
@@ -554,9 +736,7 @@ def build_event_pipeline(settings: dict[str, Any] | None = None, limit: int | No
 
             for content_id in item_ids:
                 for mention in mentions_by_content.get(content_id, []):
-                    role = str(mention.get("mention_type") or "").strip().lower()
-                    if role not in EVENT_ROLE_TYPES:
-                        role = "affected" if mention.get("entity_type") == "person" else "target"
+                    role = _infer_event_role(mention, tags_by_content.get(content_id, []))
                     key = (int(mention["entity_id"]), role)
                     existing = event_entity_map.get(key)
                     confidence = float(mention.get("confidence") or 0)
@@ -581,7 +761,74 @@ def build_event_pipeline(settings: dict[str, Any] | None = None, limit: int | No
                         event_date_start or None,
                         event_date_end or None,
                         entity.get("observed_at") or event_date_start or None,
-                        _json({"event_type": event_type}),
+                            _json({"event_type": event_type}),
+                        ),
+                    )
+
+            tag_fact_seen: set[int] = set()
+            for item in sorted_items:
+                content_id = int(item["id"])
+                if claims_by_content.get(content_id):
+                    continue
+                votes = tags_by_content.get(content_id, [])
+                tag_names = _tag_names(votes)
+                fact_type = _fact_type_from_tags(tag_names)
+                if not fact_type:
+                    continue
+                canonical_text = _tag_fact_text(item, cleaned_by_item.get(content_id) or "")
+                if not canonical_text:
+                    continue
+                if content_id in tag_fact_seen:
+                    continue
+                tag_fact_seen.add(content_id)
+                attachment_meta = attachments_by_content.get(content_id, {})
+                document_like = _is_document_like(tag_names, item, attachment_meta)
+                evidence_class = "hard" if document_like else ("support" if str(item.get("source_category") or "").startswith("official") else "signal")
+                fact_cursor = conn.execute(
+                    """
+                    INSERT INTO event_facts(
+                        event_id, claim_id, fact_type, canonical_text, polarity, valid_from, valid_to,
+                        observed_at, confidence, metadata_json
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        event_id,
+                        None,
+                        fact_type,
+                        canonical_text,
+                        "negative" if any(tag.startswith("negative:") for tag in tag_names) or any(tag.startswith("restriction/") for tag in tag_names) else "neutral",
+                        event_date_start or None,
+                        event_date_end or None,
+                        observed_at_by_content.get(content_id) or event_date_start or None,
+                        _tag_fact_confidence(votes, document_like=document_like),
+                        _json(
+                            {
+                                "content_item_id": content_id,
+                                "derived_from": "content_tag_votes",
+                                "tags": sorted(tag_names),
+                                "attachment_count": attachment_meta.get("attachment_count", 0),
+                                "ocr_ready": attachment_meta.get("ocr_ready", 0),
+                            }
+                        ),
+                    ),
+                )
+                fact_id = int(fact_cursor.lastrowid)
+                facts_written += 1
+                conn.execute(
+                    """
+                    INSERT INTO fact_evidence(
+                        fact_id, content_item_id, document_content_id, evidence_type,
+                        evidence_class, source_strength, metadata_json
+                    ) VALUES(?,?,?,?,?,?,?)
+                    """,
+                    (
+                        fact_id,
+                        content_id,
+                        content_id if document_like else None,
+                        "document_screenshot" if document_like else "content_item",
+                        evidence_class,
+                        "strong" if evidence_class == "hard" else evidence_class,
+                        _json({"derived_from": "content_tag_votes", "tags": sorted(tag_names)}),
                     ),
                 )
 

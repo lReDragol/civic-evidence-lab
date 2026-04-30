@@ -3,10 +3,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -109,6 +110,7 @@ def _ai_settings(settings: dict[str, Any]) -> dict[str, Any]:
     cfg.setdefault("dead_key_threshold", 3)
     cfg.setdefault("max_units_per_run", 0)
     cfg.setdefault("max_failures_per_provider_stage", 25)
+    cfg.setdefault("max_transient_failures_per_provider_stage", 32)
     cfg.setdefault("provider_priority", ["mistral", "perplexity", "groq", "openrouter", "openai"])
     cfg.setdefault("mode", "pilot")
     cfg.setdefault("campaign_seed", "ai-pilot-2026-04-27")
@@ -116,6 +118,7 @@ def _ai_settings(settings: dict[str, Any]) -> dict[str, Any]:
     cfg.setdefault("provider_mode", "conservative")
     cfg.setdefault("max_attempts_per_work_item", 6)
     cfg.setdefault("max_failures_per_provider_per_item", 2)
+    cfg.setdefault("max_transient_failures_per_provider_per_item", 3)
     cfg.setdefault("pilot_target_units", 232)
     cfg.setdefault(
         "pilot_distribution",
@@ -160,6 +163,10 @@ BUDGETED_FAILURE_KINDS = {
     "unsupported_tool",
     "bad_response_shape",
 }
+TRANSIENT_PROVIDER_STAGE_FAILURE_KINDS = {
+    "rate",
+    "timeout",
+}
 HARD_PROVIDER_STAGE_FAILURE_LIMITS = {
     "unsupported_tool": 1,
     "invalid_model": 1,
@@ -170,25 +177,39 @@ HARD_PROVIDER_STAGE_FAILURE_LIMITS = {
 class RunProviderBudget:
     """Shared run-level guard against provider/stage failure storms."""
 
-    def __init__(self, *, max_failures_per_provider_stage: int = 25) -> None:
+    def __init__(
+        self,
+        *,
+        max_failures_per_provider_stage: int = 25,
+        max_transient_failures_per_provider_stage: int = 12,
+    ) -> None:
         self.max_failures_per_provider_stage = max(1, int(max_failures_per_provider_stage or 1))
+        self.max_transient_failures_per_provider_stage = max(
+            1, int(max_transient_failures_per_provider_stage or 1)
+        )
         self._failures: dict[tuple[str, str], int] = {}
+        self._transient_failures: dict[tuple[str, str], int] = {}
         self._failures_by_kind: dict[tuple[str, str, str], int] = {}
         self._lock = threading.Lock()
 
     def record_failure(self, stage: str, provider: str, failure_kind: str) -> None:
-        if failure_kind not in BUDGETED_FAILURE_KINDS:
+        if failure_kind not in BUDGETED_FAILURE_KINDS and failure_kind not in TRANSIENT_PROVIDER_STAGE_FAILURE_KINDS:
             return
         key = (str(stage), str(provider))
         kind_key = (str(stage), str(provider), str(failure_kind))
         with self._lock:
-            self._failures[key] = self._failures.get(key, 0) + 1
+            if failure_kind in TRANSIENT_PROVIDER_STAGE_FAILURE_KINDS:
+                self._transient_failures[key] = self._transient_failures.get(key, 0) + 1
+            else:
+                self._failures[key] = self._failures.get(key, 0) + 1
             self._failures_by_kind[kind_key] = self._failures_by_kind.get(kind_key, 0) + 1
 
     def is_exhausted(self, stage: str, provider: str) -> bool:
         key = (str(stage), str(provider))
         with self._lock:
             if self._failures.get(key, 0) >= self.max_failures_per_provider_stage:
+                return True
+            if self._transient_failures.get(key, 0) >= self.max_transient_failures_per_provider_stage:
                 return True
             for failure_kind, limit in HARD_PROVIDER_STAGE_FAILURE_LIMITS.items():
                 if self._failures_by_kind.get((str(stage), str(provider), failure_kind), 0) >= limit:
@@ -200,7 +221,10 @@ class RunProviderBudget:
 
     def snapshot(self) -> dict[str, int]:
         with self._lock:
-            return {f"{stage}:{provider}": count for (stage, provider), count in sorted(self._failures.items())}
+            snapshot = {f"{stage}:{provider}": count for (stage, provider), count in sorted(self._failures.items())}
+            for (stage, provider), count in sorted(self._transient_failures.items()):
+                snapshot[f"{stage}:{provider}:transient"] = count
+            return snapshot
 
 
 def _bootstrap_key_pool(conn: sqlite3.Connection, settings: dict[str, Any]) -> dict[str, Any]:
@@ -592,12 +616,15 @@ def _parse_iso(value: Any) -> datetime | None:
     if not text:
         return None
     try:
-        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
     except ValueError:
         try:
-            return datetime.fromisoformat(text[:10])
+            parsed = datetime.fromisoformat(text[:10])
         except ValueError:
             return None
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed
 
 
 def _content_ids_for_unit_context(unit: dict[str, Any], context: dict[str, Any]) -> list[int]:
@@ -2188,6 +2215,51 @@ UNGROUNDED_OUTPUT_KEYS = {
     "added_facts",
     "unsupported_facts",
 }
+LOCAL_ORG_PATTERNS = (
+    ("Роскомнадзор", re.compile(r"(роскомнадзор|\bркн\b)", re.IGNORECASE | re.UNICODE)),
+    ("Минцифры", re.compile(r"минцифры|министерств[ао] цифров", re.IGNORECASE | re.UNICODE)),
+    ("Государственная Дума", re.compile(r"госдум|государственн\w+\s+дум", re.IGNORECASE | re.UNICODE)),
+    ("Правительство РФ", re.compile(r"правительств[ао]\s+(?:рф|российской федерации)", re.IGNORECASE | re.UNICODE)),
+)
+LOCAL_DATE_RE = re.compile(r"\b(?:\d{1,2}[./-]\d{1,2}[./-]\d{2,4}|\d{4}-\d{2}-\d{2})\b")
+LOCAL_LEGAL_RE = re.compile(r"\b\d{1,3}\s*-\s*ФЗ\b|ст\.\s*\d+(?:\.\d+)?|№\s*[\wА-Яа-яЁё./-]+", re.IGNORECASE | re.UNICODE)
+LOCAL_DOCUMENT_RE = re.compile(r"\b(требовани[ея]|письмо|запрос|постановлени[ея]|уведомлени[ея]|приказ|решени[ея])\b", re.IGNORECASE | re.UNICODE)
+
+
+def _local_structured_extract(text: str) -> dict[str, Any]:
+    normalized = _normalize_space(text)
+    lowered = normalized.lower()
+    organizations = [name for name, pattern in LOCAL_ORG_PATTERNS if pattern.search(normalized)]
+    dates = list(dict.fromkeys(LOCAL_DATE_RE.findall(normalized)))
+    legal_basis = [
+        _normalize_space(match.group(0).replace(" ", ""))
+        for match in LOCAL_LEGAL_RE.finditer(normalized)
+    ]
+    legal_basis = list(dict.fromkeys(legal_basis))
+    actions: list[str] = []
+    if re.search(r"штраф|рубл|млн", lowered, re.UNICODE):
+        actions.append("fine")
+    if re.search(r"блокиров|огранич|запрет|цензур", lowered, re.UNICODE):
+        actions.append("restriction")
+    if re.search(r"персональн\w+\s+данн", lowered, re.UNICODE):
+        actions.append("privacy_enforcement")
+    if re.search(r"vpn|трафик|интернет|связ", lowered, re.UNICODE):
+        actions.append("internet_restriction")
+    document_anchors = list(dict.fromkeys(_normalize_space(match.group(0)) for match in LOCAL_DOCUMENT_RE.finditer(normalized)))
+    return {
+        "actors": [],
+        "organizations": organizations,
+        "dates": dates,
+        "locations": [],
+        "actions": actions,
+        "legal_basis": legal_basis,
+        "affected_groups": [],
+        "explicit_claims": [normalized] if normalized else [],
+        "uncertainty_markers": [],
+        "document_anchors": document_anchors,
+        "source_facts": [normalized] if normalized else [],
+        "external_context": [],
+    }
 
 
 def _validate_stage_result(stage: str, result: dict[str, Any]) -> None:
@@ -2239,20 +2311,7 @@ def _deterministic_source_only_result(stage: str, prompt_version: str, payload: 
         }
         output_text = text
     elif stage == "structured_extract":
-        output_json = {
-            "actors": [],
-            "organizations": [],
-            "dates": [],
-            "locations": [],
-            "actions": [],
-            "legal_basis": [],
-            "affected_groups": [],
-            "explicit_claims": [text] if text else [],
-            "uncertainty_markers": [],
-            "document_anchors": [],
-            "source_facts": [text] if text else [],
-            "external_context": [],
-        }
+        output_json = _local_structured_extract(text)
         output_text = text
     elif stage == "event_link_hint":
         output_json = {
@@ -2369,8 +2428,13 @@ def _worker_run(
         cfg = _ai_settings(settings)
         max_attempts = max(1, int(cfg.get("max_attempts_per_work_item") or 6))
         max_provider_failures = max(1, int(cfg.get("max_failures_per_provider_per_item") or 2))
+        max_transient_provider_failures = max(
+            max_provider_failures,
+            int(cfg.get("max_transient_failures_per_provider_per_item") or 3),
+        )
         exclude: set[int] = set()
         provider_failures: dict[str, int] = {}
+        provider_transient_failures: dict[str, int] = {}
         while True:
             if len(failures) >= max_attempts:
                 return {
@@ -2507,8 +2571,13 @@ def _worker_run(
                     }
                 )
                 exclude.add(key_id)
-                provider_failures[provider] = provider_failures.get(provider, 0) + 1
-                if provider_failures[provider] >= max_provider_failures:
+                if failure_kind in {"rate", "timeout"}:
+                    provider_transient_failures[provider] = provider_transient_failures.get(provider, 0) + 1
+                    should_exclude_provider = provider_transient_failures[provider] >= max_transient_provider_failures
+                else:
+                    provider_failures[provider] = provider_failures.get(provider, 0) + 1
+                    should_exclude_provider = provider_failures[provider] >= max_provider_failures
+                if should_exclude_provider:
                     provider_key_rows = conn.execute(
                         "SELECT id FROM llm_keys WHERE provider=? AND status='active'",
                         (provider,),
@@ -2761,7 +2830,8 @@ def run_ai_full_sweep(settings: dict[str, Any]) -> dict[str, Any]:
 
     futures = {}
     provider_budget = RunProviderBudget(
-        max_failures_per_provider_stage=int(cfg.get("max_failures_per_provider_stage") or 25)
+        max_failures_per_provider_stage=int(cfg.get("max_failures_per_provider_stage") or 25),
+        max_transient_failures_per_provider_stage=int(cfg.get("max_transient_failures_per_provider_stage") or 12),
     )
     with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="ai-sweep") as executor:
         for row in work_rows:

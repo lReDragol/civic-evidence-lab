@@ -680,6 +680,14 @@ def create_event_fact_official_bridge_db(db_path: Path):
 
 
 class RelationLayerTests(unittest.TestCase):
+    def test_event_fact_role_pair_normalizes_llm_role_variants(self):
+        from graph.relation_candidates import _event_fact_role_pair_is_direct_relation
+
+        self.assertTrue(_event_fact_role_pair_is_direct_relation("decision-maker / issuer", "Subject named in event title"))
+        self.assertTrue(_event_fact_role_pair_is_direct_relation("Regulator body", "affected group"))
+        self.assertFalse(_event_fact_role_pair_is_direct_relation("commentator", "subject"))
+        self.assertFalse(_event_fact_role_pair_is_direct_relation("unknown", "target"))
+
     def test_candidate_state_never_promotes_same_case_cluster_even_with_strong_support(self):
         state = _candidate_state(
             candidate_type="same_case_cluster",

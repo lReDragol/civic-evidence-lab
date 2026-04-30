@@ -184,6 +184,157 @@ class EventPlatformTests(unittest.TestCase):
             self.assertTrue(any(row[1] == "hard" and row[3] == 12 for row in fact_evidence))
             self.assertIn("Пользователи начали жаловаться", raw_text)
 
+    def test_event_pipeline_promotes_document_votes_to_fact_evidence_without_claims(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "events.db"
+            create_event_db(db_path)
+
+            conn = sqlite3.connect(db_path)
+            try:
+                conn.executescript(
+                    """
+                    DELETE FROM evidence_links;
+                    DELETE FROM claims;
+                    DELETE FROM restriction_events;
+
+                    INSERT INTO entities(id, entity_type, canonical_name, description)
+                    VALUES
+                        (10, 'organization', 'Роскомнадзор', 'Регулятор'),
+                        (11, 'organization', 'Оператор сайта', 'Проверяемая организация');
+
+                    INSERT INTO content_items(
+                        id, source_id, external_id, content_type, title, body_text, published_at, url, status
+                    ) VALUES(
+                        30, 1, 'tg-doc-30', 'post',
+                        'Штрафы до 15 млн рублей начал выписывать РКН владельцам сайтов',
+                        'В посте опубликован скриншот требования Роскомнадзора о нарушениях обработки персональных данных и штрафах.',
+                        '2026-04-30T12:00:00',
+                        'https://t.me/yep_news/30',
+                        'raw_signal'
+                    );
+
+                    INSERT INTO entity_mentions(entity_id, content_item_id, mention_type, confidence)
+                    VALUES
+                        (10, 30, 'mentioned', 0.98),
+                        (11, 30, 'target', 0.91);
+
+                    INSERT INTO content_tag_votes(
+                        content_item_id, voter_name, tag_name, namespace, normalized_tag, vote_value,
+                        confidence_raw, evidence_text, signal_layer
+                    ) VALUES
+                        (30, 'telegram_relevance_filter', 'document/screenshot', 'document', 'document/screenshot', 'support', 0.90, 'скриншот требования', 'raw'),
+                        (30, 'telegram_relevance_filter', 'document/authenticity_review', 'document', 'document/authenticity_review', 'support', 0.90, 'проверить документ', 'raw'),
+                        (30, 'telegram_relevance_filter', 'restriction/fines', 'restriction', 'restriction/fines', 'support', 0.88, 'штрафы до 15 млн рублей', 'raw'),
+                        (30, 'telegram_relevance_filter', 'restriction/privacy', 'restriction', 'restriction/privacy', 'support', 0.82, 'персональные данные', 'raw');
+                    """
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            result = build_event_pipeline({"db_path": str(db_path), "ensure_schema_on_connect": True})
+
+            conn = sqlite3.connect(db_path)
+            try:
+                fact = conn.execute(
+                    """
+                    SELECT ef.fact_type, ef.canonical_text, fe.evidence_class, fe.document_content_id
+                    FROM event_facts ef
+                    JOIN fact_evidence fe ON fe.fact_id=ef.id
+                    WHERE fe.content_item_id=30
+                    ORDER BY ef.id DESC
+                    LIMIT 1
+                    """
+                ).fetchone()
+                roles = conn.execute(
+                    """
+                    SELECT e.canonical_name, ee.role
+                    FROM event_entities ee
+                    JOIN entities e ON e.id=ee.entity_id
+                    WHERE ee.event_id=(SELECT event_id FROM fact_evidence fe JOIN event_facts ef ON ef.id=fe.fact_id WHERE fe.content_item_id=30 LIMIT 1)
+                    ORDER BY e.id, ee.role
+                    """
+                ).fetchall()
+            finally:
+                conn.close()
+
+            self.assertTrue(result["ok"])
+            self.assertIsNotNone(fact)
+            self.assertEqual(fact[0], "fine")
+            self.assertIn("Роскомнадзор", fact[1])
+            self.assertEqual(fact[2], "hard")
+            self.assertEqual(fact[3], 30)
+            self.assertIn(("Роскомнадзор", "regulator"), roles)
+            self.assertIn(("Оператор сайта", "target"), roles)
+
+    def test_event_pipeline_overrides_bad_ner_types_for_authorities_and_media(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "events.db"
+            create_event_db(db_path)
+
+            conn = sqlite3.connect(db_path)
+            try:
+                conn.executescript(
+                    """
+                    INSERT INTO entities(id, entity_type, canonical_name, description)
+                    VALUES
+                        (40, 'location', 'Кремль', 'Неверно распознан как локация'),
+                        (41, 'person', 'Минцифры', 'Неверно распознано как персона'),
+                        (42, 'person', 'Коммерсантъ', 'Неверно распознан как персона'),
+                        (43, 'organization', 'VPN-сервис', 'Цель ограничения');
+
+                    INSERT INTO content_items(
+                        id, source_id, external_id, content_type, title, body_text, published_at, url, status
+                    ) VALUES(
+                        40, 1, 'tg-doc-40', 'post',
+                        'Кремль и Минцифры объяснили ограничения VPN',
+                        'Коммерсантъ сообщил, что Кремль и Минцифры объяснили ограничения VPN-сервисов нехваткой ресурсов.',
+                        '2026-04-30T13:00:00',
+                        'https://t.me/yep_news/40',
+                        'raw_signal'
+                    );
+
+                    INSERT INTO entity_mentions(entity_id, content_item_id, mention_type, confidence)
+                    VALUES
+                        (40, 40, 'location', 0.98),
+                        (41, 40, 'mentioned', 0.98),
+                        (42, 40, 'mentioned', 0.90),
+                        (43, 40, 'target', 0.91);
+
+                    INSERT INTO content_tag_votes(
+                        content_item_id, voter_name, tag_name, namespace, normalized_tag, vote_value,
+                        confidence_raw, evidence_text, signal_layer
+                    ) VALUES
+                        (40, 'telegram_relevance_filter', 'restriction/internet', 'restriction', 'restriction/internet', 'support', 0.86, 'ограничения VPN', 'raw');
+                    """
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            result = build_event_pipeline({"db_path": str(db_path), "ensure_schema_on_connect": True})
+
+            conn = sqlite3.connect(db_path)
+            try:
+                roles = conn.execute(
+                    """
+                    SELECT e.canonical_name, e.entity_type, ee.role
+                    FROM event_entities ee
+                    JOIN entities e ON e.id=ee.entity_id
+                    JOIN event_items ei ON ei.event_id=ee.event_id
+                    WHERE ei.content_item_id=40
+                    ORDER BY e.id, ee.role
+                    """
+                ).fetchall()
+            finally:
+                conn.close()
+
+            self.assertTrue(result["ok"])
+            self.assertIn(("Кремль", "location", "regulator"), roles)
+            self.assertIn(("Минцифры", "person", "regulator"), roles)
+            self.assertIn(("Коммерсантъ", "person", "commentator"), roles)
+            self.assertIn(("VPN-сервис", "organization", "target"), roles)
+
     def test_runtime_registry_exposes_event_pipeline_job(self):
         spec = get_job_spec("event_pipeline")
         self.assertIsNotNone(spec)

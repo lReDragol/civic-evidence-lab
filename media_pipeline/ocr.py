@@ -262,6 +262,11 @@ def process_unprocessed_ocr(settings: dict = None):
         SELECT a.id, a.file_path, a.attachment_type, a.ocr_text, a.hash_sha256, c.id as content_id, c.source_id
         FROM attachments a
         JOIN content_items c ON c.id = a.content_item_id
+        LEFT JOIN review_tasks rt
+          ON rt.subject_type = 'content_item'
+         AND rt.subject_id = c.id
+         AND rt.queue_key = 'documents'
+         AND rt.status = 'open'
         LEFT JOIN dead_letter_items d
           ON d.attachment_id = a.id
          AND d.resolved_at IS NULL
@@ -271,6 +276,10 @@ def process_unprocessed_ocr(settings: dict = None):
              OR (a.attachment_type = 'pdf' AND c.body_text = '')
         )
           AND d.id IS NULL
+        ORDER BY
+            CASE WHEN rt.id IS NOT NULL THEN 0 ELSE 1 END,
+            COALESCE(c.collected_at, c.published_at, '') DESC,
+            a.id DESC
         LIMIT 100
         """
     ).fetchall()
