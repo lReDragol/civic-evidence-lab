@@ -85,6 +85,15 @@ def _heartbeat_loop(stop_event: threading.Event, settings: dict[str, Any], job_i
 
 
 def _quality_for_job_result(result: dict[str, Any]) -> tuple[str, str | None, str | None]:
+    artifacts = result.get("artifacts") or {}
+    source_quality_state = str(artifacts.get("source_quality_state") or "").strip().lower()
+    if source_quality_state in {"ok", "warning", "degraded"} and (result.get("ok") or source_quality_state == "degraded"):
+        source_quality_issue = str(artifacts.get("source_quality_issue") or "").strip() or None
+        explicit_failure_class = str(artifacts.get("source_failure_class") or "").strip() or None
+        if source_quality_state == "degraded":
+            return "degraded", source_quality_issue, explicit_failure_class
+        return source_quality_state, source_quality_issue, None
+
     warnings = [str(item) for item in (result.get("warnings") or []) if item]
     warning_text = "; ".join(warnings) if warnings else None
     if not result.get("ok"):

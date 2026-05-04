@@ -179,6 +179,52 @@ class QualityGateTests(unittest.TestCase):
             self.assertEqual(len(result["artifacts"]["critical_warning_jobs"]), 1)
             self.assertEqual(result["artifacts"]["critical_warning_jobs"][0]["failure_class"], "bad_asset")
 
+    def test_quality_gate_ignores_collect_catchup_aggregate_warnings_as_source_blockers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "quality.db"
+            report_path = Path(tmp) / "qa_quality_latest.json"
+            create_quality_db(db_path)
+
+            conn = sqlite3.connect(db_path)
+            try:
+                conn.executescript(
+                    """
+                    INSERT INTO source_sync_state(source_key, state, quality_state, failure_class, last_error)
+                    VALUES('collect_catchup', 'ok', 'warning', '', '');
+
+                    INSERT INTO job_runs(job_id, trigger_mode, requested_by, owner, attempt_no, status, started_at, warnings_json)
+                    VALUES
+                        ('collect_catchup', 'manual', 'test', 'owner', 1, 'ok', '2026-04-26T00:00:00',
+                         '["minjust:SSLError: certificate verify failed"]'),
+                        ('tagger', 'manual', 'test', 'owner', 1, 'ok', '2026-04-26T00:00:00', '[]');
+                    """
+                )
+                set_runtime_metadata(conn, "classifier_audit_last_status", "ok")
+                set_runtime_metadata(conn, "classifier_audit_last_report", {"reviewed_baseline_ready": True})
+                conn.commit()
+            finally:
+                conn.close()
+
+            result = build_quality_gate(
+                {
+                    "db_path": str(db_path),
+                    "ensure_schema_on_connect": True,
+                    "quality_gate": {
+                        "report_path": str(report_path),
+                        "strict_gate": True,
+                    },
+                }
+            )
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["fatal_errors"], [])
+            self.assertEqual(result["artifacts"]["critical_warning_jobs"], [])
+            source_keys = {
+                row["source_key"]
+                for row in result["artifacts"]["source_acceptance"]["rows"]
+            }
+            self.assertNotIn("collect_catchup", source_keys)
+
     def test_quality_gate_allows_non_required_source_warning_when_manifest_matches(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "quality.db"

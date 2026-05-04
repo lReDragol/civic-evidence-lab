@@ -61,6 +61,7 @@ EVENT_FACT_OR_OFFICIAL_BRIDGE_TYPES = {
     "Asset",
     "OfficialDocument",
 }
+META_SOURCE_KEYS = {"collect_catchup"}
 
 
 def _config(settings: dict[str, Any]) -> dict[str, Any]:
@@ -90,6 +91,8 @@ def quality_report_sections(report: dict[str, Any] | None) -> dict[str, dict[str
 def _critical_warning_rows(rows: list[tuple[str, str, str]]) -> list[dict[str, str]]:
     critical_rows: list[dict[str, str]] = []
     for job_id, started_at, warnings_json in rows:
+        if str(job_id or "") in META_SOURCE_KEYS:
+            continue
         try:
             warnings = json.loads(warnings_json or "[]")
         except json.JSONDecodeError:
@@ -712,14 +715,17 @@ def build_quality_gate(settings: dict[str, Any] | None = None) -> dict[str, Any]
         ) if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='case_claims'").fetchone() else 0
         duplicate_leakage = suppressed_claims + suppressed_case_claims
 
-        degraded_rows = conn.execute(
+        degraded_rows = [
+            row for row in conn.execute(
             """
             SELECT source_key, state, COALESCE(quality_state, 'unknown') AS quality_state, COALESCE(failure_class, '') AS failure_class, COALESCE(last_error, '') AS last_error
             FROM source_sync_state
             WHERE COALESCE(quality_state, state)='degraded'
             ORDER BY source_key
             """
-        ).fetchall()
+            ).fetchall()
+            if str(row[0]) not in META_SOURCE_KEYS
+        ]
         source_state_rows = conn.execute(
             """
             SELECT source_key, state, COALESCE(quality_state, 'unknown') AS quality_state,
@@ -730,7 +736,7 @@ def build_quality_gate(settings: dict[str, Any] | None = None) -> dict[str, Any]
             """
         ).fetchall()
         source_state_map: dict[str, tuple[Any, ...]] = {str(row[0]): row for row in source_state_rows}
-        tracked_source_keys = set(source_state_map)
+        tracked_source_keys = set(source_state_map).difference(META_SOURCE_KEYS)
 
         source_acceptance_rows: list[dict[str, Any]] = []
         fixture_backed_sources: list[str] = []
@@ -892,6 +898,46 @@ def build_quality_gate(settings: dict[str, Any] | None = None) -> dict[str, Any]
             """
         ).fetchall() if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='event_candidates'").fetchone() else []
         event_link_counts = {str(row[0] or "unknown"): int(row[1] or 0) for row in event_link_rows}
+        event_link_total = max(1, sum(event_link_counts.values()))
+        structured_attempt_rows = conn.execute(
+            """
+            SELECT
+                COUNT(*) AS total,
+                SUM(CASE WHEN ata.status <> 'ok' AND COALESCE(ata.failure_kind, '')='schema_violation' THEN 1 ELSE 0 END) AS schema_violations,
+                SUM(CASE WHEN ata.status <> 'ok' THEN 1 ELSE 0 END) AS failed
+            FROM ai_task_attempts ata
+            JOIN ai_work_items aw ON aw.id = ata.work_item_id
+            WHERE aw.stage='structured_extract'
+            """
+        ).fetchone() if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='ai_task_attempts'").fetchone() and conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='ai_work_items'").fetchone() else (0, 0, 0)
+        structured_derivation_rows = conn.execute(
+            """
+            SELECT
+                COALESCE(schema_name, '') AS schema_name,
+                COALESCE(schema_version, '') AS schema_version,
+                COALESCE(schema_valid, -1) AS schema_valid,
+                COUNT(*) AS total
+            FROM content_derivations
+            WHERE derivation_type='structured_extract'
+            GROUP BY COALESCE(schema_name, ''), COALESCE(schema_version, ''), COALESCE(schema_valid, -1)
+            ORDER BY total DESC
+            """
+        ).fetchall() if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='content_derivations'").fetchone() else []
+        document_verdict_counts: dict[str, int] = {}
+        document_stage_counts: dict[str, int] = {}
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='review_tasks'").fetchone():
+            for (payload_json,) in conn.execute(
+                """
+                SELECT candidate_payload
+                FROM review_tasks
+                WHERE queue_key='documents'
+                """
+            ).fetchall():
+                payload = _parse_json(payload_json, {}) if payload_json else {}
+                verdict = str(payload.get("authenticity_verdict") or payload.get("authenticity_status") or "unknown")
+                stage = str(payload.get("verification_stage") or "unknown")
+                document_verdict_counts[verdict] = document_verdict_counts.get(verdict, 0) + 1
+                document_stage_counts[stage] = document_stage_counts.get(stage, 0) + 1
 
         report = {
             "ok": not degrade_reasons,
@@ -953,6 +999,22 @@ def build_quality_gate(settings: dict[str, Any] | None = None) -> dict[str, Any]
             },
             "ai_sweep": {
                 "failure_kind_breakdown": {str(row[0]): int(row[1] or 0) for row in ai_failure_rows},
+                "structured_extract_attempts": int((structured_attempt_rows[0] or 0) if structured_attempt_rows else 0),
+                "structured_extract_failed_attempts": int((structured_attempt_rows[2] or 0) if structured_attempt_rows else 0),
+                "structured_extract_schema_violations": int((structured_attempt_rows[1] or 0) if structured_attempt_rows else 0),
+                "structured_extract_schema_violation_rate": (
+                    round(float(structured_attempt_rows[1] or 0) / max(1, float(structured_attempt_rows[0] or 0)), 4)
+                    if structured_attempt_rows else 0.0
+                ),
+                "structured_extract_schema_counts": [
+                    {
+                        "schema_name": row[0],
+                        "schema_version": row[1],
+                        "schema_valid": row[2],
+                        "count": int(row[3] or 0),
+                    }
+                    for row in structured_derivation_rows
+                ],
             },
             "event_linking": {
                 "link_existing_count": event_link_counts.get("link_existing", 0),
@@ -960,6 +1022,12 @@ def build_quality_gate(settings: dict[str, Any] | None = None) -> dict[str, Any]
                 "standalone_count": event_link_counts.get("standalone", 0),
                 "create_candidate_count": event_link_counts.get("create_candidate", 0) + event_link_counts.get("create_event_candidate", 0),
                 "rejected_count": event_link_counts.get("rejected", 0),
+                "event_link_existing_rate": round(event_link_counts.get("link_existing", 0) / event_link_total, 4),
+                "event_merge_review_rate": round(event_link_counts.get("merge_review", 0) / event_link_total, 4),
+            },
+            "documents": {
+                "document_verdict_counts": document_verdict_counts,
+                "document_verification_stage_counts": document_stage_counts,
             },
             "dedupe_leakage": {
                 "suppressed_claims": suppressed_claims,

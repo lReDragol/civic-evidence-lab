@@ -84,6 +84,20 @@ class AiSweepTests(unittest.TestCase):
         self.assertEqual(_detect_failure_kind("invalid json response from provider"), "invalid_output")
         self.assertEqual(_detect_failure_kind("schema_violation: source-only stage returned external_context"), "schema_violation")
         self.assertEqual(_detect_failure_kind('401 invalid api key'), "auth")
+        self.assertEqual(_detect_failure_kind("ConnectionResetError(10054, 'remote host forcibly closed')"), "timeout")
+
+    def test_validate_structured_extract_rejects_schema_invalid_provider_output(self):
+        from analysis.ai_sweep import _validate_stage_result
+
+        with self.assertRaisesRegex(ValueError, "schema_violation"):
+            _validate_stage_result(
+                "structured_extract",
+                {
+                    "output_json": {"external_context": []},
+                    "schema_valid": False,
+                    "schema_errors": ["missing_json_envelope"],
+                },
+            )
 
     def test_run_provider_budget_keeps_transient_failures_local_below_threshold(self):
         from analysis.ai_sweep import RunProviderBudget
@@ -140,6 +154,17 @@ class AiSweepTests(unittest.TestCase):
         self.assertNotIn("perplexity", priority)
         self.assertNotIn("openai", priority)
         self.assertLess(priority.index("mistral"), priority.index("groq"))
+
+    def test_structured_extract_uses_only_schema_capable_providers(self):
+        from analysis.ai_sweep import _stage_provider_priority
+
+        priority = _stage_provider_priority("structured_extract", {})
+
+        self.assertIn("mistral", priority)
+        self.assertIn("perplexity", priority)
+        self.assertIn("openai", priority)
+        self.assertNotIn("groq", priority)
+        self.assertNotIn("openrouter", priority)
 
     def test_choose_key_for_stage_filters_to_allowed_provider_priority(self):
         from llm.key_pool import bootstrap_provider_catalog, choose_key_for_stage
@@ -1363,6 +1388,73 @@ class AiSweepTests(unittest.TestCase):
             self.assertEqual(candidate["suggested_event_id"], 201)
             self.assertTrue(suggestion["deterministic_override"]["accepted"])
             self.assertEqual(suggestion["deterministic_override"]["from_action"], "create_event_candidate")
+
+    def test_event_link_override_creates_merge_review_for_document_anchor_without_entity_overlap(self):
+        from analysis.ai_sweep import _persist_event_candidate
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "ai.db"
+            create_db(db_path)
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            try:
+                unit = {
+                    "unit_kind": "content_item",
+                    "unit_key": "content:14",
+                    "content_item_id": 14,
+                    "canonical_content_id": 14,
+                }
+                payload = {
+                    "candidate_events": [
+                        {
+                            "event_id": 201,
+                            "canonical_title": "Блокировка Telegram",
+                            "summary_short": "Официальное решение о блокировке Telegram",
+                            "overlap_reasons": ["temporal_proximity", "title_or_summary_anchor"],
+                            "facts": [{"fact_id": 700, "canonical_text": "Официальное решение"}],
+                            "official_docs": [{"content_item_id": 12, "title": "Документ 12"}],
+                        }
+                    ],
+                    "title": "Документ о блокировке Telegram",
+                    "body_text": "В документе описано официальное решение о блокировке Telegram.",
+                    "published_at": "2026-04-20T08:30:00",
+                }
+                updated = _persist_event_candidate(
+                    conn,
+                    unit,
+                    "ai-sweep-v3-event-link",
+                    {
+                        "provider": "mistral",
+                        "model": "mistral-medium",
+                        "confidence": 0.78,
+                        "output_json": {
+                            "action": "create_event_candidate",
+                            "reason": "document anchor overlaps existing event",
+                            "external_context": [],
+                        },
+                    },
+                    payload=payload,
+                )
+                conn.commit()
+                candidate = conn.execute(
+                    "SELECT id, candidate_state, suggested_event_id, suggestion_json FROM event_candidates ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+                review = conn.execute(
+                    "SELECT queue_key, subject_type, subject_id, suggested_action, status FROM review_tasks WHERE queue_key='events' ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+                suggestion = json.loads(candidate["suggestion_json"])
+            finally:
+                conn.close()
+
+            self.assertEqual(updated, 1)
+            self.assertEqual(candidate["candidate_state"], "merge_review")
+            self.assertEqual(candidate["suggested_event_id"], 201)
+            self.assertEqual(review["queue_key"], "events")
+            self.assertEqual(review["subject_type"], "event_candidate")
+            self.assertEqual(review["subject_id"], candidate["id"])
+            self.assertEqual(review["suggested_action"], "needs_review")
+            self.assertEqual(review["status"], "open")
+            self.assertTrue(suggestion["deterministic_override"]["accepted"])
 
     def test_candidate_events_include_timeline_roles_facts_and_document_context(self):
         from analysis.ai_sweep import _build_unit_context, _candidate_events_for_unit

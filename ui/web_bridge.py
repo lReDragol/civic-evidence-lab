@@ -153,6 +153,7 @@ NAVIGATION = [
         "label": "Мониторинг",
         "sections": [
             {"key": "overview", "label": "Обзор"},
+            {"key": "ops247", "label": "24/7"},
             {"key": "content", "label": "Контент"},
             {"key": "search", "label": "Поиск"},
         ],
@@ -400,11 +401,174 @@ class DashboardDataService:
             "logs": logs or [],
         }
 
+    def ops247_payload(self) -> dict[str, Any]:
+        daemon_running = bool(
+            self._table_exists("job_leases")
+            and self.db.execute(
+                "SELECT COUNT(*) FROM job_leases WHERE job_id='__daemon__'"
+            ).fetchone()[0]
+        )
+        running_jobs = []
+        if self._table_exists("job_leases"):
+            running_jobs = [
+                self._row_to_dict(row)
+                for row in self.db.execute(
+                    """
+                    SELECT job_id, lease_owner, started_at, heartbeat_at, expires_at
+                    FROM job_leases
+                    WHERE job_id != '__daemon__'
+                    ORDER BY started_at DESC
+                    LIMIT 40
+                    """
+                ).fetchall()
+            ]
+
+        telegram_sessions = []
+        if self._table_exists("telegram_sessions"):
+            telegram_sessions = [
+                self._row_to_dict(row)
+                for row in self.db.execute(
+                    """
+                    SELECT session_key, client_type, session_path, status, assigned_count,
+                           last_success_at, last_attempt_at, failure_class, cooldown_until
+                    FROM telegram_sessions
+                    ORDER BY
+                        CASE status WHEN 'active' THEN 0 WHEN 'cooldown' THEN 1 WHEN 'failed' THEN 2 ELSE 3 END,
+                        session_key
+                    """
+                ).fetchall()
+            ]
+
+        key_status = {}
+        if self._table_exists("llm_keys"):
+            for row in self.db.execute(
+                """
+                SELECT status, COUNT(*) AS count
+                FROM llm_keys
+                GROUP BY status
+                """
+            ).fetchall():
+                key_status[str(row["status"] or "unknown")] = int(row["count"] or 0)
+
+        provider_rows = []
+        if self._table_exists("llm_provider_health"):
+            provider_rows = [
+                self._row_to_dict(row)
+                for row in self.db.execute(
+                    """
+                    SELECT provider, status, active_key_count, last_checked_at, last_success_at
+                    FROM llm_provider_health
+                    ORDER BY provider
+                    """
+                ).fetchall()
+            ]
+
+        failure_kinds = {}
+        if self._table_exists("ai_task_attempts"):
+            for row in self.db.execute(
+                """
+                SELECT COALESCE(failure_kind, 'unknown') AS failure_kind, COUNT(*) AS count
+                FROM ai_task_attempts
+                WHERE status='failed'
+                GROUP BY COALESCE(failure_kind, 'unknown')
+                ORDER BY count DESC
+                LIMIT 12
+                """
+            ).fetchall():
+                failure_kinds[str(row["failure_kind"] or "unknown")] = int(row["count"] or 0)
+
+        recent_jobs = []
+        if self._table_exists("job_runs"):
+            recent_jobs = [
+                self._row_to_dict(row)
+                for row in self.db.execute(
+                    """
+                    SELECT job_id, status, started_at, finished_at, items_seen, items_new, items_updated,
+                           warnings_json, fatal_errors_json, error_summary
+                    FROM job_runs
+                    ORDER BY id DESC
+                    LIMIT 80
+                    """
+                ).fetchall()
+            ]
+
+        logs = []
+        for row in recent_jobs[:40]:
+            status = str(row.get("status") or "unknown")
+            level = "error" if status in {"failed", "abandoned"} else "warning" if status in {"warning", "degraded"} else "success" if status == "ok" else "info"
+            message = f"{row.get('job_id')}: {status}"
+            if row.get("items_new"):
+                message += f" · new {row.get('items_new')}"
+            if row.get("error_summary"):
+                message += f" · {row.get('error_summary')}"
+            logs.append({"level": level, "message": message, "started_at": row.get("started_at")})
+
+        quality = {
+            "relation_gate": {
+                "promoted_same_case_cluster": self._count_where("relation_candidates", "candidate_state='promoted' AND candidate_type='same_case_cluster'") if self._table_exists("relation_candidates") else 0,
+                "promoted_with_location_entity": self._count_where(
+                    "relation_candidates",
+                    """
+                    candidate_state='promoted' AND (
+                        entity_a_id IN (SELECT id FROM entities WHERE entity_type='location')
+                        OR entity_b_id IN (SELECT id FROM entities WHERE entity_type='location')
+                    )
+                    """,
+                ) if self._table_exists("relation_candidates") and self._table_exists("entities") else 0,
+                "review_zero_support": self._count_where("relation_candidates", "candidate_state='review' AND COALESCE(support_items, 0)=0") if self._table_exists("relation_candidates") else 0,
+            },
+            "degraded_sources": self._count_where("source_sync_state", "state='degraded' OR quality_state='degraded'") if self._table_exists("source_sync_state") else 0,
+            "reviewed_baseline_ready": self._runtime_metadata("reviewed_baseline_ready") or False,
+        }
+
+        ingest = {
+            "content": self._count("content_items"),
+            "attachments": self._count("attachments"),
+            "document_reviews": self._count_where("review_tasks", "queue_key='documents' AND status='open'") if self._table_exists("review_tasks") else 0,
+            "events": self._count("events"),
+            "facts": self._count("event_facts"),
+            "relations": self._count("entity_relations"),
+            "relation_candidates": self._count("relation_candidates"),
+        }
+
+        return {
+            "runtime": {
+                "enabled": str(self._runtime_metadata("mode_247_enabled") or "").lower() in {"true", "1", "yes"},
+                "autostart_status": self._runtime_metadata("mode_247_autostart_status") or "unknown",
+                "daemon_running": daemon_running,
+                "last_heartbeat": self._runtime_metadata("daemon_last_seen_at"),
+                "last_catchup": self._runtime_metadata("last_collect_catchup_finished_at"),
+                "running_jobs": running_jobs,
+            },
+            "ingest": ingest,
+            "telegram": {
+                "sessions": telegram_sessions,
+                "active_sessions": sum(1 for item in telegram_sessions if item.get("status") == "active"),
+                "cooldown_sessions": sum(1 for item in telegram_sessions if item.get("status") == "cooldown"),
+                "failed_sessions": sum(1 for item in telegram_sessions if item.get("status") == "failed"),
+                "assigned_channels": sum(int(item.get("assigned_count") or 0) for item in telegram_sessions),
+            },
+            "ai": {
+                "keys": {
+                    "active": int(key_status.get("active", 0)),
+                    "cooldown": int(key_status.get("cooldown", 0)),
+                    "removed": int(key_status.get("removed", 0)),
+                    "by_status": key_status,
+                },
+                "providers": provider_rows,
+                "failure_kinds": failure_kinds,
+            },
+            "quality": quality,
+            "logs": logs,
+        }
+
     def screen_payload(self, screen: str, filters: dict[str, Any] | None = None) -> dict[str, Any]:
         filters = filters or {}
         screen = (screen or "overview").strip().lower()
         if screen == "overview":
             return self.overview_payload()
+        if screen == "ops247":
+            return self.ops247_payload()
         if screen in {"content", "search"}:
             return self._content_screen(filters)
         if screen == "claims":
@@ -3425,6 +3589,10 @@ class DashboardBridge(QObject):
     @Slot(str)
     def runJob(self, job_id: str):
         self.controller.run_job(job_id)
+
+    @Slot()
+    def start247(self):
+        self.controller.start_247()
 
     @Slot(str)
     def stopJob(self, job_id: str):

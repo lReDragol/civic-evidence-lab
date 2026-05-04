@@ -148,7 +148,7 @@ def _stage_provider_priority(stage: str, settings: dict[str, Any]) -> list[str]:
         return [str(provider) for provider in overrides[stage] if str(provider).strip()]
     stage_specific = {
         "clean_factual_text": ["mistral", "groq", "openrouter"],
-        "structured_extract": ["mistral", "groq", "openrouter"],
+        "structured_extract": ["mistral", "openai", "perplexity"],
         "event_link_hint": ["mistral", "groq", "openrouter"],
         "tag_reasoning": ["mistral", "groq", "openrouter"],
         "relation_reasoning": ["perplexity", "openai", "openrouter"],
@@ -1744,6 +1744,17 @@ def _persist_content_derivation(
     payload: dict[str, Any],
     work_item_id: int | None = None,
 ) -> int:
+    existing_derivation_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(content_derivations)").fetchall()
+    }
+    for column_name, column_sql in {
+        "schema_name": "TEXT",
+        "schema_version": "TEXT",
+        "schema_valid": "INTEGER",
+    }.items():
+        if column_name not in existing_derivation_columns:
+            conn.execute(f"ALTER TABLE content_derivations ADD COLUMN {column_name} {column_sql}")
+            existing_derivation_columns.add(column_name)
     content_item_id = int(unit.get("canonical_content_id") or unit.get("content_item_id") or payload.get("content_id") or 0)
     if content_item_id <= 0:
         return 0
@@ -1772,8 +1783,8 @@ def _persist_content_derivation(
         INSERT INTO content_derivations(
             content_item_id, campaign_id, work_item_id, derivation_type, model_provider, model_name, prompt_version, input_hash,
             output_text, output_json, event_context_json, fact_context_json, temporal_window_json,
-            confidence, status, is_current, created_at, updated_at
-        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            schema_name, schema_version, schema_valid, confidence, status, is_current, created_at, updated_at
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(content_item_id, derivation_type, model_provider, model_name, prompt_version, input_hash) DO UPDATE SET
             campaign_id=excluded.campaign_id,
             work_item_id=excluded.work_item_id,
@@ -1782,6 +1793,9 @@ def _persist_content_derivation(
             event_context_json=excluded.event_context_json,
             fact_context_json=excluded.fact_context_json,
             temporal_window_json=excluded.temporal_window_json,
+            schema_name=excluded.schema_name,
+            schema_version=excluded.schema_version,
+            schema_valid=excluded.schema_valid,
             confidence=excluded.confidence,
             status=excluded.status,
             is_current=excluded.is_current,
@@ -1801,6 +1815,9 @@ def _persist_content_derivation(
             _json_dumps(event_context) if event_context is not None else None,
             _json_dumps(fact_context) if fact_context is not None else None,
             _json_dumps(temporal_window) if temporal_window is not None else None,
+            result.get("schema_name"),
+            result.get("schema_version"),
+            (1 if result.get("schema_valid") is True else 0 if result.get("schema_valid") is False else None),
             float(result.get("confidence") or 0),
             "ready",
             1,
@@ -1896,7 +1913,24 @@ def _deterministic_event_link_override(
         has_time = "temporal_proximity" in reasons
         has_text_anchor = "title_or_summary_anchor" in reasons
         has_document_anchor = bool(candidate.get("official_docs") or candidate.get("facts"))
-        if not has_entity or not (has_time or has_text_anchor or has_document_anchor):
+        if not has_entity:
+            if has_document_anchor and (has_time or has_text_anchor):
+                return "merge_review", event_id, {
+                    "accepted": True,
+                    "candidate_event_id": event_id,
+                    "candidate_reasons": sorted(reasons),
+                    "gate": {
+                        "accepted": False,
+                        "reason": "document_anchor_merge_review",
+                        "checks": {
+                            "entity_overlap": False,
+                            "temporal_proximity": has_time,
+                            "document_or_title_anchor": has_document_anchor or has_text_anchor,
+                        },
+                    },
+                }
+            continue
+        if not (has_time or has_text_anchor or has_document_anchor):
             continue
         gated_state, gated_event_id, gate = _event_link_gate(
             conn,
@@ -1938,6 +1972,17 @@ def _persist_event_candidate(
     work_item_id: int | None = None,
     payload: dict[str, Any] | None = None,
 ) -> int:
+    existing_event_candidate_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(event_candidates)").fetchall()
+    }
+    for column_name, column_sql in {
+        "overlap_score": "REAL DEFAULT 0",
+        "overlap_reasons_json": "TEXT",
+        "candidate_event_context_json": "TEXT",
+    }.items():
+        if column_name not in existing_event_candidate_columns:
+            conn.execute(f"ALTER TABLE event_candidates ADD COLUMN {column_name} {column_sql}")
+            existing_event_candidate_columns.add(column_name)
     output_json = result.get("output_json")
     if not isinstance(output_json, dict):
         return 0
@@ -1987,6 +2032,38 @@ def _persist_event_candidate(
             }
             candidate_state = override_state
             suggested_event_id = override_event_id
+    candidate_event_context = None
+    overlap_reasons: list[str] = []
+    overlap_score = 0.0
+    for candidate in (payload or {}).get("candidate_events") or []:
+        if not isinstance(candidate, dict):
+            continue
+        raw_event_id = candidate.get("event_id") or candidate.get("id")
+        try:
+            candidate_event_id = int(raw_event_id)
+        except (TypeError, ValueError):
+            continue
+        if suggested_event_id is not None and candidate_event_id != int(suggested_event_id):
+            continue
+        candidate_event_context = candidate
+        overlap_reasons = [str(value) for value in (candidate.get("overlap_reasons") or []) if str(value).strip()]
+        try:
+            overlap_score = float(candidate.get("retrieval_score") or 0)
+        except (TypeError, ValueError):
+            overlap_score = 0.0
+        break
+    deterministic_gate = output_json.get("deterministic_gate")
+    deterministic_override = output_json.get("deterministic_override")
+    if isinstance(deterministic_override, dict):
+        overlap_reasons = list(dict.fromkeys(overlap_reasons + [str(value) for value in (deterministic_override.get("candidate_reasons") or [])]))
+        gate = deterministic_override.get("gate")
+        if isinstance(gate, dict):
+            overlap_score = max(overlap_score, float(gate.get("score") or 0))
+    elif isinstance(deterministic_gate, dict):
+        checks = deterministic_gate.get("checks")
+        if isinstance(checks, dict):
+            overlap_reasons = list(dict.fromkeys(overlap_reasons + [key for key, value in checks.items() if value]))
+        overlap_score = max(overlap_score, float(deterministic_gate.get("score") or 0))
     campaign_id = None
     if work_item_id is not None:
         campaign_row = conn.execute("SELECT campaign_id FROM ai_work_items WHERE id=?", (int(work_item_id),)).fetchone()
@@ -2011,7 +2088,8 @@ def _persist_event_candidate(
             """
             UPDATE event_candidates
             SET campaign_id=?, work_item_id=?, content_item_id=?, content_cluster_id=?, suggested_event_id=?, candidate_state=?, confidence=?, suggestion_json=?,
-                model_provider=?, model_name=?, prompt_version=?, status='open', updated_at=?
+                model_provider=?, model_name=?, prompt_version=?, overlap_score=?, overlap_reasons_json=?, candidate_event_context_json=?,
+                status='open', updated_at=?
             WHERE id=?
             """,
             (
@@ -2026,6 +2104,9 @@ def _persist_event_candidate(
                 result.get("provider"),
                 result.get("model"),
                 prompt_version,
+                overlap_score,
+                _json_dumps(overlap_reasons),
+                _json_dumps(candidate_event_context) if candidate_event_context is not None else None,
                 now_iso(),
                 candidate_id,
             ),
@@ -2035,8 +2116,9 @@ def _persist_event_candidate(
         """
         INSERT INTO event_candidates(
             campaign_id, work_item_id, unit_kind, unit_key, content_item_id, content_cluster_id, suggested_event_id, candidate_state,
-            confidence, suggestion_json, model_provider, model_name, prompt_version, status, created_at, updated_at
-        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            confidence, suggestion_json, model_provider, model_name, prompt_version, overlap_score, overlap_reasons_json,
+            candidate_event_context_json, status, created_at, updated_at
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             campaign_id,
@@ -2052,6 +2134,9 @@ def _persist_event_candidate(
             result.get("provider"),
             result.get("model"),
             prompt_version,
+            overlap_score,
+            _json_dumps(overlap_reasons),
+            _json_dumps(candidate_event_context) if candidate_event_context is not None else None,
             "open",
             now_iso(),
             now_iso(),
@@ -2266,6 +2351,9 @@ def _validate_stage_result(stage: str, result: dict[str, Any]) -> None:
     output_json = result.get("output_json")
     if output_json is not None and not isinstance(output_json, dict):
         raise ValueError("invalid_output: output_json must be an object")
+    if stage == "structured_extract" and result.get("schema_valid") is False:
+        errors = result.get("schema_errors")
+        raise ValueError(f"schema_violation: structured_extract schema invalid: {errors}")
     if stage not in SOURCE_ONLY_STAGES or not isinstance(output_json, dict):
         return
     for key in UNGROUNDED_OUTPUT_KEYS:
@@ -2357,6 +2445,10 @@ def _deterministic_source_only_result(stage: str, prompt_version: str, payload: 
         "output_text": output_text,
         "output_json": output_json,
         "confidence": 0.35,
+        "schema_name": "structured_extract_v1" if stage == "structured_extract" else None,
+        "schema_version": "2026-04-30" if stage == "structured_extract" else None,
+        "schema_valid": True if stage == "structured_extract" else None,
+        "schema_errors": [],
         "citations": [],
     }
 
@@ -2403,9 +2495,27 @@ def _detect_failure_kind(error_text: str) -> str:
         or ("quota" in lowered and "rate" not in lowered)
     ):
         return "auth"
-    if "timeout" in lowered or "timed out" in lowered:
+    if (
+        "timeout" in lowered
+        or "timed out" in lowered
+        or "connectionreseterror" in lowered
+        or "connection reset" in lowered
+        or "connection aborted" in lowered
+        or "forcibly closed" in lowered
+        or "принудительно разорвал" in lowered
+    ):
         return "timeout"
     return "provider_model"
+
+
+def _key_remove_threshold_for_failure(failure_kind: str, settings: dict[str, Any]) -> int:
+    """Only key-scoped failures should remove a key from the active pool."""
+    kind = str(failure_kind or "").strip().lower()
+    if kind == "auth":
+        return 1
+    # Rate, transport, provider/model/schema/output failures are routed by
+    # provider-stage budgets. They do not prove that the API key itself is dead.
+    return 10**9
 
 
 def _worker_run(
@@ -2553,11 +2663,7 @@ def _worker_run(
                     key_id,
                     failure_kind=failure_kind,
                     error_text=failure_text,
-                    remove_threshold=(
-                        1
-                        if failure_kind == "auth"
-                        else (10**9 if failure_kind in {"rate", "timeout"} else int(_ai_settings(settings).get("dead_key_threshold") or 3))
-                    ),
+                    remove_threshold=_key_remove_threshold_for_failure(failure_kind, settings),
                 )
                 failures.append(
                     {

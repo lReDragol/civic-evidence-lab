@@ -5,7 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from runtime.runner import _finalize_job_state, _heartbeat_loop, run_job_once
+from runtime.runner import _finalize_job_state, _heartbeat_loop, _quality_for_job_result, run_job_once
 from runtime.state import (
     acquire_job_lease,
     active_job_lease,
@@ -251,6 +251,63 @@ class RuntimeStateTests(unittest.TestCase):
             self.assertEqual(row[3], "timeout")
             self.assertEqual(row[4], "healthcheck")
             self.assertIn("fixture_sample", row[5])
+
+    def test_update_source_sync_state_clears_failure_class_after_success(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "runtime.db"
+            create_db(db_path)
+
+            conn = sqlite3.connect(db_path)
+            try:
+                update_source_sync_state(
+                    conn,
+                    source_key="telegram",
+                    success=False,
+                    transport_mode="telegram",
+                    last_error="EOFError",
+                    failure_class="runtime_error",
+                )
+                update_source_sync_state(
+                    conn,
+                    source_key="telegram",
+                    success=True,
+                    transport_mode="telegram_public_fallback",
+                    metadata={"fallback_used": "public"},
+                )
+                row = conn.execute(
+                    """
+                    SELECT state, quality_state, failure_class, last_error, transport_mode
+                    FROM source_sync_state
+                    WHERE source_key='telegram'
+                    """
+                ).fetchone()
+            finally:
+                conn.close()
+
+            self.assertEqual(row[0], "ok")
+            self.assertEqual(row[1], "ok")
+            self.assertIsNone(row[2])
+            self.assertIsNone(row[3])
+            self.assertEqual(row[4], "telegram_public_fallback")
+
+    def test_job_result_source_quality_override_keeps_aggregate_warnings_non_degraded(self):
+        quality_state, quality_issue, failure_class = _quality_for_job_result(
+            {
+                "ok": True,
+                "warnings": [
+                    "minjust:SSLError: certificate verify failed",
+                    "duma_votes_2y:job_failed",
+                ],
+                "artifacts": {
+                    "source_quality_state": "warning",
+                    "source_quality_issue": "optional source failures",
+                },
+            }
+        )
+
+        self.assertEqual(quality_state, "warning")
+        self.assertEqual(quality_issue, "optional source failures")
+        self.assertIsNone(failure_class)
 
     def test_record_source_health_report_classifies_failure_and_quality_state(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -76,6 +76,14 @@ venv/
 *.temp
 *.pid
 _tmp_*.txt
+tmp/
+temp/
+artifacts/
+screenshots/
+test-results/
+playwright-report/
+tests/_artifacts/
+tests/.tmp/
 
 # Local planning notes and generated agent plans
 todo.md

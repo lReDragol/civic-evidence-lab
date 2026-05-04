@@ -12,6 +12,50 @@ class ProviderTaskError(RuntimeError):
 
 
 JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", re.IGNORECASE)
+STRUCTURED_EXTRACT_SCHEMA_NAME = "structured_extract_v1"
+STRUCTURED_EXTRACT_SCHEMA_VERSION = "2026-04-30"
+
+STRUCTURED_EXTRACT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "output_text": {"type": "string"},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "output_json": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "actors": {"type": "array", "items": {"type": ["object", "string"]}},
+                "organizations": {"type": "array", "items": {"type": ["object", "string"]}},
+                "dates": {"type": "array", "items": {"type": ["object", "string"]}},
+                "locations": {"type": "array", "items": {"type": ["object", "string"]}},
+                "actions": {"type": "array", "items": {"type": ["object", "string"]}},
+                "legal_basis": {"type": "array", "items": {"type": ["object", "string"]}},
+                "affected_groups": {"type": "array", "items": {"type": ["object", "string"]}},
+                "explicit_claims": {"type": "array", "items": {"type": ["object", "string"]}},
+                "uncertainty_markers": {"type": "array", "items": {"type": ["object", "string"]}},
+                "document_anchors": {"type": "array", "items": {"type": ["object", "string"]}},
+                "source_facts": {"type": "array", "items": {"type": ["object", "string"]}},
+                "external_context": {"type": "array", "items": {"type": ["object", "string"]}},
+            },
+            "required": [
+                "actors",
+                "organizations",
+                "dates",
+                "locations",
+                "actions",
+                "legal_basis",
+                "affected_groups",
+                "explicit_claims",
+                "uncertainty_markers",
+                "document_anchors",
+                "source_facts",
+                "external_context",
+            ],
+        },
+    },
+    "required": ["output_text", "output_json", "confidence"],
+}
 
 STAGE_SPECS: dict[str, dict[str, Any]] = {
     "clean_factual_text": {
@@ -147,6 +191,42 @@ def _stage_allows_web(stage: str) -> bool:
     return stage in {"relation_reasoning"}
 
 
+def _stage_schema(stage: str) -> dict[str, Any] | None:
+    if stage == "structured_extract":
+        return {
+            "name": STRUCTURED_EXTRACT_SCHEMA_NAME,
+            "version": STRUCTURED_EXTRACT_SCHEMA_VERSION,
+            "schema": STRUCTURED_EXTRACT_SCHEMA,
+        }
+    return None
+
+
+def _response_format_for_stage(stage: str) -> dict[str, Any] | None:
+    schema = _stage_schema(stage)
+    if not schema:
+        return None
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": schema["name"],
+            "strict": True,
+            "schema": schema["schema"],
+        },
+    }
+
+
+def _openai_text_format_for_stage(stage: str) -> dict[str, Any] | None:
+    schema = _stage_schema(stage)
+    if not schema:
+        return None
+    return {
+        "type": "json_schema",
+        "name": schema["name"],
+        "strict": True,
+        "schema": schema["schema"],
+    }
+
+
 def _extract_chat_text(data: dict[str, Any]) -> str:
     if isinstance(data.get("output_text"), str) and data.get("output_text"):
         return str(data["output_text"])
@@ -243,6 +323,23 @@ def _stage_fallback_output(stage: str, text: str) -> dict[str, Any]:
     return {"response": text}
 
 
+def _validate_stage_schema(stage: str, parsed_json: dict[str, Any] | None, output_json: dict[str, Any]) -> tuple[bool, list[str]]:
+    schema = _stage_schema(stage)
+    if not schema:
+        return True, []
+    errors: list[str] = []
+    if parsed_json is None:
+        errors.append("missing_json_envelope")
+    required = list((schema["schema"].get("properties") or {}).get("output_json", {}).get("required") or [])
+    for key in required:
+        value = output_json.get(key)
+        if not isinstance(value, list):
+            errors.append(f"output_json.{key}_must_be_array")
+    if output_json.get("external_context") not in (None, [], ""):
+        errors.append("output_json.external_context_must_be_empty_for_source_only_stage")
+    return not errors, errors
+
+
 def _coerce_stage_result(stage: str, raw_text: str, parsed_json: dict[str, Any] | None) -> tuple[str, dict[str, Any], float]:
     raw_text = str(raw_text or "").strip()
     envelope = parsed_json or {}
@@ -271,12 +368,18 @@ def _normalize_result(provider: str, model: str, stage: str, data: dict[str, Any
     raw_text = _extract_chat_text(data)
     parsed = _extract_json_object(raw_text)
     output_text, output_json, confidence = _coerce_stage_result(stage, raw_text, parsed)
+    schema = _stage_schema(stage)
+    schema_valid, schema_errors = _validate_stage_schema(stage, parsed, output_json)
     return {
         "provider": provider,
         "model": model,
         "output_text": output_text,
         "output_json": output_json,
         "confidence": confidence,
+        "schema_name": schema["name"] if schema else None,
+        "schema_version": schema["version"] if schema else None,
+        "schema_valid": schema_valid,
+        "schema_errors": schema_errors,
         "raw_response": data,
     }
 
@@ -284,6 +387,7 @@ def _normalize_result(provider: str, model: str, stage: str, data: dict[str, Any
 def _openai_run(model: str, api_key: str, task: dict[str, Any]) -> dict[str, Any]:
     system_prompt, user_prompt = _stage_prompt(task)
     stage = _task_stage(task)
+    text_format = _openai_text_format_for_stage(stage)
     payload = {
         "model": model,
         "input": [
@@ -297,6 +401,8 @@ def _openai_run(model: str, api_key: str, task: dict[str, Any]) -> dict[str, Any
             },
         ],
     }
+    if text_format:
+        payload["text"] = {"format": text_format}
     if _stage_allows_web(stage):
         payload["tools"] = [{"type": "web_search"}]
     data = _post_json(
@@ -309,6 +415,8 @@ def _openai_run(model: str, api_key: str, task: dict[str, Any]) -> dict[str, Any
 
 def _perplexity_run(model: str, api_key: str, task: dict[str, Any]) -> dict[str, Any]:
     system_prompt, user_prompt = _stage_prompt(task)
+    stage = _task_stage(task)
+    response_format = _response_format_for_stage(stage)
     payload = {
         "model": model,
         "messages": [
@@ -316,12 +424,14 @@ def _perplexity_run(model: str, api_key: str, task: dict[str, Any]) -> dict[str,
             {"role": "user", "content": user_prompt},
         ],
     }
+    if response_format:
+        payload["response_format"] = response_format
     data = _post_json(
         "https://api.perplexity.ai/chat/completions",
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
         payload=payload,
     )
-    return _normalize_result("perplexity", model, _task_stage(task), data)
+    return _normalize_result("perplexity", model, stage, data)
 
 
 def _groq_run(model: str, api_key: str, task: dict[str, Any]) -> dict[str, Any]:
@@ -343,6 +453,8 @@ def _groq_run(model: str, api_key: str, task: dict[str, Any]) -> dict[str, Any]:
 
 def _mistral_run(model: str, api_key: str, task: dict[str, Any]) -> dict[str, Any]:
     system_prompt, user_prompt = _stage_prompt(task)
+    stage = _task_stage(task)
+    response_format = _response_format_for_stage(stage)
     payload = {
         "model": model,
         "messages": [
@@ -350,12 +462,14 @@ def _mistral_run(model: str, api_key: str, task: dict[str, Any]) -> dict[str, An
             {"role": "user", "content": user_prompt},
         ],
     }
+    if response_format:
+        payload["response_format"] = response_format
     data = _post_json(
         "https://api.mistral.ai/v1/chat/completions",
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
         payload=payload,
     )
-    return _normalize_result("mistral", model, _task_stage(task), data)
+    return _normalize_result("mistral", model, stage, data)
 
 
 def _openrouter_run(model: str, api_key: str, task: dict[str, Any]) -> dict[str, Any]:

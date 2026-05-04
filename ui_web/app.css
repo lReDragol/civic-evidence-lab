@@ -1649,6 +1649,12 @@ button:disabled {
   box-shadow: 0 0 0 3px rgba(255, 203, 108, 0.08), 0 0 10px rgba(255, 203, 108, 0.20);
 }
 
+.status-warning.status-dot,
+.status-dot.status-warning {
+  background: #ffc96b;
+  box-shadow: 0 0 0 3px rgba(255, 201, 107, 0.08), 0 0 10px rgba(255, 201, 107, 0.22);
+}
+
 .status-error.status-dot,
 .status-dot.status-error {
   background: var(--task-error);
@@ -1658,6 +1664,18 @@ button:disabled {
 .job-state.status-running { color: #caffeb; }
 .job-state.status-idle { color: #ffe5ae; }
 .job-state.status-error { color: #ffd6df; }
+
+.log-item.error {
+  color: #ffd6df;
+}
+
+.log-item.warning {
+  color: #ffe5ae;
+}
+
+.log-item.success {
+  color: #caffeb;
+}
 
 .task-group-toggle {
   border: 0;
@@ -3152,12 +3170,12 @@ button:disabled {
 
 .top-actions {
   display: grid !important;
-  grid-template-columns: repeat(2, minmax(112px, 1fr));
+  grid-template-columns: repeat(3, minmax(112px, 1fr));
   grid-auto-rows: 38px;
   gap: 8px;
-  width: 240px !important;
-  max-width: 240px !important;
-  min-width: 240px !important;
+  width: 360px !important;
+  max-width: 360px !important;
+  min-width: 360px !important;
   justify-content: stretch;
   align-content: center;
 }

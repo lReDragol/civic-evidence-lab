@@ -70,6 +70,7 @@
     ui.jobDetailCard = document.getElementById("job-detail-card");
     ui.toastStack = document.getElementById("toast-stack");
     ui.aiSweepBtn = document.getElementById("ai-sweep-btn");
+    ui.catchupCollectBtn = document.getElementById("catchup-collect-btn");
     ui.toggleSourcesBtn = document.getElementById("toggle-sources-btn");
     ui.toggleTasksBtn = document.getElementById("toggle-tasks-btn");
     ui.schedulerToggleBtn = document.getElementById("scheduler-toggle-btn");
@@ -200,6 +201,11 @@
 
   function bindShellEvents() {
     document.getElementById("manual-refresh-btn").addEventListener("click", manualRefresh);
+    if (ui.catchupCollectBtn) {
+      ui.catchupCollectBtn.addEventListener("click", () => {
+        bridgeVoid("start247");
+      });
+    }
     if (ui.aiSweepBtn) {
       ui.aiSweepBtn.addEventListener("click", () => {
         bridgeVoid("runJob", "ai_full_sweep");
@@ -588,7 +594,7 @@
       : emptyState("Нет задач", "Registry пока пуст.");
 
     const logsMarkup = logs.length
-      ? logs.slice(-14).reverse().map((logEntry) => `<div class="log-item"><span class="status-dot status-idle"></span>${escapeHtml(logEntry.message || "")}</div>`).join("")
+      ? logs.slice(-14).reverse().map((logEntry) => `<div class="log-item ${escapeHtml(logEntry.level || "info")}"><span class="status-dot ${statusDotClass(logEntry.level)}"></span>${escapeHtml(logEntry.message || "")}</div>`).join("")
       : '<div class="log-item"><span class="status-dot status-idle"></span>Пока нет сообщений.</div>';
 
     const settingsMarkup = selected
@@ -693,6 +699,14 @@
     return "Ожидание";
   }
 
+  function statusDotClass(level) {
+    const normalized = String(level || "").toLowerCase();
+    if (["error", "failed", "fatal"].includes(normalized)) return "status-error";
+    if (["warning", "degraded", "abandoned"].includes(normalized)) return "status-warning";
+    if (["success", "ok"].includes(normalized)) return "status-running";
+    return "status-idle";
+  }
+
   function renderJobState(item, options = {}) {
     const compact = !!options.compact;
     const statusClass = jobStatusClass(item);
@@ -723,6 +737,9 @@
     switch (state.section) {
       case "overview":
         renderOverviewScreen(state.screenData);
+        break;
+      case "ops247":
+        renderOps247Screen(state.screenData);
         break;
       case "content":
       case "search":
@@ -1006,6 +1023,154 @@
       relations: "Связи",
     };
     return labels[key] || key.replace(/_/g, " ");
+  }
+
+  function renderOps247Screen(payload) {
+    const runtime = payload.runtime || {};
+    const ingest = payload.ingest || {};
+    const telegram = payload.telegram || {};
+    const ai = payload.ai || {};
+    const quality = payload.quality || {};
+    const sessions = telegram.sessions || [];
+    const providers = ai.providers || [];
+    const logs = payload.logs || [];
+    const relationGate = quality.relation_gate || {};
+
+    const runtimeCards = [
+      ["24/7", runtime.enabled ? "ON" : "OFF", `autostart ${runtime.autostart_status || "unknown"}`],
+      ["Daemon", runtime.daemon_running ? "RUNNING" : "OFF", runtime.last_heartbeat || "heartbeat —"],
+      ["Last catch-up", runtime.last_catchup || "—", `${(runtime.running_jobs || []).length} running jobs`],
+      ["Telegram sessions", telegram.active_sessions || 0, `${telegram.failed_sessions || 0} failed · ${telegram.cooldown_sessions || 0} cooldown`],
+      ["AI keys", ai.keys?.active || 0, `${ai.keys?.cooldown || 0} cooldown · ${ai.keys?.removed || 0} removed`],
+      ["Relations gate", relationGate.promoted_same_case_cluster || 0, "bad same_case promoted"],
+    ]
+      .map(
+        ([label, value, meta]) => `
+          <div class="system-tile metric-tile">
+            <div class="label">${escapeHtml(label)}</div>
+            <strong>${escapeHtml(String(value))}</strong>
+            <div class="meta">${escapeHtml(String(meta || ""))}</div>
+          </div>
+        `
+      )
+      .join("");
+
+    const ingestCards = Object.entries({
+      "Контент": ingest.content,
+      "Вложения": ingest.attachments,
+      "Документы review": ingest.document_reviews,
+      "События": ingest.events,
+      "Факты": ingest.facts,
+      "Связи": ingest.relations,
+      "Relation candidates": ingest.relation_candidates,
+    })
+      .map(
+        ([label, value]) => `
+          <div class="detail-kv compact-kpi">
+            <div class="k">${escapeHtml(label)}</div>
+            <div class="v">${escapeHtml(String(value ?? 0))}</div>
+          </div>
+        `
+      )
+      .join("");
+
+    const sessionMarkup = sessions.length
+      ? sessions
+          .map((session) => {
+            const status = session.status || "unknown";
+            const level = status === "active" ? "success" : status === "cooldown" ? "warning" : "error";
+            return `
+              <article class="mini-item ops-session ${escapeHtml(level)}">
+                <div class="table-row-head">
+                  <div class="table-primary">${escapeHtml(session.session_key || "—")} · ${escapeHtml(session.client_type || "—")}</div>
+                  <span class="badge ${level === "success" ? "" : level === "warning" ? "amber" : "rose"}">${escapeHtml(status)}</span>
+                </div>
+                <div class="table-secondary">
+                  channels ${escapeHtml(String(session.assigned_count || 0))}
+                  · last ${escapeHtml(session.last_success_at || session.last_attempt_at || "—")}
+                  ${session.failure_class ? `· ${escapeHtml(session.failure_class)}` : ""}
+                </div>
+              </article>
+            `;
+          })
+          .join("")
+      : emptyState("Нет Telegram-сессий", "Импортируйте Telethon/Pyrogram session или используйте public fallback.");
+
+    const providerMarkup = providers.length
+      ? providers
+          .map(
+            (provider) => `
+              <article class="mini-item">
+                <div class="table-row-head">
+                  <div class="table-primary">${escapeHtml(provider.provider || "—")}</div>
+                  <span class="badge">${escapeHtml(provider.status || "unknown")}</span>
+                </div>
+                <div class="table-secondary">active keys ${escapeHtml(String(provider.active_key_count || 0))} · last ${escapeHtml(provider.last_success_at || provider.last_checked_at || "—")}</div>
+              </article>
+            `
+          )
+          .join("")
+      : emptyState("Нет provider health", "AI-пул ещё не обновлял health-состояние.");
+
+    const failuresMarkup = Object.entries(ai.failure_kinds || {}).length
+      ? Object.entries(ai.failure_kinds || {})
+          .map(
+            ([kind, count]) => `
+              <div class="detail-kv compact-kpi">
+                <div class="k">${escapeHtml(kind)}</div>
+                <div class="v">${escapeHtml(String(count))}</div>
+              </div>
+            `
+          )
+          .join("")
+      : `<div class="muted">Нет failed AI attempts.</div>`;
+
+    const logsMarkup = logs.length
+      ? logs
+          .slice(0, 40)
+          .map((entry) => `<div class="log-item ${escapeHtml(entry.level || "info")}"><span class="status-dot ${statusDotClass(entry.level)}"></span>${escapeHtml(entry.message || "")}</div>`)
+          .join("")
+      : '<div class="log-item"><span class="status-dot status-idle"></span>Пока нет сообщений.</div>';
+
+    ui.screenRoot.innerHTML = `
+      <div class="overview-grid overview-grid-dense ops247-grid">
+        <div class="overview-column">
+          <section class="overview-panel metrics-panel">
+            <h3>Runtime 24/7</h3>
+            <div class="system-grid dense-metrics-grid">${runtimeCards}</div>
+          </section>
+          <section class="overview-panel">
+            <h3>Ingest / Event / Graph</h3>
+            <div class="detail-grid health-grid">${ingestCards}</div>
+          </section>
+          <section class="overview-panel scrollable">
+            <h3>Telegram sessions</h3>
+            <div class="mini-list">${sessionMarkup}</div>
+          </section>
+        </div>
+
+        <div class="overview-column">
+          <section class="overview-panel scrollable">
+            <h3>AI providers</h3>
+            <div class="mini-list">${providerMarkup}</div>
+            <div class="detail-grid health-grid">${failuresMarkup}</div>
+          </section>
+          <section class="overview-panel">
+            <h3>Quality gate</h3>
+            <div class="detail-grid health-grid">
+              <div class="detail-kv compact-kpi"><div class="k">promoted same_case</div><div class="v">${escapeHtml(String(relationGate.promoted_same_case_cluster || 0))}</div></div>
+              <div class="detail-kv compact-kpi"><div class="k">promoted location</div><div class="v">${escapeHtml(String(relationGate.promoted_with_location_entity || 0))}</div></div>
+              <div class="detail-kv compact-kpi"><div class="k">review zero support</div><div class="v">${escapeHtml(String(relationGate.review_zero_support || 0))}</div></div>
+              <div class="detail-kv compact-kpi"><div class="k">degraded sources</div><div class="v">${escapeHtml(String(quality.degraded_sources || 0))}</div></div>
+            </div>
+          </section>
+          <section class="overview-panel scrollable">
+            <h3>Логи</h3>
+            <div class="log-list ops-log-list">${logsMarkup}</div>
+          </section>
+        </div>
+      </div>
+    `;
   }
 
   function countMeta(key) {
@@ -3719,6 +3884,7 @@
   function screenCaption(section) {
     const captions = {
       overview: "Операционный срез, качество графа, тегов и последние изменения по базе.",
+      ops247: "Мониторинг daemon, Telegram-сессий, AI-провайдеров, ingest и quality gate.",
       content: "Master-detail по контенту без перегруженных таблиц.",
       search: "Быстрый поиск по контенту и связанным объектам.",
       claims: "Список заявлений, статусов и evidence linkages.",
@@ -3873,7 +4039,7 @@
     function bootstrap() {
       return {
         navigation: [
-          { key: "monitoring", label: "Мониторинг", sections: [{ key: "overview", label: "Обзор" }, { key: "content", label: "Контент" }, { key: "search", label: "Поиск" }] },
+          { key: "monitoring", label: "Мониторинг", sections: [{ key: "overview", label: "Обзор" }, { key: "ops247", label: "24/7" }, { key: "content", label: "Контент" }, { key: "search", label: "Поиск" }] },
           { key: "verification", label: "Проверка", sections: [{ key: "claims", label: "Заявления" }, { key: "cases", label: "Дела" }, { key: "review_ops", label: "Review Ops" }] },
           { key: "analytics", label: "Аналитика", sections: [{ key: "events", label: "События" }, { key: "entities", label: "Сущности" }, { key: "relations", label: "Связи" }, { key: "officials", label: "Руководство" }] },
           { key: "system", label: "Система", sections: [{ key: "settings", label: "Настройки" }] },
@@ -3896,11 +4062,12 @@
           scheduler_running: mockState.schedulerRunning,
           items: [
             { id: "watch_folder", name: "Inbox-сканер", group: "Сбор", interval: 60, running: false },
+            { id: "collect_catchup", name: "Сбор новых данных", group: "Сбор", interval: 86400, running: false },
             { id: "executive_directory", name: "Руководство органов", group: "Сбор", interval: 604800, running: true },
             { id: "claims", name: "Заявления/верификация", group: "Анализ", interval: 21600, running: false },
           ],
           groups: [
-            { label: "Сбор", items: [{ id: "watch_folder", name: "Inbox-сканер", group: "Сбор", interval: 60, running: false }, { id: "executive_directory", name: "Руководство органов", group: "Сбор", interval: 604800, running: true }] },
+            { label: "Сбор", items: [{ id: "watch_folder", name: "Inbox-сканер", group: "Сбор", interval: 60, running: false }, { id: "collect_catchup", name: "Сбор новых данных", group: "Сбор", interval: 86400, running: false }, { id: "executive_directory", name: "Руководство органов", group: "Сбор", interval: 604800, running: true }] },
             { label: "Анализ", items: [{ id: "claims", name: "Заявления/верификация", group: "Анализ", interval: 21600, running: false }] },
           ],
           logs: [{ message: "Mock bridge active" }],
@@ -3911,6 +4078,23 @@
     function screen(screenKey) {
       const screens = {
         overview: bootstrap().summary,
+        ops247: {
+          runtime: { enabled: true, autostart_status: "ok", daemon_running: true, last_heartbeat: "2026-05-03T10:00:00", last_catchup: "2026-05-03T10:05:00", running_jobs: [] },
+          ingest: { content: 128, attachments: 12, document_reviews: 3, events: 8, facts: 21, relations: 14, relation_candidates: 40 },
+          telegram: {
+            active_sessions: 1,
+            failed_sessions: 0,
+            cooldown_sessions: 0,
+            sessions: [{ session_key: "232354072", client_type: "telethon", status: "active", assigned_count: 12, last_success_at: "2026-05-03T10:00:00" }],
+          },
+          ai: {
+            keys: { active: 12, cooldown: 1, removed: 2 },
+            providers: [{ provider: "mistral", status: "ok", active_key_count: 8, last_success_at: "2026-05-03T10:00:00" }],
+            failure_kinds: { timeout: 2 },
+          },
+          quality: { relation_gate: { promoted_same_case_cluster: 0, promoted_with_location_entity: 0, review_zero_support: 0 }, degraded_sources: 0 },
+          logs: [{ level: "success", message: "24/7 mock running" }, { level: "error", message: "example error line" }],
+        },
         content: {
           items: [{ id: 11, title: "Executive profile snapshot", status: "raw_signal", source_name: "Минфин", published_at: "2026-04-25" }],
           detail: { id: 11, title: "Executive profile snapshot", source_name: "Минфин", published_at: "2026-04-25", body_text: "Mock content body", entities: [{ canonical_name: "Иванов Иван Иванович", mention_type: "subject" }], claims: [{ claim_text: "Иванов занимает должность" }] },
@@ -4124,6 +4308,9 @@
       },
       runJob(jobId) {
         toastRaised.emit(JSON.stringify({ message: `Mock run: ${jobId}`, level: "success" }));
+      },
+      start247() {
+        toastRaised.emit(JSON.stringify({ message: "Mock 24/7 enabled", level: "success" }));
       },
       stopJob(jobId) {
         toastRaised.emit(JSON.stringify({ message: `Mock stop: ${jobId}`, level: "warning" }));

@@ -492,12 +492,19 @@ CREATE TABLE IF NOT EXISTS bill_vote_sessions (
     total_present   INTEGER DEFAULT 0,
     result          TEXT,
     duma_session    TEXT,
+    external_vote_id TEXT,
+    source_url      TEXT,
     raw_data        TEXT,
+    updated_at      TEXT,
     FOREIGN KEY (bill_id) REFERENCES bills(id) ON DELETE SET NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_bill_vote_sessions_bill ON bill_vote_sessions(bill_id);
 CREATE INDEX IF NOT EXISTS idx_bill_vote_sessions_date ON bill_vote_sessions(vote_date);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_bill_vote_sessions_external_vote_id
+    ON bill_vote_sessions(external_vote_id)
+    WHERE external_vote_id IS NOT NULL AND external_vote_id != '';
+CREATE INDEX IF NOT EXISTS idx_bill_vote_sessions_source_url ON bill_vote_sessions(source_url);
 
 CREATE TABLE IF NOT EXISTS bill_votes (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -506,6 +513,8 @@ CREATE TABLE IF NOT EXISTS bill_votes (
     deputy_name     TEXT NOT NULL,
     faction         TEXT,
     vote_result     TEXT NOT NULL,
+    external_vote_id TEXT,
+    source_url      TEXT,
     raw_data        TEXT,
     FOREIGN KEY (vote_session_id) REFERENCES bill_vote_sessions(id) ON DELETE CASCADE,
     FOREIGN KEY (entity_id) REFERENCES entities(id) ON DELETE SET NULL
@@ -513,6 +522,8 @@ CREATE TABLE IF NOT EXISTS bill_votes (
 
 CREATE INDEX IF NOT EXISTS idx_bill_votes_session ON bill_votes(vote_session_id);
 CREATE INDEX IF NOT EXISTS idx_bill_votes_entity ON bill_votes(entity_id);
+CREATE INDEX IF NOT EXISTS idx_bill_votes_external_vote_id ON bill_votes(external_vote_id);
+CREATE INDEX IF NOT EXISTS idx_bill_votes_source_url ON bill_votes(source_url);
 
 CREATE TABLE IF NOT EXISTS investigative_materials (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -689,6 +700,44 @@ CREATE INDEX IF NOT EXISTS idx_source_sync_state_id ON source_sync_state(source_
 CREATE INDEX IF NOT EXISTS idx_source_sync_state_state ON source_sync_state(state);
 CREATE INDEX IF NOT EXISTS idx_source_sync_state_quality ON source_sync_state(quality_state);
 CREATE INDEX IF NOT EXISTS idx_source_sync_state_success ON source_sync_state(last_success_at);
+
+CREATE TABLE IF NOT EXISTS telegram_sessions (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_key     TEXT NOT NULL UNIQUE,
+    client_type     TEXT NOT NULL DEFAULT 'telethon',
+    session_path    TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'active',
+    last_success_at TEXT,
+    last_attempt_at TEXT,
+    failure_class   TEXT,
+    cooldown_until  TEXT,
+    assigned_count  INTEGER DEFAULT 0,
+    metadata_json   TEXT,
+    created_at      TEXT DEFAULT (datetime('now')),
+    updated_at      TEXT DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_telegram_sessions_status ON telegram_sessions(status);
+CREATE INDEX IF NOT EXISTS idx_telegram_sessions_type ON telegram_sessions(client_type);
+CREATE INDEX IF NOT EXISTS idx_telegram_sessions_cooldown ON telegram_sessions(cooldown_until);
+
+CREATE TABLE IF NOT EXISTS telegram_source_assignments (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_id       INTEGER NOT NULL,
+    session_key     TEXT NOT NULL,
+    assignment_version TEXT NOT NULL,
+    is_active       INTEGER DEFAULT 1,
+    last_collected_at TEXT,
+    created_at      TEXT DEFAULT (datetime('now')),
+    updated_at      TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE CASCADE,
+    FOREIGN KEY (session_key) REFERENCES telegram_sessions(session_key) ON DELETE CASCADE,
+    UNIQUE(source_id, assignment_version)
+);
+
+CREATE INDEX IF NOT EXISTS idx_telegram_assignments_source ON telegram_source_assignments(source_id);
+CREATE INDEX IF NOT EXISTS idx_telegram_assignments_session ON telegram_source_assignments(session_key);
+CREATE INDEX IF NOT EXISTS idx_telegram_assignments_active ON telegram_source_assignments(assignment_version, is_active);
 
 CREATE TABLE IF NOT EXISTS source_fixtures (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,

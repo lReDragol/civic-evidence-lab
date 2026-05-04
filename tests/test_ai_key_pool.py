@@ -196,6 +196,12 @@ class AiKeyPoolTests(unittest.TestCase):
                     VALUES('groq', 'g-auth-mislabel', 'g-auth-mislabel-hash', 'removed', 1, '2026-04-27T00:00:00', 'auth', '429 Rate limit reached')
                     """
                 )
+                conn.execute(
+                    """
+                    INSERT INTO llm_keys(provider, api_key, key_hash, status, failure_count, removed_at, last_failure_kind, last_error)
+                    VALUES('perplexity', 'p-schema', 'p-schema-hash', 'removed', 3, '2026-04-27T00:00:00', 'schema_violation', 'source-only JSON schema violation')
+                    """
+                )
                 conn.commit()
 
                 result = reactivate_recoverable_keys(conn)
@@ -205,11 +211,12 @@ class AiKeyPoolTests(unittest.TestCase):
             finally:
                 conn.close()
 
-            self.assertEqual(result["reactivated"], 3)
+            self.assertEqual(result["reactivated"], 4)
             self.assertEqual([tuple(row) for row in rows], [
                 ("groq", "active", 0, None),
                 ("groq", "active", 0, None),
                 ("mistral", "active", 0, None),
+                ("perplexity", "active", 0, None),
             ])
 
     def test_record_key_success_waits_out_short_sqlite_write_lock(self):

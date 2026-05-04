@@ -22,7 +22,7 @@ PROVIDER_CATALOG: dict[str, list[dict[str, Any]]] = {
             "supports_web_search": 1,
             "supports_reasoning": 1,
             "supports_background": 1,
-            "stage_roles": ["event_synthesis", "arbiter", "relation_reasoning"],
+            "stage_roles": ["structured_extract", "event_synthesis", "arbiter", "relation_reasoning"],
         }
     ],
     "perplexity": [
@@ -225,7 +225,15 @@ def reactivate_recoverable_keys(conn: sqlite3.Connection) -> dict[str, int]:
             UPDATE llm_keys
             SET status='active', failure_count=0, removed_at=NULL, updated_at=?
             WHERE status='removed'
-              AND last_failure_kind='timeout'
+              AND last_failure_kind IN (
+                    'timeout',
+                    'schema_violation',
+                    'bad_response_shape',
+                    'invalid_output',
+                    'unsupported_tool',
+                    'invalid_model',
+                    'provider_model'
+              )
             """,
         ),
     ]

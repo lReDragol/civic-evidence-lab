@@ -25,6 +25,9 @@ ADDITIVE_COLUMNS = {
         "event_context_json": "TEXT",
         "fact_context_json": "TEXT",
         "temporal_window_json": "TEXT",
+        "schema_name": "TEXT",
+        "schema_version": "TEXT",
+        "schema_valid": "INTEGER",
         "is_current": "INTEGER DEFAULT 0",
     },
     "content_tag_votes": {
@@ -83,6 +86,15 @@ ADDITIVE_COLUMNS = {
         "quality_issue": "TEXT",
         "failure_class": "TEXT",
     },
+    "bill_vote_sessions": {
+        "external_vote_id": "TEXT",
+        "source_url": "TEXT",
+        "updated_at": "TEXT",
+    },
+    "bill_votes": {
+        "external_vote_id": "TEXT",
+        "source_url": "TEXT",
+    },
     "content_clusters": {
         "representative_score": "REAL DEFAULT 0",
         "suppression_reason": "TEXT",
@@ -122,6 +134,9 @@ ADDITIVE_COLUMNS = {
     "event_candidates": {
         "campaign_id": "INTEGER",
         "work_item_id": "INTEGER",
+        "overlap_score": "REAL DEFAULT 0",
+        "overlap_reasons_json": "TEXT",
+        "candidate_event_context_json": "TEXT",
     },
     "ai_task_attempts": {
         "failure_kind": "TEXT",
@@ -294,6 +309,9 @@ CREATE TABLE IF NOT EXISTS event_candidates (
     model_provider  TEXT,
     model_name      TEXT,
     prompt_version  TEXT,
+    overlap_score   REAL DEFAULT 0,
+    overlap_reasons_json TEXT,
+    candidate_event_context_json TEXT,
     status          TEXT NOT NULL DEFAULT 'open',
     created_at      TEXT DEFAULT (datetime('now')),
     updated_at      TEXT DEFAULT (datetime('now')),
@@ -624,6 +642,42 @@ CREATE INDEX IF NOT EXISTS idx_review_tasks_queue ON review_tasks(queue_key);
 CREATE INDEX IF NOT EXISTS idx_review_tasks_status ON review_tasks(status);
 CREATE INDEX IF NOT EXISTS idx_review_tasks_pack ON review_tasks(review_pack_id);
 
+CREATE TABLE IF NOT EXISTS telegram_sessions (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_key     TEXT NOT NULL UNIQUE,
+    client_type     TEXT NOT NULL DEFAULT 'telethon',
+    session_path    TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'active',
+    last_success_at TEXT,
+    last_attempt_at TEXT,
+    failure_class   TEXT,
+    cooldown_until  TEXT,
+    assigned_count  INTEGER DEFAULT 0,
+    metadata_json   TEXT,
+    created_at      TEXT DEFAULT (datetime('now')),
+    updated_at      TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_telegram_sessions_status ON telegram_sessions(status);
+CREATE INDEX IF NOT EXISTS idx_telegram_sessions_type ON telegram_sessions(client_type);
+CREATE INDEX IF NOT EXISTS idx_telegram_sessions_cooldown ON telegram_sessions(cooldown_until);
+
+CREATE TABLE IF NOT EXISTS telegram_source_assignments (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_id       INTEGER NOT NULL,
+    session_key     TEXT NOT NULL,
+    assignment_version TEXT NOT NULL,
+    is_active       INTEGER DEFAULT 1,
+    last_collected_at TEXT,
+    created_at      TEXT DEFAULT (datetime('now')),
+    updated_at      TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE CASCADE,
+    FOREIGN KEY (session_key) REFERENCES telegram_sessions(session_key) ON DELETE CASCADE,
+    UNIQUE(source_id, assignment_version)
+);
+CREATE INDEX IF NOT EXISTS idx_telegram_assignments_source ON telegram_source_assignments(source_id);
+CREATE INDEX IF NOT EXISTS idx_telegram_assignments_session ON telegram_source_assignments(session_key);
+CREATE INDEX IF NOT EXISTS idx_telegram_assignments_active ON telegram_source_assignments(assignment_version, is_active);
+
 CREATE TABLE IF NOT EXISTS source_fixtures (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     source_key      TEXT NOT NULL,
@@ -654,6 +708,9 @@ CREATE TABLE IF NOT EXISTS content_derivations (
     event_context_json TEXT,
     fact_context_json TEXT,
     temporal_window_json TEXT,
+    schema_name     TEXT,
+    schema_version  TEXT,
+    schema_valid    INTEGER,
     confidence      REAL DEFAULT 0,
     status          TEXT DEFAULT 'ready',
     is_current      INTEGER DEFAULT 0,

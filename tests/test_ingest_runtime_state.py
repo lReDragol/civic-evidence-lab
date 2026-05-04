@@ -363,6 +363,110 @@ class IngestRuntimeStateTests(unittest.TestCase):
         self.assertTrue(any(row["tag_name"] == "document/screenshot" and row["vote_value"] == "support" for row in tag_votes))
         self.assertIn(("documents", "content_item", "verify_document_screenshot", "open"), [tuple(row) for row in review_rows])
 
+    def test_telegram_run_collect_requires_existing_session_without_prompting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            db_path = tmp_path / "news.db"
+            session_dir = tmp_path / "telegram-session"
+            create_db(db_path)
+            settings = {
+                "db_path": str(db_path),
+                "ensure_schema_on_connect": True,
+                "telegram_api_id": 123,
+                "telegram_api_hash": "hash",
+                "telegram_session_dir": str(session_dir),
+                "telegram_require_existing_session": True,
+            }
+            conn = get_db(settings)
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO sources(id, name, category, url, access_method, is_active)
+                    VALUES(1, 'YEP', 'telegram', 'https://t.me/yep_news', 'telegram', 1)
+                    """
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            with patch.object(telegram_collector, "HAVE_PYROGRAM", True), patch.object(telegram_collector, "Client") as client:
+                result = asyncio.run(telegram_collector.run_collect(settings))
+
+            self.assertFalse(result["ok"])
+            self.assertIn("telegram_session_missing", result["fatal_errors"])
+            client.assert_not_called()
+
+            conn = get_db(settings)
+            try:
+                state = conn.execute(
+                    "SELECT state, failure_class, last_error, transport_mode FROM source_sync_state WHERE source_key='telegram'"
+                ).fetchone()
+            finally:
+                conn.close()
+
+            self.assertEqual(state["state"], "warning")
+            self.assertEqual(state["failure_class"], "auth")
+            self.assertIn("telegram_session_missing", state["last_error"])
+            self.assertEqual(state["transport_mode"], "telegram")
+
+    def test_telegram_run_collect_rejects_unauthorized_session_without_prompting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            db_path = tmp_path / "news.db"
+            session_dir = tmp_path / "telegram-session"
+            session_dir.mkdir()
+            session_db = session_dir / "news_collector.session"
+            session_conn = sqlite3.connect(session_db)
+            try:
+                session_conn.execute(
+                    """
+                    CREATE TABLE sessions (
+                        dc_id INTEGER PRIMARY KEY,
+                        api_id INTEGER,
+                        test_mode INTEGER,
+                        auth_key BLOB,
+                        date INTEGER NOT NULL,
+                        user_id INTEGER,
+                        is_bot INTEGER
+                    )
+                    """
+                )
+                session_conn.execute(
+                    "INSERT INTO sessions(dc_id, api_id, test_mode, auth_key, date, user_id, is_bot) VALUES(2, 123, 0, ?, 0, NULL, NULL)",
+                    (b"auth-key",),
+                )
+                session_conn.commit()
+            finally:
+                session_conn.close()
+
+            create_db(db_path)
+            settings = {
+                "db_path": str(db_path),
+                "ensure_schema_on_connect": True,
+                "telegram_api_id": 123,
+                "telegram_api_hash": "hash",
+                "telegram_session_dir": str(session_dir),
+                "telegram_require_existing_session": True,
+            }
+            conn = get_db(settings)
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO sources(id, name, category, url, access_method, is_active)
+                    VALUES(1, 'YEP', 'telegram', 'https://t.me/yep_news', 'telegram', 1)
+                    """
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            with patch.object(telegram_collector, "HAVE_PYROGRAM", True), patch.object(telegram_collector, "Client") as client:
+                result = asyncio.run(telegram_collector.run_collect(settings))
+
+            self.assertFalse(result["ok"])
+            self.assertIn("telegram_session_unauthorized", result["fatal_errors"])
+            client.assert_not_called()
+
     def test_ocr_missing_file_records_dead_letter_and_source_state(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -602,6 +706,87 @@ class IngestRuntimeStateTests(unittest.TestCase):
             self.assertEqual(result["items_seen"], 100)
             self.assertEqual(doc_ocr, "ocr:document.jpg")
             self.assertGreaterEqual(remaining_normals, 1)
+
+    def test_ocr_updates_document_review_payload_for_authenticity_followup(self):
+        class FakeEngine:
+            def ocr(self, image_path, **kwargs):
+                return [[[None, ("РОСКОМНАДЗОР Требование № 207 от 30.03.2026 по 152-ФЗ", 0.99)]]]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            db_path = tmp_path / "news.db"
+            image_path = tmp_path / "document.jpg"
+            image_path.write_bytes(b"image")
+            create_db(db_path)
+            settings = {
+                "db_path": str(db_path),
+                "ensure_schema_on_connect": True,
+            }
+            conn = get_db(settings)
+            try:
+                conn.execute("INSERT INTO sources(id, name, category, url, is_active) VALUES(1, 'YEP', 'telegram', 'https://t.me/yep_news', 1)")
+                conn.execute(
+                    """
+                    INSERT INTO content_items(id, source_id, external_id, content_type, title, body_text, status)
+                    VALUES(300, 1, '300', 'post', 'Скриншот требования РКН', '', 'raw_signal')
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO attachments(id, content_item_id, file_path, attachment_type, hash_sha256, file_size, mime_type)
+                    VALUES(300, 300, ?, 'photo', 'doc-hash', 5, 'image/jpeg')
+                    """,
+                    (str(image_path),),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO review_tasks(
+                        task_key, queue_key, subject_type, subject_id, candidate_payload,
+                        suggested_action, confidence, machine_reason, status
+                    ) VALUES(
+                        'telegram-document:1:300', 'documents', 'content_item', 300,
+                        '{"document_reasons":["требование"]}', 'verify_document_screenshot',
+                        0.9, 'needs OCR', 'open'
+                    )
+                    """
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            with patch("media_pipeline.ocr.get_ocr_engine", return_value=FakeEngine()):
+                previous_backend = getattr(ocr, "_ocr_backend", None)
+                ocr._ocr_backend = "paddleocr"
+                try:
+                    result = ocr.process_unprocessed_ocr(settings)
+                finally:
+                    ocr._ocr_backend = previous_backend
+
+            conn = get_db(settings)
+            try:
+                review_row = conn.execute(
+                    """
+                    SELECT candidate_payload, suggested_action, machine_reason
+                    FROM review_tasks
+                    WHERE task_key='telegram-document:1:300'
+                    """
+                ).fetchone()
+                attachment_row = conn.execute(
+                    "SELECT ocr_text FROM attachments WHERE id=300"
+                ).fetchone()
+            finally:
+                conn.close()
+
+            payload = json.loads(review_row["candidate_payload"])
+            self.assertEqual(result["items_updated"], 1)
+            self.assertIn("РОСКОМНАДЗОР", attachment_row["ocr_text"])
+            self.assertEqual(payload["ocr_status"], "ready")
+            self.assertEqual(payload["verification_stage"], "official_source_search")
+            self.assertEqual(payload["authenticity_verdict"], "needs_review")
+            self.assertIn("document_identifiers", payload)
+            self.assertIn("provenance_signals", payload)
+            self.assertEqual(review_row["suggested_action"], "official_source_search")
+            self.assertIn("official-source search", review_row["machine_reason"])
 
     def test_get_ocr_engine_retries_without_show_log(self):
         class FakePaddleOCR:

@@ -295,6 +295,74 @@ def _telegram_source_key(source_id: int) -> str:
     return f"telegram:{int(source_id)}"
 
 
+def _telegram_session_candidates(session_dir: Path, session_path: Path) -> list[Path]:
+    candidates = [
+        session_path.with_suffix(".session"),
+        session_dir / f"{session_path.name}.session",
+    ]
+    return list(dict.fromkeys(candidates))
+
+
+def _existing_telegram_session_file(session_dir: Path, session_path: Path) -> Path | None:
+    for candidate in _telegram_session_candidates(session_dir, session_path):
+        try:
+            if candidate.exists() and candidate.stat().st_size > 0:
+                return candidate
+        except OSError:
+            continue
+    return None
+
+
+def _has_existing_telegram_session(session_dir: Path, session_path: Path) -> bool:
+    return _existing_telegram_session_file(session_dir, session_path) is not None
+
+
+def _is_authorized_telegram_session(session_file: Path) -> bool:
+    try:
+        conn = sqlite3.connect(session_file)
+        try:
+            row = conn.execute(
+                "SELECT user_id, is_bot FROM sessions WHERE auth_key IS NOT NULL LIMIT 1"
+            ).fetchone()
+        finally:
+            conn.close()
+    except Exception:
+        return False
+    if not row:
+        return False
+    return row[0] is not None or row[1] is not None
+
+
+def _record_telegram_runtime_failure(
+    settings: dict,
+    *,
+    fatal_error: str,
+    failure_class: str,
+    last_error: str | None = None,
+) -> dict:
+    conn = get_db(settings)
+    try:
+        update_source_sync_state(
+            conn,
+            source_key="telegram",
+            success=False,
+            transport_mode="telegram",
+            failure_class=failure_class,
+            last_error=last_error or fatal_error,
+            metadata={"fatal_error": fatal_error},
+        )
+    finally:
+        conn.close()
+    return {
+        "ok": False,
+        "items_seen": 0,
+        "items_new": 0,
+        "items_updated": 0,
+        "fatal_errors": [fatal_error],
+        "warnings": [],
+    }
+
+
 def _load_telegram_cursor(conn: sqlite3.Connection, source_id: int) -> int:
     row = conn.execute(
         "SELECT last_external_id FROM source_sync_state WHERE source_key=? LIMIT 1",
@@ -625,6 +693,25 @@ async def run_collect(settings: dict = None):
     session_path = session_dir / "news_collector"
     session_dir.mkdir(parents=True, exist_ok=True)
 
+    if settings.get("telegram_require_existing_session", True):
+        session_file = _existing_telegram_session_file(session_dir, session_path)
+        if not session_file:
+            log.error("Telegram session is missing; refusing to start interactive Pyrogram authorization")
+            return _record_telegram_runtime_failure(
+                settings,
+                fatal_error="telegram_session_missing",
+                failure_class="auth",
+                last_error="telegram_session_missing: create an authorized Pyrogram session or use telegram_public_fallback",
+            )
+        if not _is_authorized_telegram_session(session_file):
+            log.error("Telegram session is present but unauthorized; refusing interactive Pyrogram authorization")
+            return _record_telegram_runtime_failure(
+                settings,
+                fatal_error="telegram_session_unauthorized",
+                failure_class="auth",
+                last_error="telegram_session_unauthorized: session exists but has no user_id/bot marker",
+            )
+
     conn = get_db(settings)
     channels = conn.execute(
         """
@@ -649,31 +736,48 @@ async def run_collect(settings: dict = None):
         workdir=str(session_dir),
     )
 
-    async with app:
-        conn = get_db(settings)
-        try:
-            total = 0
-            for ch in channels:
-                n = await collect_channel(app, ch["url"], ch["id"], conn, settings, limit=limit)
-                total += n
-            log.info("Total collected: %d", total)
+    try:
+        async with app:
+            conn = get_db(settings)
+            try:
+                total = 0
+                for ch in channels:
+                    n = await collect_channel(app, ch["url"], ch["id"], conn, settings, limit=limit)
+                    total += n
+                log.info("Total collected: %d", total)
 
-            media_stats = await download_media_batch(app, conn, settings)
-            warnings = []
-            if media_stats.get("failed"):
-                warnings.append(f"telegram_media_failed:{media_stats['failed']}")
-            return {
-                "ok": True,
-                "items_seen": len(channels),
-                "items_new": total,
-                "items_updated": int(media_stats.get("downloaded") or 0),
-                "channels": len(channels),
-                "media_failed": int(media_stats.get("failed") or 0),
-                "warnings": warnings,
-            }
-        finally:
-            conn.commit()
-            conn.close()
+                media_stats = await download_media_batch(app, conn, settings)
+                warnings = []
+                if media_stats.get("failed"):
+                    warnings.append(f"telegram_media_failed:{media_stats['failed']}")
+                return {
+                    "ok": True,
+                    "items_seen": len(channels),
+                    "items_new": total,
+                    "items_updated": int(media_stats.get("downloaded") or 0),
+                    "channels": len(channels),
+                    "media_failed": int(media_stats.get("failed") or 0),
+                    "warnings": warnings,
+                }
+            finally:
+                conn.commit()
+                conn.close()
+    except EOFError:
+        return _record_telegram_runtime_failure(
+            settings,
+            fatal_error="telegram_session_missing",
+            failure_class="auth",
+            last_error="EOFError: Pyrogram requested interactive authorization in non-interactive runtime",
+        )
+    except Exception as error:
+        if "The api_id/api_hash combination is invalid" in str(error):
+            return _record_telegram_runtime_failure(
+                settings,
+                fatal_error="telegram_auth_invalid",
+                failure_class="auth",
+                last_error=f"{type(error).__name__}: {error}",
+            )
+        raise
 
 
 def main():

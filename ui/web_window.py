@@ -192,6 +192,27 @@ class WebDashboardWindow(QMainWindow):
         self.bridge.emit_bootstrap()
         self._update_statusbar()
 
+    def start_247(self):
+        job_id = "start247"
+        if job_id in self._workers:
+            self._append_log("24/7 уже запускается", level="warning")
+            return
+        worker = WorkerThread(
+            job_id,
+            [
+                sys.executable,
+                "-m",
+                "runtime.start247",
+            ],
+            self,
+        )
+        worker.finished_signal.connect(self._on_job_finished)
+        self._workers[job_id] = worker
+        self._append_log("Запуск 24/7-конвейера", level="info")
+        worker.start()
+        self.bridge.emit_bootstrap()
+        self._update_statusbar()
+
     def stop_job(self, job_id: str):
         worker = self._workers.get(job_id)
         if worker and worker.isRunning():
@@ -298,7 +319,25 @@ class WebDashboardWindow(QMainWindow):
         except json.JSONDecodeError:
             data = {}
         if success and data.get("ok", True):
-            if job_id == "ai_full_sweep":
+            if job_id == "start247":
+                daemon_status = (data.get("daemon") or {}).get("status") or "unknown"
+                catchup_status = (data.get("catchup") or {}).get("status") or "unknown"
+                active_sessions = int(((data.get("telegram") or {}).get("import") or {}).get("active_count") or 0)
+                self._append_log(
+                    f"24/7 включён · daemon {daemon_status} · catchup {catchup_status} · TG sessions {active_sessions}",
+                    level="success",
+                )
+                QMessageBox.information(
+                    self,
+                    "24/7",
+                    (
+                        "24/7-конвейер включён.\n\n"
+                        f"Daemon: {daemon_status}\n"
+                        f"Первичный сбор: {catchup_status}\n"
+                        f"Активных Telegram-сессий: {active_sessions}"
+                    ),
+                )
+            elif job_id == "ai_full_sweep":
                 completed_units = int(data.get("completed_units") or 0)
                 items_seen = int(data.get("items_seen") or 0)
                 attempts = int(data.get("attempts") or 0)
@@ -315,14 +354,33 @@ class WebDashboardWindow(QMainWindow):
                         f"Параллельных workers: {workers}"
                     ),
                 )
+            elif job_id == "collect_catchup":
+                items_seen = int(data.get("items_seen") or 0)
+                items_new = int(data.get("items_new") or 0)
+                items_updated = int(data.get("items_updated") or 0)
+                self._append_log(
+                    f"Сбор новых данных завершён · seen {items_seen} · new {items_new} · updated {items_updated}",
+                    level="success",
+                )
+                QMessageBox.information(
+                    self,
+                    "Сбор новых данных",
+                    (
+                        "Сбор новых данных завершён.\n\n"
+                        f"Проверено: {items_seen}\n"
+                        f"Новых: {items_new}\n"
+                        f"Обновлено: {items_updated}"
+                    ),
+                )
             else:
                 suffix = f" · new {data.get('items_new')}" if data.get("items_new") else ""
                 self._append_log(f"Задача завершена: {job_id}{suffix}", level="success")
         else:
             message = error[:260] if error else (payload[:260] if payload else f"Ошибка {job_id}")
-            if job_id == "ai_full_sweep":
-                self._append_log(f"Ошибка AI Sweep: {message}", level="error")
-                QMessageBox.critical(self, "AI Sweep", message)
+            if job_id in {"ai_full_sweep", "collect_catchup", "start247"}:
+                title = "AI Sweep" if job_id == "ai_full_sweep" else "24/7" if job_id == "start247" else "Сбор новых данных"
+                self._append_log(f"Ошибка {title}: {message}", level="error")
+                QMessageBox.critical(self, title, message)
             else:
                 self._append_log(f"Ошибка {job_id}: {message}", level="error")
         self.bridge.emit_bootstrap()

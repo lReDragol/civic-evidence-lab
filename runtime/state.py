@@ -576,9 +576,14 @@ def update_source_sync_state(
             resolved_state = "degraded"
         elif success is False:
             resolved_state = "warning"
-    resolved_quality_state = quality_state or (existing[2] if existing and existing[2] else None)
-    resolved_quality_issue = quality_issue if quality_issue is not None else (existing[3] if existing and existing[3] else None)
-    resolved_failure_class = failure_class or (existing[4] if existing and existing[4] else None)
+    if success is True:
+        resolved_quality_state = quality_state or "ok"
+        resolved_quality_issue = quality_issue
+        resolved_failure_class = failure_class
+    else:
+        resolved_quality_state = quality_state or (existing[2] if existing and existing[2] else None)
+        resolved_quality_issue = quality_issue if quality_issue is not None else (existing[3] if existing and existing[3] else None)
+        resolved_failure_class = failure_class or (existing[4] if existing and existing[4] else None)
     if resolved_quality_state is None:
         resolved_quality_state = "ok" if success is True else "degraded" if resolved_state == "degraded" else "warning" if resolved_state == "warning" else "unknown"
 
@@ -593,8 +598,8 @@ def update_source_sync_state(
             source_id=COALESCE(excluded.source_id, source_sync_state.source_id),
             state=COALESCE(excluded.state, source_sync_state.state),
             quality_state=COALESCE(excluded.quality_state, source_sync_state.quality_state),
-            quality_issue=COALESCE(excluded.quality_issue, source_sync_state.quality_issue),
-            failure_class=COALESCE(excluded.failure_class, source_sync_state.failure_class),
+            quality_issue=CASE WHEN excluded.state='ok' THEN excluded.quality_issue ELSE COALESCE(excluded.quality_issue, source_sync_state.quality_issue) END,
+            failure_class=CASE WHEN excluded.state='ok' THEN excluded.failure_class ELSE COALESCE(excluded.failure_class, source_sync_state.failure_class) END,
             last_success_at=COALESCE(excluded.last_success_at, source_sync_state.last_success_at),
             last_attempt_at=excluded.last_attempt_at,
             consecutive_failures=excluded.consecutive_failures,

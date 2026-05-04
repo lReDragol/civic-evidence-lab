@@ -1,5 +1,7 @@
 import logging
+import json
 import os
+import re
 import sqlite3
 import sys
 from pathlib import Path
@@ -250,6 +252,186 @@ def ocr_pdf(pdf_path: str, settings: dict = None) -> str:
         return ""
 
 
+def _document_identifiers_from_text(text: str) -> dict:
+    normalized = " ".join(str(text or "").split())
+    issuer = None
+    if re.search(r"роскомнадзор|\bркн\b", normalized, flags=re.IGNORECASE | re.UNICODE):
+        issuer = "Роскомнадзор"
+    elif re.search(r"минцифры|министерств[ао] цифров", normalized, flags=re.IGNORECASE | re.UNICODE):
+        issuer = "Минцифры"
+    recipient_match = re.search(
+        r"(?:на|кому|адресат|министру)\s+([А-ЯЁ][А-Яа-яЁё.\-\s]{3,80})",
+        normalized,
+        flags=re.IGNORECASE | re.UNICODE,
+    )
+    return {
+        "dates": list(dict.fromkeys(re.findall(r"\b\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\b", normalized)))[:10],
+        "numbers": list(dict.fromkeys(re.findall(r"№\s*[\wА-Яа-яЁё./-]+", normalized)))[:10],
+        "laws": list(dict.fromkeys(re.findall(r"\b\d{1,3}\s*-\s*ФЗ\b|ст\.\s*\d+(?:\.\d+)?", normalized, flags=re.IGNORECASE | re.UNICODE)))[:10],
+        "issuer": issuer,
+        "recipient_hint": " ".join(recipient_match.group(1).split())[:120] if recipient_match else None,
+        "organizations": [
+            name
+            for name, pattern in (
+                ("Роскомнадзор", r"роскомнадзор|\bркн\b"),
+                ("Минцифры", r"минцифры|министерств[ао] цифров"),
+                ("Государственная Дума", r"госдум|государственн\w+\s+дум"),
+            )
+            if re.search(pattern, normalized, flags=re.IGNORECASE | re.UNICODE)
+        ],
+    }
+
+
+def _file_sha256(path: str | None) -> str | None:
+    if not path:
+        return None
+    try:
+        import hashlib
+
+        hasher = hashlib.sha256()
+        with open(path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                hasher.update(chunk)
+        return hasher.hexdigest()
+    except Exception:
+        return None
+
+
+def _image_average_hash(path: str | None) -> str | None:
+    if not path:
+        return None
+    try:
+        from PIL import Image
+
+        image = Image.open(path).convert("L").resize((8, 8))
+        pixels = list(image.getdata())
+        avg = sum(pixels) / len(pixels)
+        bits = "".join("1" if pixel >= avg else "0" for pixel in pixels)
+        return f"{int(bits, 2):016x}"
+    except Exception:
+        return None
+
+
+def _image_exif_keys(path: str | None) -> list[str]:
+    if not path:
+        return []
+    try:
+        from PIL import Image, ExifTags
+
+        image = Image.open(path)
+        exif = image.getexif()
+        keys = []
+        for key in exif.keys():
+            keys.append(str(ExifTags.TAGS.get(key, key)))
+        return sorted(set(keys))[:40]
+    except Exception:
+        return []
+
+
+def _has_c2pa_marker(path: str | None) -> bool:
+    if not path:
+        return False
+    try:
+        with open(path, "rb") as handle:
+            data = handle.read(2 * 1024 * 1024).lower()
+        return b"c2pa" in data or b"content credentials" in data or b"contentcredentials" in data
+    except Exception:
+        return False
+
+
+def _document_provenance_signals(*, file_path: str | None, attachment_row: sqlite3.Row | None = None) -> dict:
+    attachment_row = attachment_row or {}
+    mime_type = None
+    file_size = None
+    hash_sha256 = None
+    try:
+        mime_type = attachment_row["mime_type"]
+        file_size = attachment_row["file_size"]
+        hash_sha256 = attachment_row["hash_sha256"]
+    except Exception:
+        pass
+    return {
+        "attachment_hash": hash_sha256,
+        "computed_sha256": _file_sha256(file_path),
+        "average_hash": _image_average_hash(file_path),
+        "mime_type": mime_type,
+        "file_size": file_size,
+        "exif_keys": _image_exif_keys(file_path),
+        "c2pa_marker_present": _has_c2pa_marker(file_path),
+    }
+
+
+def _update_document_review_after_ocr(
+    conn: sqlite3.Connection,
+    *,
+    content_id: int,
+    text: str,
+    file_path: str | None = None,
+    attachment_row: sqlite3.Row | None = None,
+) -> None:
+    if not text or not str(text).strip():
+        return
+    rows = conn.execute(
+        """
+        SELECT id, candidate_payload
+        FROM review_tasks
+        WHERE queue_key='documents'
+          AND subject_type='content_item'
+          AND subject_id=?
+          AND status='open'
+        """,
+        (int(content_id),),
+    ).fetchall()
+    if not rows:
+        return
+    excerpt = " ".join(str(text).split())[:1200]
+    identifiers = _document_identifiers_from_text(text)
+    for row in rows:
+        try:
+            payload = json.loads(row["candidate_payload"] or "{}")
+            if not isinstance(payload, dict):
+                payload = {}
+        except Exception:
+            payload = {}
+        payload.update(
+            {
+                "ocr_status": "ready",
+                "ocr_excerpt": excerpt,
+                "ocr_length": len(str(text)),
+                "document_identifiers": identifiers,
+                "verification_stage": "official_source_search",
+                "authenticity_status": "needs_review",
+                "authenticity_verdict": "needs_review",
+                "official_search_candidates": payload.get("official_search_candidates") or [],
+                "text_compare_score": payload.get("text_compare_score"),
+                "provenance_signals": _document_provenance_signals(
+                    file_path=file_path,
+                    attachment_row=attachment_row,
+                ),
+                "authenticity_next_steps": [
+                    "search official source by document number/date/issuer",
+                    "compare OCR text with official publication or archive copy",
+                    "mark verdict confirmed/likely/disputed/fake/needs_review",
+                ],
+            }
+        )
+        conn.execute(
+            """
+            UPDATE review_tasks
+            SET candidate_payload=?,
+                suggested_action='official_source_search',
+                machine_reason=?,
+                updated_at=datetime('now')
+            WHERE id=?
+            """,
+            (
+                json.dumps(payload, ensure_ascii=False),
+                "OCR extracted text and document identifiers; official-source search is required before authenticity verdict.",
+                int(row["id"]),
+            ),
+        )
+
+
 def process_unprocessed_ocr(settings: dict = None):
     if settings is None:
         settings = load_settings()
@@ -259,7 +441,7 @@ def process_unprocessed_ocr(settings: dict = None):
 
     rows = conn.execute(
         """
-        SELECT a.id, a.file_path, a.attachment_type, a.ocr_text, a.hash_sha256, c.id as content_id, c.source_id
+        SELECT a.id, a.file_path, a.attachment_type, a.ocr_text, a.hash_sha256, a.file_size, a.mime_type, c.id as content_id, c.source_id
         FROM attachments a
         JOIN content_items c ON c.id = a.content_item_id
         LEFT JOIN review_tasks rt
@@ -345,6 +527,7 @@ def process_unprocessed_ocr(settings: dict = None):
             if text:
                 conn.execute("UPDATE content_items SET body_text=? WHERE id=?", (text, content_id))
                 conn.execute("UPDATE attachments SET ocr_text=? WHERE id=?", (text, att_id))
+                _update_document_review_after_ocr(conn, content_id=content_id, text=text, file_path=file_path, attachment_row=row)
                 text_updates += 1
         elif att_type in ("keyframe", "scan", "photo"):
             text, error_message = _ocr_image_with_error(file_path, ocr_settings)
@@ -384,6 +567,7 @@ def process_unprocessed_ocr(settings: dict = None):
                 continue
             if text:
                 conn.execute("UPDATE attachments SET ocr_text=? WHERE id=?", (text, att_id))
+                _update_document_review_after_ocr(conn, content_id=content_id, text=text, file_path=file_path, attachment_row=row)
                 text_updates += 1
 
         processed += 1

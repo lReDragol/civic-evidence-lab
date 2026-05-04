@@ -45,8 +45,6 @@ def _daemon_scheduler(settings: dict[str, Any], daemon_owner: str) -> Background
     for spec in JOB_SPECS:
         if not spec.scheduled:
             continue
-        if spec.stage in {"graph", "cases", "snapshot", "export"}:
-            continue
         if spec.stage == "maintenance" and spec.id != "backup":
             continue
         interval_seconds = interval_for_job(settings, spec.id)

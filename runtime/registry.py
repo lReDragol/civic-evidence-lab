@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
@@ -34,6 +36,14 @@ def _telegram(settings: dict[str, Any]):
     return __import__("asyncio").run(
         __import__("collectors.telegram_collector", fromlist=["run_collect"]).run_collect(settings)
     )
+
+
+def _telegram_public_fallback(settings: dict[str, Any]):
+    return __import__("collectors.telegram_public_fallback", fromlist=["collect_public_fallback"]).collect_public_fallback(settings)
+
+
+def _telegram_telethon_pool(settings: dict[str, Any]):
+    return __import__("collectors.telegram_telethon_collector", fromlist=["collect_telegram_pool"]).collect_telegram_pool(settings)
 
 
 def _youtube(settings: dict[str, Any]):
@@ -82,6 +92,98 @@ def _gov(settings: dict[str, Any]):
 
 def _votes(settings: dict[str, Any]):
     return __import__("collectors.vote_scraper", fromlist=["collect_votes"]).collect_votes(pages=3, fetch_details=True)
+
+
+def _enqueue_vote_source_review(settings: dict[str, Any], primary: dict[str, Any], fallback_result: Any) -> None:
+    conn = get_db(settings)
+    try:
+        payload = {
+            "source_key": "votes",
+            "primary_errors": list(primary.get("retriable_errors") or primary.get("fatal_errors") or primary.get("warnings") or [])[:5],
+            "fallback_result": fallback_result,
+            "failure_class": "timeout" if any("timeout" in str(item).lower() for item in (primary.get("retriable_errors") or [])) else "unresolved",
+            "required_actions": [
+                "Check vote.duma.gov.ru live availability",
+                "Add SOZD/API token path if available",
+                "Attach archive/fixture sample for parser smoke",
+            ],
+        }
+        conn.execute(
+            """
+            INSERT INTO review_tasks(
+                task_key, queue_key, subject_type, subject_id, candidate_payload,
+                suggested_action, confidence, machine_reason, source_links_json, status, updated_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,'open',?)
+            ON CONFLICT(task_key) DO UPDATE SET
+                candidate_payload=excluded.candidate_payload,
+                suggested_action=excluded.suggested_action,
+                machine_reason=excluded.machine_reason,
+                source_links_json=excluded.source_links_json,
+                updated_at=excluded.updated_at,
+                status='open'
+            """,
+            (
+                "source:votes:fallback_unresolved",
+                "sources",
+                "source",
+                None,
+                json.dumps(payload, ensure_ascii=False),
+                "add_vote_archive_or_fixture",
+                0.95,
+                "Duma vote live listing failed and fallback did not produce vote rows.",
+                json.dumps(["https://vote.duma.gov.ru/", "https://sozd.duma.gov.ru/"], ensure_ascii=False),
+                datetime.now().isoformat(),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _duma_votes_2y(settings: dict[str, Any]):
+    module = __import__("collectors.vote_scraper", fromlist=["collect_votes_last_years"])
+    years = int(settings.get("duma_votes_recent_years", 2) or 2)
+    max_pages = int(settings.get("duma_votes_recent_max_pages", 180) or 180)
+    primary = module.collect_votes_last_years(settings, years=years, max_pages=max_pages)
+    if primary.get("ok") or int(primary.get("items_new") or 0) or int(primary.get("items_updated") or 0):
+        return primary
+    if not settings.get("duma_votes_enable_bill_fallback", True):
+        return primary
+
+    fallback_result = None
+    try:
+        fallback = __import__("collectors.duma_votes_scraper", fromlist=["collect_votes_for_bills"])
+        fallback_result = fallback.collect_votes_for_bills(
+            settings,
+            bill_limit=int(settings.get("duma_votes_fallback_bill_limit", 50) or 50),
+            use_api=bool(settings.get("duma_api_token")),
+            fetch_details=True,
+        )
+    except Exception as error:
+        retriable = list(primary.get("retriable_errors") or [])
+        retriable.append(f"duma_votes_fallback_failed:{type(error).__name__}:{error}")
+        primary["retriable_errors"] = retriable
+        primary.setdefault("warnings", []).append("duma_votes_fallback_failed")
+        return primary
+
+    fallback_items = int(fallback_result.get("total_votes") or fallback_result.get("items_new") or 0) if isinstance(fallback_result, dict) else 0
+    merged = dict(primary)
+    merged.setdefault("warnings", [])
+    merged["warnings"] = list(primary.get("warnings") or []) + ["fallback_used:sozd_or_api"]
+    merged.setdefault("artifacts", {})
+    merged["artifacts"] = dict(primary.get("artifacts") or {})
+    merged["artifacts"]["fallback"] = fallback_result
+    merged["items_updated"] = int(primary.get("items_updated") or 0) + fallback_items
+    if fallback_items > 0:
+        merged["ok"] = True
+        merged["retriable_errors"] = []
+    else:
+        _enqueue_vote_source_review(settings, primary, fallback_result)
+    return merged
+
+
+def _collect_catchup(settings: dict[str, Any]):
+    return __import__("runtime.catchup", fromlist=["run_collect_catchup"]).run_collect_catchup(settings)
 
 
 def _deputies(settings: dict[str, Any]):
@@ -494,6 +596,8 @@ def _maintenance(settings: dict[str, Any]):
 JOB_SPECS = [
     JobSpec("watch_folder", "Inbox-сканер", "Сбор", 60, "watch_folder_interval_seconds", "collect", timeout_seconds=180, runner=_watch_folder),
     JobSpec("telegram", "Telegram", "Сбор", 300, "telegram_collect_interval_seconds", "collect", timeout_seconds=1800, source_keys=("telegram",), runner=_telegram),
+    JobSpec("telegram_telethon_pool", "Telegram session pool", "Сбор", 300, "telegram_telethon_pool_interval_seconds", "collect", timeout_seconds=1800, source_keys=("telegram",), runner=_telegram_telethon_pool),
+    JobSpec("telegram_public_fallback", "Telegram public fallback", "Сбор", 300, "telegram_public_fallback_interval_seconds", "collect", timeout_seconds=1800, source_keys=("telegram",), runner=_telegram_public_fallback),
     JobSpec("youtube", "YouTube", "Сбор", 86400, "youtube_interval_seconds", "collect", timeout_seconds=3600, source_keys=("youtube",), runner=_youtube),
     JobSpec("rss", "RSS/СМИ", "Сбор", 3600, "rss_interval_seconds", "collect", timeout_seconds=1800, source_keys=("rss",), runner=_rss),
     JobSpec("official", "Офиц. реестры", "Сбор", 86400, "official_interval_seconds", "collect", timeout_seconds=3600, source_keys=("official",), runner=_official),
@@ -503,6 +607,7 @@ JOB_SPECS = [
     JobSpec("zakupki", "Госзакупки", "Сбор", 86400, "zakupki_interval_seconds", "collect", timeout_seconds=3600, source_keys=("zakupki",), runner=_zakupki),
     JobSpec("gov", "Кремль/Правительство", "Сбор", 86400, "gov_interval_seconds", "collect", timeout_seconds=3600, source_keys=("kremlin", "government"), runner=_gov),
     JobSpec("votes", "Голосования Думы", "Сбор", 86400, "votes_interval_seconds", "collect", timeout_seconds=3600, source_keys=("votes",), runner=_votes),
+    JobSpec("duma_votes_2y", "Голосования ГД 2 года", "Сбор", 86400, "duma_votes_recent_interval_seconds", "collect", timeout_seconds=21600, source_keys=("votes",), scheduled=False, runner=_duma_votes_2y),
     JobSpec("deputies", "Депутаты ГД", "Сбор", 604800, "deputies_interval_seconds", "collect", timeout_seconds=5400, source_keys=("deputies",), runner=_deputies),
     JobSpec("senators", "Сенаторы", "Сбор", 604800, "senators_interval_seconds", "collect", timeout_seconds=3600, source_keys=("senators",), runner=_senators),
     JobSpec("fas_ach_sk", "ФАС/Счётная/СК", "Сбор", 86400, "fas_ach_sk_interval_seconds", "collect", timeout_seconds=3600, source_keys=("fas", "ach", "sk"), runner=_fas_ach_sk),
@@ -550,6 +655,7 @@ JOB_SPECS = [
     JobSpec("obsidian_export", "Obsidian graph export", "Система", 86400, "obsidian_export_interval_seconds", "export", timeout_seconds=10800, scheduled=False, runner=_obsidian_export),
     JobSpec("backup", "Бэкап БД", "Система", 86400, "backup_interval_seconds", "maintenance", timeout_seconds=3600, runner=_backup),
     JobSpec("maintenance", "DB maintenance", "Система", 604800, "maintenance_interval_seconds", "maintenance", timeout_seconds=3600, visible=False, runner=_maintenance),
+    JobSpec("collect_catchup", "Сбор новых данных", "Сбор", 86400, "collect_catchup_interval_seconds", "collect", timeout_seconds=43200, source_keys=("collect_catchup",), scheduled=False, runner=_collect_catchup),
 ]
 
 JOB_BY_ID = {spec.id: spec for spec in JOB_SPECS}
@@ -575,6 +681,8 @@ PIPELINE_JOB_IDS = {
     "incremental": [
         "watch_folder",
         "telegram",
+        "telegram_telethon_pool",
+        "telegram_public_fallback",
         "youtube",
         "rss",
         "official",
