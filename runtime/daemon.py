@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import threading
 import time
@@ -26,6 +27,10 @@ from runtime.state import (
     set_runtime_metadata,
     now_iso,
 )
+
+
+log = logging.getLogger(__name__)
+DAEMON_LEASE_TTL_SECONDS = 180
 
 
 def _daemon_owner() -> str:
@@ -86,13 +91,17 @@ def _daemon_scheduler(settings: dict[str, Any], daemon_owner: str) -> Background
 
 def _daemon_heartbeat(stop_event: threading.Event, settings: dict[str, Any], owner: str):
     while not stop_event.wait(10):
-        conn = get_db(settings)
+        conn = None
         try:
-            heartbeat_job_lease(conn, DAEMON_JOB_ID, owner, ttl_seconds=45)
+            conn = get_db(settings)
+            heartbeat_job_lease(conn, DAEMON_JOB_ID, owner, ttl_seconds=DAEMON_LEASE_TTL_SECONDS)
             set_runtime_metadata(conn, "daemon_owner", owner)
             set_runtime_metadata(conn, "daemon_last_seen_at", now_iso())
+        except Exception as error:
+            log.warning("Daemon heartbeat skipped: %s: %s", type(error).__name__, error)
         finally:
-            conn.close()
+            if conn is not None:
+                conn.close()
 
 
 def run_daemon(settings: dict[str, Any] | None = None, *, no_preflight: bool = False) -> dict[str, Any]:
@@ -107,7 +116,7 @@ def run_daemon(settings: dict[str, Any] | None = None, *, no_preflight: bool = F
             conn,
             DAEMON_JOB_ID,
             daemon_owner,
-            ttl_seconds=45,
+            ttl_seconds=DAEMON_LEASE_TTL_SECONDS,
             payload={"pid": os.getpid()},
         ):
             lease = active_job_lease(conn, DAEMON_JOB_ID)

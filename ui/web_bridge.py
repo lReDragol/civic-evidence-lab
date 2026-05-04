@@ -4,6 +4,7 @@ import json
 import re
 import sqlite3
 from collections import defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +43,21 @@ CLAIM_STATUS_PRIORITY = {
     "unverified": 1,
     "draft": 0,
 }
+
+
+def _iso_is_future(value: str | None) -> bool:
+    if not value:
+        return False
+    raw = str(value).strip().rstrip("Z")
+    if not raw:
+        return False
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return False
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed > datetime.now(timezone.utc).replace(tzinfo=None)
 LOW_SIGNAL_CLAIMS = {
     "заявил",
     "сказал",
@@ -413,7 +429,7 @@ class DashboardDataService:
                 LIMIT 1
                 """
             ).fetchone()
-            daemon_running = daemon_lease is not None
+            daemon_running = daemon_lease is not None and _iso_is_future(daemon_lease["expires_at"])
         running_jobs = []
         if self._table_exists("job_leases"):
             running_jobs = [
@@ -427,6 +443,7 @@ class DashboardDataService:
                     LIMIT 40
                     """
                 ).fetchall()
+                if _iso_is_future(row["expires_at"])
             ]
 
         telegram_sessions = []

@@ -72,3 +72,20 @@ class Ops247PayloadTests(unittest.TestCase):
             self.assertEqual(payload["ai"]["keys"]["active"], 2)
             self.assertEqual(payload["ai"]["failure_kinds"]["timeout"], 1)
             self.assertTrue(any(log["level"] == "error" for log in payload["logs"]))
+
+    def test_ops247_payload_treats_expired_daemon_lease_as_not_running(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "ops.db"
+            create_db(db_path)
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            try:
+                conn.execute(
+                    "UPDATE job_leases SET expires_at='2000-01-01T00:00:00' WHERE job_id='__daemon__'"
+                )
+                conn.commit()
+                payload = DashboardDataService(conn, {}).screen_payload("ops247")
+            finally:
+                conn.close()
+
+            self.assertFalse(payload["runtime"]["daemon_running"])
