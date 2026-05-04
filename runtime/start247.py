@@ -75,9 +75,10 @@ def ensure_247(
         else:
             autostart = {"ok": True, "install_mode": "skipped"}
 
+        autostart_mode = str(autostart.get("install_mode") or ("ok" if autostart.get("ok") else "autostart_failed"))
         set_runtime_metadata(conn, "mode_247_enabled", "True")
         set_runtime_metadata(conn, "mode_247_last_started_at", __import__("runtime.state", fromlist=["now_iso"]).now_iso())
-        set_runtime_metadata(conn, "mode_247_autostart_status", "ok" if autostart.get("ok") else "autostart_failed")
+        set_runtime_metadata(conn, "mode_247_autostart_status", autostart_mode)
         set_runtime_metadata(conn, "mode_247_last_result", {"autostart": autostart, "telegram": telegram_import})
 
         daemon_lease = _active_lease(conn, DAEMON_JOB_ID)
@@ -145,4 +146,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

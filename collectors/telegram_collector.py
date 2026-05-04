@@ -21,13 +21,33 @@ from runtime.state import record_dead_letter, update_source_sync_state
 
 log = logging.getLogger(__name__)
 
-try:
-    from pyrogram import Client
-    from pyrogram.types import Message
+Client = None
+HAVE_PYROGRAM = None
+
+
+def _ensure_thread_event_loop() -> None:
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+
+
+def _load_pyrogram_client():
+    global Client, HAVE_PYROGRAM
+    if Client is not None:
+        return Client
+    if HAVE_PYROGRAM is False:
+        return None
+    try:
+        _ensure_thread_event_loop()
+        from pyrogram import Client as PyrogramClient
+    except ImportError:
+        HAVE_PYROGRAM = False
+        log.error("pyrogram not installed")
+        return None
+    Client = PyrogramClient
     HAVE_PYROGRAM = True
-except ImportError:
-    HAVE_PYROGRAM = False
-    log.error("pyrogram not installed")
+    return Client
 
 
 RUSSIA_CONTEXT_PATTERNS = [
@@ -363,6 +383,52 @@ def _record_telegram_runtime_failure(
     }
 
 
+def _telethon_pool_is_active(settings: dict) -> bool:
+    conn = get_db(settings)
+    try:
+        row = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM telegram_sessions
+            WHERE client_type='telethon'
+              AND status='active'
+            """
+        ).fetchone()
+        return bool(row and int(row[0] or 0) > 0)
+    except Exception:
+        return False
+    finally:
+        conn.close()
+
+
+def _skip_legacy_runtime_failure(settings: dict, warning: str) -> dict:
+    log.warning("%s", warning)
+    conn = get_db(settings)
+    try:
+        update_source_sync_state(
+            conn,
+            source_key="telegram",
+            success=True,
+            state="warning",
+            transport_mode="pyrogram",
+            quality_state="warning",
+            quality_issue=warning,
+            last_error=warning,
+            failure_class=None,
+            metadata={"skipped": True, "reason": warning},
+        )
+    finally:
+        conn.close()
+    return {
+        "ok": True,
+        "items_seen": 0,
+        "items_new": 0,
+        "items_updated": 0,
+        "warnings": [warning],
+        "artifacts": {"skipped": True, "reason": warning},
+    }
+
+
 def _load_telegram_cursor(conn: sqlite3.Connection, source_id: int) -> int:
     row = conn.execute(
         "SELECT last_external_id FROM source_sync_state WHERE source_key=? LIMIT 1",
@@ -670,7 +736,8 @@ async def run_collect(settings: dict = None):
     if settings is None:
         settings = load_settings()
 
-    if not HAVE_PYROGRAM:
+    pyrogram_client = _load_pyrogram_client()
+    if not pyrogram_client:
         log.error("Pyrogram not available")
         return {"ok": False, "fatal_errors": ["pyrogram_not_available"]}
 
@@ -697,6 +764,11 @@ async def run_collect(settings: dict = None):
         session_file = _existing_telegram_session_file(session_dir, session_path)
         if not session_file:
             log.error("Telegram session is missing; refusing to start interactive Pyrogram authorization")
+            if _telethon_pool_is_active(settings):
+                return _skip_legacy_runtime_failure(
+                    settings,
+                    "telegram_legacy_skipped:telethon_pool_active:session_missing",
+                )
             return _record_telegram_runtime_failure(
                 settings,
                 fatal_error="telegram_session_missing",
@@ -705,6 +777,11 @@ async def run_collect(settings: dict = None):
             )
         if not _is_authorized_telegram_session(session_file):
             log.error("Telegram session is present but unauthorized; refusing interactive Pyrogram authorization")
+            if _telethon_pool_is_active(settings):
+                return _skip_legacy_runtime_failure(
+                    settings,
+                    "telegram_legacy_skipped:telethon_pool_active:session_unauthorized",
+                )
             return _record_telegram_runtime_failure(
                 settings,
                 fatal_error="telegram_session_unauthorized",
@@ -729,7 +806,7 @@ async def run_collect(settings: dict = None):
 
     limit = settings.get("telegram_posts_per_channel", 100)
 
-    app = Client(
+    app = pyrogram_client(
         str(session_path),
         api_id=int(api_id),
         api_hash=str(api_hash),

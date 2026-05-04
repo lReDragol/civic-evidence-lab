@@ -402,12 +402,18 @@ class DashboardDataService:
         }
 
     def ops247_payload(self) -> dict[str, Any]:
-        daemon_running = bool(
-            self._table_exists("job_leases")
-            and self.db.execute(
-                "SELECT COUNT(*) FROM job_leases WHERE job_id='__daemon__'"
-            ).fetchone()[0]
-        )
+        daemon_lease = None
+        daemon_running = False
+        if self._table_exists("job_leases"):
+            daemon_lease = self.db.execute(
+                """
+                SELECT job_id, lease_owner, started_at, heartbeat_at, expires_at
+                FROM job_leases
+                WHERE job_id='__daemon__'
+                LIMIT 1
+                """
+            ).fetchone()
+            daemon_running = daemon_lease is not None
         running_jobs = []
         if self._table_exists("job_leases"):
             running_jobs = [
@@ -536,7 +542,7 @@ class DashboardDataService:
                 "enabled": str(self._runtime_metadata("mode_247_enabled") or "").lower() in {"true", "1", "yes"},
                 "autostart_status": self._runtime_metadata("mode_247_autostart_status") or "unknown",
                 "daemon_running": daemon_running,
-                "last_heartbeat": self._runtime_metadata("daemon_last_seen_at"),
+                "last_heartbeat": self._runtime_metadata("daemon_last_seen_at") or (daemon_lease["heartbeat_at"] if daemon_lease else None),
                 "last_catchup": self._runtime_metadata("last_collect_catchup_finished_at"),
                 "running_jobs": running_jobs,
             },

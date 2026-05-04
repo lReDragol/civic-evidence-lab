@@ -66,6 +66,7 @@ class Ops247PayloadTests(unittest.TestCase):
 
             self.assertTrue(payload["runtime"]["enabled"])
             self.assertTrue(payload["runtime"]["daemon_running"])
+            self.assertEqual(payload["runtime"]["last_heartbeat"], "2026-05-03T10:00:00")
             self.assertEqual(payload["telegram"]["active_sessions"], 1)
             self.assertEqual(payload["telegram"]["failed_sessions"], 1)
             self.assertEqual(payload["ai"]["keys"]["active"], 2)

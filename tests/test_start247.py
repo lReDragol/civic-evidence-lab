@@ -41,7 +41,7 @@ class Start247Tests(unittest.TestCase):
             conn = get_db(settings)
             try:
                 self.assertEqual(get_runtime_metadata(conn, "mode_247_enabled"), "True")
-                self.assertEqual(get_runtime_metadata(conn, "mode_247_autostart_status"), "ok")
+                self.assertEqual(get_runtime_metadata(conn, "mode_247_autostart_status"), "task_scheduler")
             finally:
                 conn.close()
 
@@ -73,4 +73,3 @@ class Start247Tests(unittest.TestCase):
             spawn.assert_not_called()
             self.assertFalse(result["daemon"]["started"])
             self.assertEqual(result["daemon"]["status"], "already_running")
-

@@ -467,6 +467,83 @@ class IngestRuntimeStateTests(unittest.TestCase):
             self.assertIn("telegram_session_unauthorized", result["fatal_errors"])
             client.assert_not_called()
 
+    def test_telegram_run_collect_skips_legacy_pyrogram_when_telethon_pool_is_active(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            db_path = tmp_path / "news.db"
+            session_dir = tmp_path / "telegram-session"
+            session_dir.mkdir()
+            session_db = session_dir / "news_collector.session"
+            session_conn = sqlite3.connect(session_db)
+            try:
+                session_conn.execute(
+                    """
+                    CREATE TABLE sessions (
+                        dc_id INTEGER PRIMARY KEY,
+                        api_id INTEGER,
+                        test_mode INTEGER,
+                        auth_key BLOB,
+                        date INTEGER NOT NULL,
+                        user_id INTEGER,
+                        is_bot INTEGER
+                    )
+                    """
+                )
+                session_conn.execute(
+                    "INSERT INTO sessions(dc_id, api_id, test_mode, auth_key, date, user_id, is_bot) VALUES(2, 123, 0, ?, 0, NULL, NULL)",
+                    (b"auth-key",),
+                )
+                session_conn.commit()
+            finally:
+                session_conn.close()
+
+            create_db(db_path)
+            settings = {
+                "db_path": str(db_path),
+                "ensure_schema_on_connect": True,
+                "telegram_api_id": 123,
+                "telegram_api_hash": "hash",
+                "telegram_session_dir": str(session_dir),
+                "telegram_require_existing_session": True,
+            }
+            conn = get_db(settings)
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO sources(id, name, category, url, access_method, is_active)
+                    VALUES(1, 'YEP', 'telegram', 'https://t.me/yep_news', 'telegram', 1)
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO telegram_sessions(session_key, client_type, session_path, status, assigned_count)
+                    VALUES('232354072', 'telethon', 'config/telegram_test_sessions/232354072_telethon.session', 'active', 4)
+                    """
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            with patch.object(telegram_collector, "HAVE_PYROGRAM", True), patch.object(telegram_collector, "Client") as client:
+                result = asyncio.run(telegram_collector.run_collect(settings))
+
+            self.assertTrue(result["ok"])
+            self.assertIn("telethon_pool_active", " ".join(result.get("warnings") or []))
+            client.assert_not_called()
+
+            conn = get_db(settings)
+            try:
+                state = conn.execute(
+                    "SELECT state, failure_class, transport_mode, last_error FROM source_sync_state WHERE source_key='telegram'"
+                ).fetchone()
+            finally:
+                conn.close()
+
+            self.assertEqual(state["state"], "warning")
+            self.assertIsNone(state["failure_class"])
+            self.assertEqual(state["transport_mode"], "pyrogram")
+            self.assertIn("telethon_pool_active", state["last_error"])
+
     def test_ocr_missing_file_records_dead_letter_and_source_state(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
