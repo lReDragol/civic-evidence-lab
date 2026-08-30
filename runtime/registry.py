@@ -7,6 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
+from config.constants import DAY, HOUR, MINUTE, WEEK
 from config.db_utils import PROJECT_ROOT, get_db, load_settings
 from graph.relation_candidates import rebuild_and_promote_relation_candidates
 
@@ -19,12 +20,13 @@ class JobSpec:
     default_interval: int
     interval_key: str | None
     stage: str
-    timeout_seconds: int = 3600
+    timeout_seconds: int = HOUR
     retry_limit: int = 3
-    retry_backoff_seconds: int = 60
+    retry_backoff_seconds: int = MINUTE
     scheduled: bool = True
     visible: bool = True
     source_keys: tuple[str, ...] = ()
+    depends_on: tuple[str, ...] = ()
     runner: Callable[[dict[str, Any]], Any] | None = None
 
 
@@ -321,6 +323,18 @@ def _content_dedupe(settings: dict[str, Any]):
     return __import__("enrichment.content_dedupe", fromlist=["run_content_dedupe"]).run_content_dedupe(settings)
 
 
+def _garbage_filter_llm(settings: dict[str, Any]):
+    return __import__("classifier.garbage_filter", fromlist=["run_llm_garbage_filter"]).run_llm_garbage_filter(settings)
+
+
+def _agent_search(settings: dict[str, Any]):
+    return __import__("ner.agent_search", fromlist=["run_agent_search"]).run_agent_search(settings)
+
+
+def _metrics_collector(settings: dict[str, Any]):
+    return __import__("runtime.metrics_collector", fromlist=["run_metrics_collector"]).run_metrics_collector(settings)
+
+
 def _review_pack_export(settings: dict[str, Any]):
     module = __import__("enrichment.review_packs", fromlist=["export_review_pack"])
     export_dir = Path(settings.get("review_export_dir", str(PROJECT_ROOT / "reports" / "review_packs")))
@@ -574,7 +588,7 @@ def _build_analysis_snapshot(settings: dict[str, Any]):
 
 def _obsidian_export(settings: dict[str, Any]):
     module = __import__("tools.export_obsidian", fromlist=["export_obsidian"])
-    db_path = Path(settings.get("analysis_db_path", str(PROJECT_ROOT / "db" / "news_analysis.db")))
+    db_path = Path(settings.get("db_path", str(PROJECT_ROOT / "db" / "news_unified.db")))
     vault = Path(settings.get("obsidian_export_dir", str(PROJECT_ROOT / "obsidian_export_graph")))
     return module.export_obsidian(db_path=db_path, vault=vault, copy_media=True, mode="graph")
 
@@ -594,68 +608,71 @@ def _maintenance(settings: dict[str, Any]):
 
 
 JOB_SPECS = [
-    JobSpec("watch_folder", "Inbox-сканер", "Сбор", 60, "watch_folder_interval_seconds", "collect", timeout_seconds=180, runner=_watch_folder),
-    JobSpec("telegram", "Telegram", "Сбор", 300, "telegram_collect_interval_seconds", "collect", timeout_seconds=1800, source_keys=("telegram",), runner=_telegram),
-    JobSpec("telegram_telethon_pool", "Telegram session pool", "Сбор", 300, "telegram_telethon_pool_interval_seconds", "collect", timeout_seconds=1800, source_keys=("telegram",), runner=_telegram_telethon_pool),
-    JobSpec("telegram_public_fallback", "Telegram public fallback", "Сбор", 300, "telegram_public_fallback_interval_seconds", "collect", timeout_seconds=1800, source_keys=("telegram",), runner=_telegram_public_fallback),
-    JobSpec("youtube", "YouTube", "Сбор", 86400, "youtube_interval_seconds", "collect", timeout_seconds=3600, source_keys=("youtube",), runner=_youtube),
-    JobSpec("rss", "RSS/СМИ", "Сбор", 3600, "rss_interval_seconds", "collect", timeout_seconds=1800, source_keys=("rss",), runner=_rss),
-    JobSpec("official", "Офиц. реестры", "Сбор", 86400, "official_interval_seconds", "collect", timeout_seconds=3600, source_keys=("official",), runner=_official),
-    JobSpec("playwright_official", "Офиц. JS-сайты", "Сбор", 86400, "playwright_interval_seconds", "collect", timeout_seconds=3600, source_keys=("playwright_official",), runner=_playwright_official),
-    JobSpec("duma_bills", "Законопроекты Думы", "Сбор", 86400, "duma_bills_interval_seconds", "collect", timeout_seconds=3600, source_keys=("duma_bills",), runner=_duma_bills),
-    JobSpec("minjust", "Минюст (иноагенты)", "Сбор", 86400, "minjust_interval_seconds", "collect", timeout_seconds=3600, source_keys=("minjust",), runner=_minjust),
-    JobSpec("zakupki", "Госзакупки", "Сбор", 86400, "zakupki_interval_seconds", "collect", timeout_seconds=3600, source_keys=("zakupki",), runner=_zakupki),
-    JobSpec("gov", "Кремль/Правительство", "Сбор", 86400, "gov_interval_seconds", "collect", timeout_seconds=3600, source_keys=("kremlin", "government"), runner=_gov),
-    JobSpec("votes", "Голосования Думы", "Сбор", 86400, "votes_interval_seconds", "collect", timeout_seconds=3600, source_keys=("votes",), runner=_votes),
-    JobSpec("duma_votes_2y", "Голосования ГД 2 года", "Сбор", 86400, "duma_votes_recent_interval_seconds", "collect", timeout_seconds=21600, source_keys=("votes",), scheduled=False, runner=_duma_votes_2y),
-    JobSpec("deputies", "Депутаты ГД", "Сбор", 604800, "deputies_interval_seconds", "collect", timeout_seconds=5400, source_keys=("deputies",), runner=_deputies),
-    JobSpec("senators", "Сенаторы", "Сбор", 604800, "senators_interval_seconds", "collect", timeout_seconds=3600, source_keys=("senators",), runner=_senators),
-    JobSpec("fas_ach_sk", "ФАС/Счётная/СК", "Сбор", 86400, "fas_ach_sk_interval_seconds", "collect", timeout_seconds=3600, source_keys=("fas", "ach", "sk"), runner=_fas_ach_sk),
-    JobSpec("executive_directory", "Руководство органов", "Сбор", 604800, "executive_directory_interval_seconds", "collect", timeout_seconds=3600, source_keys=("executive_directory",), runner=_executive_directory),
-    JobSpec("profiles_enrichment", "Profiles enrichment", "Обогащение", 604800, "profiles_enrichment_interval_seconds", "enrichment", timeout_seconds=7200, runner=_profiles_enrichment),
-    JobSpec("photo_backfill", "Photo backfill", "Обогащение", 86400, "photo_backfill_interval_seconds", "enrichment", timeout_seconds=7200, runner=_photo_backfill),
-    JobSpec("anticorruption_disclosures", "Декларации/доходы", "Обогащение", 86400, "anticorruption_disclosures_interval_seconds", "enrichment", timeout_seconds=10800, runner=_anticorruption_disclosures),
-    JobSpec("company_registry_enrichment", "Бизнес/аффилиации", "Обогащение", 86400, "company_registry_enrichment_interval_seconds", "enrichment", timeout_seconds=10800, runner=_company_registry_enrichment),
-    JobSpec("state_company_reports", "Госкомпании/отчёты", "Обогащение", 604800, "state_company_reports_interval_seconds", "enrichment", timeout_seconds=10800, runner=_state_company_reports),
-    JobSpec("restriction_corpus", "Ограничения/оправдания", "Обогащение", 86400, "restriction_corpus_interval_seconds", "enrichment", timeout_seconds=7200, runner=_restriction_corpus),
-    JobSpec("content_dedupe", "Контент dedupe", "Обогащение", 43200, "content_dedupe_interval_seconds", "enrichment", timeout_seconds=7200, runner=_content_dedupe),
-    JobSpec("review_pack_export", "Review pack export", "Обогащение", 86400, "review_pack_export_interval_seconds", "enrichment", timeout_seconds=3600, scheduled=False, runner=_review_pack_export),
-    JobSpec("review_pack_import", "Review pack import", "Обогащение", 86400, "review_pack_import_interval_seconds", "enrichment", timeout_seconds=3600, scheduled=False, runner=_review_pack_import),
-    JobSpec("source_health", "Source health", "Система", 1800, "source_health_interval_seconds", "health", timeout_seconds=600, source_keys=("source_health",), runner=_source_health),
-    JobSpec("tagger", "Classifier v3", "Анализ", 21600, "classification_interval_seconds", "analysis", timeout_seconds=3600, runner=_tagger),
-    JobSpec("llm", "LLM-классификатор", "Анализ", 43200, "llm_interval_seconds", "analysis", timeout_seconds=7200, scheduled=False, visible=False, runner=_llm),
-    JobSpec("semantic_index", "Semantic index", "Анализ", 43200, "semantic_index_interval_seconds", "analysis", timeout_seconds=7200, runner=_semantic_index),
-    JobSpec("event_pipeline", "Event pipeline", "Анализ", 43200, "event_pipeline_interval_seconds", "analysis", timeout_seconds=7200, runner=_event_pipeline),
-    JobSpec("ai_full_sweep", "AI Sweep", "AI", 86400, "ai_full_sweep_interval_seconds", "ai", timeout_seconds=43200, scheduled=False, runner=_ai_full_sweep),
-    JobSpec("ai_sweep_doctor", "AI Sweep doctor", "AI", 86400, "ai_sweep_doctor_interval_seconds", "ai", timeout_seconds=600, scheduled=False, runner=_ai_sweep_doctor),
-    JobSpec("ai_sweep_maintenance", "AI Sweep maintenance", "AI", 86400, "ai_sweep_maintenance_interval_seconds", "ai", timeout_seconds=1800, scheduled=False, visible=False, runner=_ai_sweep_maintenance),
-    JobSpec("asr", "ASR (Whisper)", "Медиа", 3600, None, "media", timeout_seconds=7200, runner=_asr),
-    JobSpec("ocr", "OCR (PaddleOCR)", "Медиа", 3600, None, "media", timeout_seconds=7200, runner=_ocr),
-    JobSpec("ner", "NER (Natasha)", "Анализ", 7200, "ner_interval_seconds", "analysis", timeout_seconds=3600, runner=_ner),
-    JobSpec("entity_resolve", "Разрешение сущностей", "Анализ", 43200, "entity_resolve_interval_seconds", "analysis", timeout_seconds=3600, runner=_entity_resolve),
-    JobSpec("quotes", "Извлечение цитат", "Анализ", 7200, "quotes_interval_seconds", "analysis", timeout_seconds=3600, runner=_quotes),
-    JobSpec("claims", "Заявления/верификация", "Анализ", 21600, "claims_interval_seconds", "verification", timeout_seconds=7200, runner=_claims),
-    JobSpec("claim_cluster", "Claim clustering", "Анализ", 43200, "claim_cluster_interval_seconds", "verification", timeout_seconds=7200, runner=_claim_cluster),
-    JobSpec("evidence_link", "Привязка свидетельств", "Анализ", 43200, "evidence_link_interval_seconds", "verification", timeout_seconds=7200, runner=_evidence_link),
-    JobSpec("negation", "Негация/опровержения", "Анализ", 43200, "negation_interval_seconds", "analysis", timeout_seconds=3600, runner=_negation),
-    JobSpec("authenticity", "Модель подлинности", "Верификация", 86400, "authenticity_interval_seconds", "verification", timeout_seconds=7200, runner=_authenticity),
-    JobSpec("structural_links", "Структурные связи", "Аналитика", 86400, "structural_links_interval_seconds", "graph", timeout_seconds=3600, runner=_structural_links),
-    JobSpec("entity_relation_builder", "Построение связей", "Аналитика", 86400, "entity_relation_builder_interval_seconds", "graph", timeout_seconds=3600, runner=_entity_relation_builder),
-    JobSpec("l4_tags", "L4 аналитические теги", "Анализ", 43200, "l4_tags_interval_seconds", "analysis", timeout_seconds=3600, runner=_l4_tags),
-    JobSpec("re_verifier", "Повторная верификация", "Верификация", 43200, "re_verifier_interval_seconds", "verification", timeout_seconds=7200, runner=_re_verifier),
-    JobSpec("contradiction_detector", "Детекция противоречий", "Верификация", 86400, "contradiction_detector_interval_seconds", "verification", timeout_seconds=3600, runner=_contradiction_detector),
-    JobSpec("cases", "Построение дел", "Дела", 86400, "cases_interval_seconds", "cases", timeout_seconds=3600, runner=_cases),
-    JobSpec("accountability", "Индекс подотчётности", "Дела", 86400, "accountability_interval_seconds", "cases", timeout_seconds=3600, runner=_accountability),
-    JobSpec("risk_patterns", "Детекция рисков", "Дела", 86400, "risk_interval_seconds", "cases", timeout_seconds=3600, runner=_risk_patterns),
-    JobSpec("relations", "Связи сущностей", "Анализ", 86400, "relations_interval_seconds", "graph", timeout_seconds=3600, runner=_relations),
-    JobSpec("relation_rebuild_enriched", "Enriched relation rebuild", "Обогащение", 86400, "relation_rebuild_enriched_interval_seconds", "graph", timeout_seconds=7200, runner=_relation_rebuild_enriched),
-    JobSpec("classifier_audit", "Classifier audit / drift gate", "Система", 86400, "classifier_audit_interval_seconds", "quality", timeout_seconds=3600, scheduled=False, runner=_classifier_audit),
-    JobSpec("quality_gate", "QA quality gate", "Система", 86400, "quality_gate_interval_seconds", "quality", timeout_seconds=3600, scheduled=False, runner=_quality_gate),
-    JobSpec("analysis_snapshot", "Analysis snapshot", "Система", 86400, "analysis_snapshot_interval_seconds", "snapshot", timeout_seconds=10800, scheduled=False, runner=_build_analysis_snapshot),
-    JobSpec("obsidian_export", "Obsidian graph export", "Система", 86400, "obsidian_export_interval_seconds", "export", timeout_seconds=10800, scheduled=False, runner=_obsidian_export),
-    JobSpec("backup", "Бэкап БД", "Система", 86400, "backup_interval_seconds", "maintenance", timeout_seconds=3600, runner=_backup),
-    JobSpec("maintenance", "DB maintenance", "Система", 604800, "maintenance_interval_seconds", "maintenance", timeout_seconds=3600, visible=False, runner=_maintenance),
-    JobSpec("collect_catchup", "Сбор новых данных", "Сбор", 86400, "collect_catchup_interval_seconds", "collect", timeout_seconds=43200, source_keys=("collect_catchup",), scheduled=False, runner=_collect_catchup),
+    JobSpec("watch_folder", "Inbox-сканер", "Сбор", MINUTE, "watch_folder_interval_seconds", "collect", timeout_seconds=180, runner=_watch_folder),
+    JobSpec("telegram", "Telegram", "Сбор", 5 * MINUTE, "telegram_collect_interval_seconds", "collect", timeout_seconds=1800, source_keys=("telegram",), runner=_telegram),
+    JobSpec("telegram_telethon_pool", "Telegram session pool", "Сбор", 5 * MINUTE, "telegram_telethon_pool_interval_seconds", "collect", timeout_seconds=1800, source_keys=("telegram",), runner=_telegram_telethon_pool),
+    JobSpec("telegram_public_fallback", "Telegram public fallback", "Сбор", 5 * MINUTE, "telegram_public_fallback_interval_seconds", "collect", timeout_seconds=1800, source_keys=("telegram",), runner=_telegram_public_fallback),
+    JobSpec("youtube", "YouTube", "Сбор", DAY, "youtube_interval_seconds", "collect", timeout_seconds=HOUR, source_keys=("youtube",), runner=_youtube),
+    JobSpec("rss", "RSS/СМИ", "Сбор", HOUR, "rss_interval_seconds", "collect", timeout_seconds=1800, source_keys=("rss",), runner=_rss),
+    JobSpec("official", "Офиц. реестры", "Сбор", DAY, "official_interval_seconds", "collect", timeout_seconds=HOUR, source_keys=("official",), runner=_official),
+    JobSpec("playwright_official", "Офиц. JS-сайты", "Сбор", DAY, "playwright_interval_seconds", "collect", timeout_seconds=HOUR, source_keys=("playwright_official",), runner=_playwright_official),
+    JobSpec("duma_bills", "Законопроекты Думы", "Сбор", DAY, "duma_bills_interval_seconds", "collect", timeout_seconds=HOUR, source_keys=("duma_bills",), runner=_duma_bills),
+    JobSpec("minjust", "Минюст (иноагенты)", "Сбор", DAY, "minjust_interval_seconds", "collect", timeout_seconds=HOUR, source_keys=("minjust",), runner=_minjust),
+    JobSpec("zakupki", "Госзакупки", "Сбор", DAY, "zakupki_interval_seconds", "collect", timeout_seconds=HOUR, source_keys=("zakupki",), runner=_zakupki),
+    JobSpec("gov", "Кремль/Правительство", "Сбор", DAY, "gov_interval_seconds", "collect", timeout_seconds=HOUR, source_keys=("kremlin", "government"), runner=_gov),
+    JobSpec("votes", "Голосования Думы", "Сбор", DAY, "votes_interval_seconds", "collect", timeout_seconds=HOUR, source_keys=("votes",), runner=_votes),
+    JobSpec("duma_votes_2y", "Голосования ГД 2 года", "Сбор", DAY, "duma_votes_recent_interval_seconds", "collect", timeout_seconds=6 * HOUR, source_keys=("votes",), scheduled=False, runner=_duma_votes_2y),
+    JobSpec("deputies", "Депутаты ГД", "Сбор", WEEK, "deputies_interval_seconds", "collect", timeout_seconds=5400, source_keys=("deputies",), runner=_deputies),
+    JobSpec("senators", "Сенаторы", "Сбор", WEEK, "senators_interval_seconds", "collect", timeout_seconds=HOUR, source_keys=("senators",), runner=_senators),
+    JobSpec("fas_ach_sk", "ФАС/Счётная/СК", "Сбор", DAY, "fas_ach_sk_interval_seconds", "collect", timeout_seconds=HOUR, source_keys=("fas", "ach", "sk"), runner=_fas_ach_sk),
+    JobSpec("executive_directory", "Руководство органов", "Сбор", WEEK, "executive_directory_interval_seconds", "collect", timeout_seconds=HOUR, source_keys=("executive_directory",), runner=_executive_directory),
+    JobSpec("profiles_enrichment", "Profiles enrichment", "Обогащение", WEEK, "profiles_enrichment_interval_seconds", "enrichment", timeout_seconds=2 * HOUR, runner=_profiles_enrichment),
+    JobSpec("photo_backfill", "Photo backfill", "Обогащение", DAY, "photo_backfill_interval_seconds", "enrichment", timeout_seconds=2 * HOUR, runner=_photo_backfill),
+    JobSpec("anticorruption_disclosures", "Декларации/доходы", "Обогащение", DAY, "anticorruption_disclosures_interval_seconds", "enrichment", timeout_seconds=3 * HOUR, runner=_anticorruption_disclosures),
+    JobSpec("company_registry_enrichment", "Бизнес/аффилиации", "Обогащение", DAY, "company_registry_enrichment_interval_seconds", "enrichment", timeout_seconds=3 * HOUR, runner=_company_registry_enrichment),
+    JobSpec("state_company_reports", "Госкомпании/отчёты", "Обогащение", WEEK, "state_company_reports_interval_seconds", "enrichment", timeout_seconds=3 * HOUR, runner=_state_company_reports),
+    JobSpec("restriction_corpus", "Ограничения/оправдания", "Обогащение", DAY, "restriction_corpus_interval_seconds", "enrichment", timeout_seconds=2 * HOUR, runner=_restriction_corpus),
+    JobSpec("content_dedupe", "Контент dedupe", "Обогащение", 12 * HOUR, "content_dedupe_interval_seconds", "enrichment", timeout_seconds=2 * HOUR, runner=_content_dedupe),
+    JobSpec("garbage_filter_llm", "Мусор-фильтр (LLM)", "Обогащение", 6 * HOUR, "garbage_filter_llm_interval_seconds", "enrichment", timeout_seconds=2 * HOUR, runner=_garbage_filter_llm),
+    JobSpec("agent_search", "Agent search (NER→online)", "Обогащение", 12 * HOUR, "agent_search_interval_seconds", "enrichment", timeout_seconds=2 * HOUR, depends_on=("ner",), runner=_agent_search),
+    JobSpec("metrics_collector", "Metrics snapshot", "Система", 5 * MINUTE, "metrics_collector_interval_seconds", "monitoring", timeout_seconds=MINUTE, visible=False, runner=_metrics_collector),
+    JobSpec("review_pack_export", "Review pack export", "Обогащение", DAY, "review_pack_export_interval_seconds", "enrichment", timeout_seconds=HOUR, scheduled=False, runner=_review_pack_export),
+    JobSpec("review_pack_import", "Review pack import", "Обогащение", DAY, "review_pack_import_interval_seconds", "enrichment", timeout_seconds=HOUR, scheduled=False, runner=_review_pack_import),
+    JobSpec("source_health", "Source health", "Система", 30 * MINUTE, "source_health_interval_seconds", "health", timeout_seconds=10 * MINUTE, source_keys=("source_health",), runner=_source_health),
+    JobSpec("tagger", "Classifier v3", "Анализ", 6 * HOUR, "classification_interval_seconds", "analysis", timeout_seconds=HOUR, runner=_tagger),
+    JobSpec("llm", "LLM-классификатор", "Анализ", 12 * HOUR, "llm_interval_seconds", "analysis", timeout_seconds=2 * HOUR, scheduled=True, runner=_llm),
+    JobSpec("semantic_index", "Semantic index", "Анализ", 12 * HOUR, "semantic_index_interval_seconds", "analysis", timeout_seconds=2 * HOUR, depends_on=("tagger",), runner=_semantic_index),
+    JobSpec("event_pipeline", "Event pipeline", "Анализ", 12 * HOUR, "event_pipeline_interval_seconds", "analysis", timeout_seconds=2 * HOUR, depends_on=("ner", "tagger"), runner=_event_pipeline),
+    JobSpec("ai_full_sweep", "AI Sweep", "AI", 12 * HOUR, "ai_full_sweep_interval_seconds", "ai", timeout_seconds=12 * HOUR, scheduled=False, depends_on=("ner", "tagger", "claims"), runner=_ai_full_sweep),
+    JobSpec("ai_sweep_doctor", "AI Sweep doctor", "AI", DAY, "ai_sweep_doctor_interval_seconds", "ai", timeout_seconds=10 * MINUTE, scheduled=False, runner=_ai_sweep_doctor),
+    JobSpec("ai_sweep_maintenance", "AI Sweep maintenance", "AI", DAY, "ai_sweep_maintenance_interval_seconds", "ai", timeout_seconds=30 * MINUTE, scheduled=False, visible=False, runner=_ai_sweep_maintenance),
+    JobSpec("asr", "ASR (Whisper)", "Медиа", HOUR, None, "media", timeout_seconds=2 * HOUR, runner=_asr),
+    JobSpec("ocr", "OCR (PaddleOCR)", "Медиа", HOUR, None, "media", timeout_seconds=2 * HOUR, runner=_ocr),
+    JobSpec("ner", "NER (Natasha)", "Анализ", 2 * HOUR, "ner_interval_seconds", "analysis", timeout_seconds=HOUR, depends_on=("tagger",), runner=_ner),
+    JobSpec("entity_resolve", "Разрешение сущностей", "Анализ", 12 * HOUR, "entity_resolve_interval_seconds", "analysis", timeout_seconds=HOUR, depends_on=("ner",), runner=_entity_resolve),
+    JobSpec("quotes", "Извлечение цитат", "Анализ", 2 * HOUR, "quotes_interval_seconds", "analysis", timeout_seconds=HOUR, depends_on=("ner",), runner=_quotes),
+    JobSpec("claims", "Заявления/верификация", "Анализ", 6 * HOUR, "claims_interval_seconds", "verification", timeout_seconds=2 * HOUR, depends_on=("ner",), runner=_claims),
+    JobSpec("claim_cluster", "Claim clustering", "Анализ", 12 * HOUR, "claim_cluster_interval_seconds", "verification", timeout_seconds=2 * HOUR, depends_on=("claims",), runner=_claim_cluster),
+    JobSpec("evidence_link", "Привязка свидетельств", "Анализ", 12 * HOUR, "evidence_link_interval_seconds", "verification", timeout_seconds=2 * HOUR, depends_on=("claims",), runner=_evidence_link),
+    JobSpec("negation", "Негация/опровержения", "Анализ", 12 * HOUR, "negation_interval_seconds", "analysis", timeout_seconds=HOUR, depends_on=("claims",), runner=_negation),
+    JobSpec("authenticity", "Модель подлинности", "Верификация", DAY, "authenticity_interval_seconds", "verification", timeout_seconds=2 * HOUR, depends_on=("claims",), runner=_authenticity),
+    JobSpec("structural_links", "Структурные связи", "Аналитика", DAY, "structural_links_interval_seconds", "graph", timeout_seconds=HOUR, depends_on=("entity_resolve",), runner=_structural_links),
+    JobSpec("entity_relation_builder", "Построение связей", "Аналитика", DAY, "entity_relation_builder_interval_seconds", "graph", timeout_seconds=HOUR, depends_on=("structural_links",), runner=_entity_relation_builder),
+    JobSpec("l4_tags", "L4 аналитические теги", "Анализ", 12 * HOUR, "l4_tags_interval_seconds", "analysis", timeout_seconds=HOUR, depends_on=("tagger", "ner"), runner=_l4_tags),
+    JobSpec("re_verifier", "Повторная верификация", "Верификация", 12 * HOUR, "re_verifier_interval_seconds", "verification", timeout_seconds=2 * HOUR, depends_on=("claims",), runner=_re_verifier),
+    JobSpec("contradiction_detector", "Детекция противоречий", "Верификация", DAY, "contradiction_detector_interval_seconds", "verification", timeout_seconds=HOUR, depends_on=("claims",), runner=_contradiction_detector),
+    JobSpec("cases", "Построение дел", "Дела", DAY, "cases_interval_seconds", "cases", timeout_seconds=HOUR, depends_on=("claims", "structural_links"), runner=_cases),
+    JobSpec("accountability", "Индекс подотчётности", "Дела", DAY, "accountability_interval_seconds", "cases", timeout_seconds=HOUR, depends_on=("cases",), runner=_accountability),
+    JobSpec("risk_patterns", "Детекция рисков", "Дела", DAY, "risk_interval_seconds", "cases", timeout_seconds=HOUR, depends_on=("cases",), runner=_risk_patterns),
+    JobSpec("relations", "Связи сущностей", "Анализ", DAY, "relations_interval_seconds", "graph", timeout_seconds=HOUR, depends_on=("entity_resolve", "structural_links"), runner=_relations),
+    JobSpec("relation_rebuild_enriched", "Enriched relation rebuild", "Обогащение", DAY, "relation_rebuild_enriched_interval_seconds", "graph", timeout_seconds=2 * HOUR, depends_on=("relations",), runner=_relation_rebuild_enriched),
+    JobSpec("classifier_audit", "Classifier audit / drift gate", "Система", DAY, "classifier_audit_interval_seconds", "quality", timeout_seconds=HOUR, scheduled=False, runner=_classifier_audit),
+    JobSpec("quality_gate", "QA quality gate", "Система", DAY, "quality_gate_interval_seconds", "quality", timeout_seconds=HOUR, scheduled=False, runner=_quality_gate),
+    JobSpec("analysis_snapshot", "Analysis snapshot", "Система", DAY, "analysis_snapshot_interval_seconds", "snapshot", timeout_seconds=3 * HOUR, scheduled=False, runner=_build_analysis_snapshot),
+    JobSpec("obsidian_export", "Obsidian graph export", "Система", DAY, "obsidian_export_interval_seconds", "export", timeout_seconds=3 * HOUR, scheduled=False, runner=_obsidian_export),
+    JobSpec("backup", "Бэкап БД", "Система", DAY, "backup_interval_seconds", "maintenance", timeout_seconds=HOUR, runner=_backup),
+    JobSpec("maintenance", "DB maintenance", "Система", WEEK, "maintenance_interval_seconds", "maintenance", timeout_seconds=HOUR, visible=False, runner=_maintenance),
+    JobSpec("collect_catchup", "Сбор новых данных", "Сбор", DAY, "collect_catchup_interval_seconds", "collect", timeout_seconds=12 * HOUR, source_keys=("collect_catchup",), scheduled=False, runner=_collect_catchup),
 ]
 
 JOB_BY_ID = {spec.id: spec for spec in JOB_SPECS}
@@ -698,10 +715,12 @@ PIPELINE_JOB_IDS = {
         "fas_ach_sk",
         "executive_directory",
         "content_dedupe",
+        "garbage_filter_llm",
         "asr",
         "ocr",
         "tagger",
         "ner",
+        "agent_search",
         "entity_resolve",
         "quotes",
         "claims",
@@ -713,6 +732,7 @@ PIPELINE_JOB_IDS = {
         "authenticity",
         "re_verifier",
         "contradiction_detector",
+        "metrics_collector",
     ],
     "nightly": [
         "source_health",
@@ -723,8 +743,10 @@ PIPELINE_JOB_IDS = {
         "state_company_reports",
         "restriction_corpus",
         "content_dedupe",
+        "garbage_filter_llm",
         "tagger",
         "ner",
+        "agent_search",
         "entity_resolve",
         "quotes",
         "claims",
@@ -817,6 +839,7 @@ def serialize_jobs(settings: dict[str, Any], running_jobs: set[str] | None = Non
                 "running": spec.id in running_jobs or bool(settings.get(f"job_{spec.id}_running", False)),
                 "stage": spec.stage,
                 "scheduled": spec.scheduled,
+                "depends_on": list(spec.depends_on),
             }
         )
     return items

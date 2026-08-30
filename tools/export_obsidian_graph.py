@@ -188,6 +188,12 @@ def table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
     return row is not None
 
 
+def column_exists(conn: sqlite3.Connection, table_name: str, column_name: str) -> bool:
+    if not table_exists(conn, table_name):
+        return False
+    return any(row["name"] == column_name for row in rows(conn, f"PRAGMA table_info({table_name})"))
+
+
 def copy_attachment(
     vault: Path,
     row: dict[str, Any],
@@ -647,11 +653,16 @@ def build_graph_context(conn: sqlite3.Connection) -> GraphContext:
 
     fact_rows = []
     if table_exists(conn, "event_facts"):
+        event_facts_alive_filter = (
+            "WHERE superseded_at IS NULL"
+            if column_exists(conn, "event_facts", "superseded_at")
+            else ""
+        )
         fact_rows = [
             dict(r)
             for r in rows(
                 conn,
-                "SELECT * FROM event_facts ORDER BY COALESCE(observed_at, recorded_at, id), id",
+                f"SELECT * FROM event_facts {event_facts_alive_filter} ORDER BY COALESCE(observed_at, recorded_at, id), id",
             )
         ]
 
@@ -1761,6 +1772,27 @@ def export_graph_entities(vault: Path, ctx: GraphContext):
 
 
 def export_graph_events(vault: Path, conn: sqlite3.Connection, ctx: GraphContext):
+    event_entities_alive_filter = (
+        "AND ee.superseded_at IS NULL"
+        if column_exists(conn, "event_entities", "superseded_at")
+        else ""
+    )
+    event_timeline_alive_filter = (
+        "AND superseded_at IS NULL"
+        if column_exists(conn, "event_timeline", "superseded_at")
+        else ""
+    )
+    event_facts_alive_filter = (
+        "AND superseded_at IS NULL"
+        if column_exists(conn, "event_facts", "superseded_at")
+        else ""
+    )
+    event_items_alive_filter = (
+        "AND ei.superseded_at IS NULL"
+        if column_exists(conn, "event_items", "superseded_at")
+        else ""
+    )
+
     index_lines = ["# Events", "", "| ID | Type | Date | Event |", "|---:|---|---|---|"]
     for event in ctx.event_rows:
         rel = ctx.event_paths[event["id"]]
@@ -1771,43 +1803,43 @@ def export_graph_events(vault: Path, conn: sqlite3.Connection, ctx: GraphContext
 
         entity_rows = rows(
             conn,
-            """
+            f"""
             SELECT ee.entity_id, ee.role, ee.confidence, e.canonical_name, e.entity_type
             FROM event_entities ee
             JOIN entities e ON e.id = ee.entity_id
-            WHERE ee.event_id=?
+            WHERE ee.event_id=? {event_entities_alive_filter}
             ORDER BY ee.role, e.canonical_name, ee.id
             """,
             (event["id"],),
         ) if table_exists(conn, "event_entities") else []
         timeline_rows = rows(
             conn,
-            """
+            f"""
             SELECT timeline_date, title, description, content_item_id, document_content_id, sort_order
             FROM event_timeline
-            WHERE event_id=?
+            WHERE event_id=? {event_timeline_alive_filter}
             ORDER BY sort_order, id
             """,
             (event["id"],),
         ) if table_exists(conn, "event_timeline") else []
         fact_rows = rows(
             conn,
-            """
+            f"""
             SELECT id, fact_type, canonical_text
             FROM event_facts
-            WHERE event_id=?
+            WHERE event_id=? {event_facts_alive_filter}
             ORDER BY id
             """,
             (event["id"],),
         ) if table_exists(conn, "event_facts") else []
         item_rows = rows(
             conn,
-            """
+            f"""
             SELECT ei.content_item_id, ei.item_role, ei.source_strength,
                    ci.title AS content_title, ci.content_type, ci.published_at
             FROM event_items ei
             LEFT JOIN content_items ci ON ci.id = ei.content_item_id
-            WHERE ei.event_id=?
+            WHERE ei.event_id=? {event_items_alive_filter}
             ORDER BY
                 CASE ei.item_role
                     WHEN 'origin' THEN 0
@@ -1893,6 +1925,12 @@ def export_graph_events(vault: Path, conn: sqlite3.Connection, ctx: GraphContext
 
 
 def export_graph_facts(vault: Path, conn: sqlite3.Connection, ctx: GraphContext):
+    fact_evidence_alive_filter = (
+        "AND superseded_at IS NULL"
+        if column_exists(conn, "fact_evidence", "superseded_at")
+        else ""
+    )
+
     index_lines = ["# Facts", "", "| ID | Type | Event | Fact |", "|---:|---|---|---|"]
     for fact in ctx.fact_rows:
         rel = ctx.fact_paths[fact["id"]]
@@ -1905,10 +1943,10 @@ def export_graph_facts(vault: Path, conn: sqlite3.Connection, ctx: GraphContext)
         )
         evidence_rows = rows(
             conn,
-            """
+            f"""
             SELECT *
             FROM fact_evidence
-            WHERE fact_id=?
+            WHERE fact_id=? {fact_evidence_alive_filter}
             ORDER BY id
             """,
             (fact["id"],),

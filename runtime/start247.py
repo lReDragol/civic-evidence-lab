@@ -39,6 +39,27 @@ def _active_lease(conn, job_id: str) -> dict[str, Any] | None:
         return None
 
 
+def _telegram_pool_snapshot(conn) -> dict[str, Any]:
+    try:
+        rows = conn.execute(
+            """
+            SELECT status, COUNT(*) AS count
+            FROM telegram_sessions
+            GROUP BY status
+            """
+        ).fetchall()
+    except Exception:
+        return {"active_count": 0, "failed_count": 0, "cooldown_count": 0, "sessions": []}
+    counts = {str(row[0] or "unknown"): int(row[1] or 0) for row in rows}
+    return {
+        "active_count": counts.get("active", 0),
+        "failed_count": counts.get("failed", 0),
+        "cooldown_count": counts.get("cooldown", 0),
+        "by_status": counts,
+        "sessions": [],
+    }
+
+
 def ensure_247(
     settings: dict[str, Any] | None = None,
     *,
@@ -49,14 +70,9 @@ def ensure_247(
 ) -> dict[str, Any]:
     settings = settings or load_settings()
     setup_logging(settings)
-    ensure_dirs(settings)
 
     conn = get_db(settings)
     try:
-        recovery = recover_abandoned_runs(conn)
-        telegram_import = import_telegram_sessions(conn, settings)
-        assignment = assign_telegram_sources(conn)
-
         autostart: dict[str, Any]
         if install_autostart:
             try:
@@ -75,15 +91,44 @@ def ensure_247(
         else:
             autostart = {"ok": True, "install_mode": "skipped"}
 
+        daemon_lease = _active_lease(conn, DAEMON_JOB_ID)
+        catchup_lease = _active_lease(conn, "collect_catchup")
+
+        if dry_run:
+            return {
+                "ok": True,
+                "dry_run": True,
+                "mode": "24/7",
+                "recovery": {"dry_run": True, "recovered": 0},
+                "autostart": autostart,
+                "telegram": {
+                    "import": {"dry_run": True, **_telegram_pool_snapshot(conn)},
+                    "assignment": {"dry_run": True, "assigned_sources": 0, "assignments": {}},
+                },
+                "daemon": {
+                    "started": False,
+                    "status": "already_running" if daemon_lease else "dry_run",
+                    "active_lease": daemon_lease,
+                },
+                "catchup": {
+                    "started": False,
+                    "status": "already_running" if catchup_lease else "dry_run",
+                    "active_lease": catchup_lease,
+                },
+            }
+
+        ensure_dirs(settings)
+        recovery = recover_abandoned_runs(conn)
+        telegram_import = import_telegram_sessions(conn, settings)
+        assignment = assign_telegram_sources(conn)
+
         autostart_mode = str(autostart.get("install_mode") or ("ok" if autostart.get("ok") else "autostart_failed"))
         set_runtime_metadata(conn, "mode_247_enabled", "True")
         set_runtime_metadata(conn, "mode_247_last_started_at", __import__("runtime.state", fromlist=["now_iso"]).now_iso())
         set_runtime_metadata(conn, "mode_247_autostart_status", autostart_mode)
         set_runtime_metadata(conn, "mode_247_last_result", {"autostart": autostart, "telegram": telegram_import})
 
-        daemon_lease = _active_lease(conn, DAEMON_JOB_ID)
         daemon = {"started": False, "status": "already_running" if daemon_lease else "skipped", "active_lease": daemon_lease}
-        catchup_lease = _active_lease(conn, "collect_catchup")
         catchup = {"started": False, "status": "already_running" if catchup_lease else "skipped", "active_lease": catchup_lease}
     finally:
         conn.close()

@@ -409,7 +409,9 @@ def process_claims_for_content(
         FROM content_items c
         JOIN sources s ON s.id = c.source_id
         WHERE (length(c.body_text) > 5 OR length(c.title) > 10)
-          AND COALESCE(c.status, '') != 'suppressed_template'
+          AND COALESCE(c.status, '') NOT IN ('suppressed_template', 'suppressed_garbage')
+          AND (c.claims_processed IS NULL OR c.claims_processed = 0)
+        ORDER BY c.id DESC
         LIMIT ?
         """,
         (content_limit,),
@@ -431,6 +433,7 @@ def process_claims_for_content(
 
         claims = extract_claims_from_text(text)
         if not claims:
+            conn.execute("UPDATE content_items SET claims_processed=1 WHERE id=?", (content_id,))
             continue
 
         for claim in claims:
@@ -473,6 +476,8 @@ def process_claims_for_content(
                 local_evidence_links += link_local_evidence_for_claim(conn, claim_id, claim["text"], content_id)
             except Exception as e:
                 log.warning("Failed to insert claim for item %d: %s", content_id, e)
+
+        conn.execute("UPDATE content_items SET claims_processed=1 WHERE id=?", (content_id,))
 
     conn.commit()
 
@@ -543,8 +548,15 @@ def process_claims_for_content(
                     except Exception:
                         pass
 
+        if evidence_found and local_links and external_checks and SITE_SEARCH_AVAILABLE:
+            conn.commit()
+            site_results = verify_claim_with_site_search(claim_id, claim_text, settings)
+
         if evidence_found:
-            conn.execute("UPDATE claims SET status='partially_confirmed', needs_review=1 WHERE id=?", (claim_id,))
+            if local_links and not external_checks:
+                conn.execute("UPDATE claims SET status='partially_confirmed', needs_review=1 WHERE id=?", (claim_id,))
+            else:
+                conn.execute("UPDATE claims SET status='confirmed', needs_review=0 WHERE id=?", (claim_id,))
             verified += 1
         else:
             if external_checks and SITE_SEARCH_AVAILABLE:

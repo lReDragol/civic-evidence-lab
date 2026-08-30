@@ -30,6 +30,7 @@ from .telegram_session_pool import (
     active_telegram_sessions,
     assign_telegram_sources,
     import_telegram_sessions,
+    mark_session_progress,
     mark_session_result,
 )
 
@@ -93,7 +94,15 @@ def _source_rows_for_session(conn, session_key: str, assignment_version: str) ->
     ).fetchall()
 
 
-async def _collect_source(client, source, conn, settings: dict[str, Any]) -> tuple[int, int]:
+async def _collect_source(
+    client,
+    source,
+    conn,
+    settings: dict[str, Any],
+    *,
+    session_key: str | None = None,
+    current_job_id: str = "telegram_telethon_pool",
+) -> tuple[int, int]:
     handle = _handle(source["url"])
     if not handle:
         return 0, 0
@@ -105,12 +114,36 @@ async def _collect_source(client, source, conn, settings: dict[str, Any]) -> tup
     storage_dir = Path(settings.get("processed_telegram", str(PROJECT_ROOT / "processed" / "telegram")))
     items_seen = 0
     items_new = 0
+    duplicates = 0
+    failed_items = 0
     max_external_id = offset_id
     last_hash = None
+    if session_key:
+        mark_session_progress(
+            conn,
+            session_key,
+            source_id=source_id,
+            channel=handle,
+            collecting_now=True,
+            current_job_id=current_job_id,
+        )
+        update_source_sync_state(
+            conn,
+            source_key=source_key,
+            source_id=source_id,
+            success=True,
+            is_collecting=True,
+            current_job_id=current_job_id,
+            current_channel=handle,
+            current_telegram_session=session_key,
+            transport_mode="telegram_telethon",
+            metadata={"handle": handle, "stage": "collecting"},
+        )
 
     try:
         entity = await client.get_entity(handle)
     except Exception as error:
+        failed_items += 1
         update_source_sync_state(
             conn,
             source_key=source_key,
@@ -119,8 +152,23 @@ async def _collect_source(client, source, conn, settings: dict[str, Any]) -> tup
             transport_mode="telegram_telethon",
             failure_class="resolve_failed",
             last_error=f"{type(error).__name__}: {error}",
+            is_collecting=False,
+            current_job_id=current_job_id,
+            current_channel=handle,
+            current_telegram_session=session_key,
+            failed_items_current_run=failed_items,
             metadata={"handle": handle},
         )
+        if session_key:
+            mark_session_progress(
+                conn,
+                session_key,
+                source_id=source_id,
+                channel=handle,
+                collecting_now=False,
+                current_job_id=current_job_id,
+                failed_delta=failed_items,
+            )
         return 0, 0
 
     async for msg in client.iter_messages(entity, limit=limit, min_id=offset_id):
@@ -133,6 +181,19 @@ async def _collect_source(client, source, conn, settings: dict[str, Any]) -> tup
             (source_id, ext_id),
         ).fetchone()
         if existing:
+            duplicates += 1
+            if session_key:
+                mark_session_progress(
+                    conn,
+                    session_key,
+                    source_id=source_id,
+                    channel=handle,
+                    collecting_now=True,
+                    current_job_id=current_job_id,
+                    last_message_id=ext_id,
+                    last_message_date=msg.date.isoformat() if getattr(msg, "date", None) else None,
+                    duplicate_delta=1,
+                )
             continue
 
         text = msg.message or ""
@@ -166,12 +227,13 @@ async def _collect_source(client, source, conn, settings: dict[str, Any]) -> tup
             (source_id, ext_id, raw_json, datetime.now().isoformat(), hash_sha),
         )
         title = (text.split("\n", 1)[0].strip() if text else f"Telegram post {ext_id}")[:200]
+        body_hash = hashlib.sha256(" ".join(text.split()).encode("utf-8")).hexdigest() if text.strip() else None
         content_cur = conn.execute(
             """
-            INSERT INTO content_items(source_id, raw_item_id, external_id, content_type, title, body_text, published_at, collected_at, url, status)
-            VALUES(?,?,?,?,?,?,?,?,?,'raw_signal')
+            INSERT INTO content_items(source_id, raw_item_id, external_id, content_type, title, body_text, body_hash, published_at, collected_at, url, status)
+            VALUES(?,?,?,?,?,?,?,?,?,?,'raw_signal')
             """,
-            (source_id, raw_cur.lastrowid, ext_id, "post", title, text, date_iso, datetime.now().isoformat(), public_url),
+            (source_id, raw_cur.lastrowid, ext_id, "post", title, text, body_hash, date_iso, datetime.now().isoformat(), public_url),
         )
         content_id = int(content_cur.lastrowid)
         _insert_relevance_votes(conn, content_id, relevance)
@@ -199,6 +261,18 @@ async def _collect_source(client, source, conn, settings: dict[str, Any]) -> tup
         items_new += 1
         max_external_id = max(max_external_id, int(msg.id))
         last_hash = hash_sha
+        if session_key:
+            mark_session_progress(
+                conn,
+                session_key,
+                source_id=source_id,
+                channel=handle,
+                collecting_now=True,
+                current_job_id=current_job_id,
+                last_message_id=ext_id,
+                last_message_date=date_iso,
+                collected_delta=1,
+            )
 
     update_source_sync_state(
         conn,
@@ -209,7 +283,14 @@ async def _collect_source(client, source, conn, settings: dict[str, Any]) -> tup
         last_external_id=str(max_external_id) if max_external_id else None,
         last_hash=last_hash,
         transport_mode="telegram_telethon",
-        metadata={"handle": handle, "items_seen": items_seen, "items_new": items_new},
+        is_collecting=False,
+        current_job_id=current_job_id,
+        current_channel=handle,
+        current_telegram_session=session_key,
+        items_current_run=items_new,
+        duplicates_current_run=duplicates,
+        failed_items_current_run=failed_items,
+        metadata={"handle": handle, "items_seen": items_seen, "items_new": items_new, "duplicates": duplicates},
     )
     return items_seen, items_new
 
@@ -250,11 +331,20 @@ async def _collect_with_sessions(settings: dict[str, Any]) -> dict[str, Any]:
                     )
                     warnings.append(f"{session_key}:unauthorized_session")
                     continue
+                session_items_new = 0
                 for source in source_rows:
-                    seen, new = await _collect_source(client, source, conn, settings)
+                    seen, new = await _collect_source(
+                        client,
+                        source,
+                        conn,
+                        settings,
+                        session_key=session_key,
+                        current_job_id="telegram_telethon_pool",
+                    )
                     items_seen += seen
                     items_new += new
-                mark_session_result(conn, session_key, success=True, metadata={"assigned": len(source_rows), "items_new": items_new})
+                    session_items_new += new
+                mark_session_result(conn, session_key, success=True, metadata={"assigned": len(source_rows), "items_new": session_items_new})
             except Exception as error:
                 failure_class = "runtime_error"
                 cooldown_until = None
@@ -311,4 +401,3 @@ def collect_telegram_pool(settings: dict[str, Any] | None = None) -> dict[str, A
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     print(json.dumps(collect_telegram_pool(), ensure_ascii=False, indent=2, default=str))
-

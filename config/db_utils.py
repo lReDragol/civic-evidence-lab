@@ -7,6 +7,8 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional
 
+from runtime.logging_context import LOG_CONTEXT_FIELDS, current_log_context
+
 log = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -18,6 +20,7 @@ SCHEMA_PATH = PROJECT_ROOT / "db" / "schema.sql"
 ADDITIVE_COLUMNS = {
     "content_items": {
         "classification_v3_processed": "INTEGER DEFAULT 0",
+        "body_hash": "TEXT",
     },
     "content_derivations": {
         "campaign_id": "INTEGER",
@@ -85,6 +88,15 @@ ADDITIVE_COLUMNS = {
         "quality_state": "TEXT DEFAULT 'unknown'",
         "quality_issue": "TEXT",
         "failure_class": "TEXT",
+        "current_job_id": "TEXT",
+        "is_collecting": "INTEGER DEFAULT 0",
+        "current_channel": "TEXT",
+        "current_telegram_session": "TEXT",
+        "items_current_run": "INTEGER DEFAULT 0",
+        "items_today": "INTEGER DEFAULT 0",
+        "duplicates_current_run": "INTEGER DEFAULT 0",
+        "failed_items_current_run": "INTEGER DEFAULT 0",
+        "heartbeat_at": "TEXT",
     },
     "bill_vote_sessions": {
         "external_vote_id": "TEXT",
@@ -131,6 +143,39 @@ ADDITIVE_COLUMNS = {
         "input_hash": "TEXT",
         "sample_bucket": "TEXT",
     },
+    "ai_task_attempts": {
+        "failure_kind": "TEXT",
+        "task_type": "TEXT",
+        "latency_ms": "INTEGER",
+        "tokens_in": "INTEGER",
+        "tokens_out": "INTEGER",
+        "estimated_cost": "REAL",
+        "current_item_key": "TEXT",
+    },
+    "job_runs": {
+        "heartbeat_at": "TEXT",
+        "duration_ms": "INTEGER",
+        "items_skipped": "INTEGER DEFAULT 0",
+        "items_failed": "INTEGER DEFAULT 0",
+        "duplicate_items": "INTEGER DEFAULT 0",
+        "warnings_count": "INTEGER DEFAULT 0",
+        "fatal_errors_count": "INTEGER DEFAULT 0",
+        "retriable_errors_count": "INTEGER DEFAULT 0",
+        "last_message": "TEXT",
+    },
+    "telegram_sessions": {
+        "current_job_id": "TEXT",
+        "current_source_id": "INTEGER",
+        "current_channel": "TEXT",
+        "collecting_now": "INTEGER DEFAULT 0",
+        "last_message_id": "TEXT",
+        "last_message_date": "TEXT",
+        "collected_current_run": "INTEGER DEFAULT 0",
+        "collected_today": "INTEGER DEFAULT 0",
+        "duplicates_skipped": "INTEGER DEFAULT 0",
+        "failed_items": "INTEGER DEFAULT 0",
+        "heartbeat_at": "TEXT",
+    },
     "event_candidates": {
         "campaign_id": "INTEGER",
         "work_item_id": "INTEGER",
@@ -138,12 +183,67 @@ ADDITIVE_COLUMNS = {
         "overlap_reasons_json": "TEXT",
         "candidate_event_context_json": "TEXT",
     },
-    "ai_task_attempts": {
-        "failure_kind": "TEXT",
+    "events": {
+        "event_key": "TEXT",
+        "superseded_at": "TEXT",
+    },
+    "event_items": {
+        "superseded_at": "TEXT",
+    },
+    "event_entities": {
+        "recorded_at": "TEXT",
+        "superseded_at": "TEXT",
+    },
+    "event_timeline": {
+        "superseded_at": "TEXT",
+    },
+    "fact_evidence": {
+        "superseded_at": "TEXT",
     },
 }
 
 ADDITIVE_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS runtime_events (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at      TEXT DEFAULT (datetime('now')),
+    level           TEXT NOT NULL DEFAULT 'info',
+    event_type      TEXT NOT NULL,
+    stage           TEXT,
+    job_id          TEXT,
+    job_run_id      INTEGER,
+    pipeline_run_id INTEGER,
+    source_key      TEXT,
+    source_type     TEXT,
+    telegram_session TEXT,
+    channel         TEXT,
+    provider        TEXT,
+    model           TEXT,
+    item_id         INTEGER,
+    raw_item_id     INTEGER,
+    content_item_id INTEGER,
+    message         TEXT,
+    error_type      TEXT,
+    traceback_text  TEXT,
+    payload_json    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_runtime_events_created ON runtime_events(created_at, event_type, level);
+CREATE INDEX IF NOT EXISTS idx_runtime_events_job ON runtime_events(job_id, job_run_id);
+CREATE INDEX IF NOT EXISTS idx_runtime_events_source ON runtime_events(source_key, created_at);
+CREATE INDEX IF NOT EXISTS idx_runtime_events_model ON runtime_events(provider, model, created_at);
+
+CREATE TABLE IF NOT EXISTS processing_skips (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at      TEXT DEFAULT (datetime('now')),
+    stage           TEXT NOT NULL,
+    reason          TEXT NOT NULL,
+    source_key      TEXT,
+    content_item_id INTEGER,
+    raw_item_id     INTEGER,
+    external_id     TEXT,
+    payload_json    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_processing_skips_stage ON processing_skips(stage, created_at);
+
 CREATE TABLE IF NOT EXISTS content_tag_votes (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     content_item_id INTEGER NOT NULL,
@@ -278,12 +378,18 @@ CREATE INDEX IF NOT EXISTS idx_ai_work_items_campaign ON ai_work_items(campaign_
 
 CREATE TABLE IF NOT EXISTS ai_task_attempts (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    work_item_id    INTEGER NOT NULL,
+    work_item_id    INTEGER,
     provider        TEXT,
     model_name      TEXT,
     llm_key_id      INTEGER,
     status          TEXT NOT NULL,
     failure_kind    TEXT,
+    task_type       TEXT,
+    latency_ms      INTEGER,
+    tokens_in       INTEGER,
+    tokens_out      INTEGER,
+    estimated_cost  REAL,
+    current_item_key TEXT,
     error_text      TEXT,
     output_json     TEXT,
     started_at      TEXT DEFAULT (datetime('now')),
@@ -724,6 +830,7 @@ CREATE INDEX IF NOT EXISTS idx_content_derivations_type ON content_derivations(d
 
 CREATE TABLE IF NOT EXISTS events (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_key       TEXT,
     canonical_title TEXT NOT NULL,
     event_type      TEXT,
     summary_short   TEXT,
@@ -736,9 +843,11 @@ CREATE TABLE IF NOT EXISTS events (
     importance_score REAL DEFAULT 0,
     confidence      REAL DEFAULT 0,
     metadata_json   TEXT,
+    superseded_at   TEXT,
     created_at      TEXT DEFAULT (datetime('now')),
     updated_at      TEXT DEFAULT (datetime('now'))
 );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_events_event_key ON events(event_key);
 CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type);
 CREATE INDEX IF NOT EXISTS idx_events_status ON events(status);
 CREATE INDEX IF NOT EXISTS idx_events_date_start ON events(event_date_start);
@@ -751,6 +860,7 @@ CREATE TABLE IF NOT EXISTS event_items (
     item_role       TEXT NOT NULL DEFAULT 'origin',
     source_strength TEXT DEFAULT 'support',
     added_at        TEXT DEFAULT (datetime('now')),
+    superseded_at   TEXT,
     metadata_json   TEXT,
     FOREIGN KEY (event_id) REFERENCES events(id) ON DELETE CASCADE,
     FOREIGN KEY (content_item_id) REFERENCES content_items(id) ON DELETE CASCADE,
@@ -769,6 +879,8 @@ CREATE TABLE IF NOT EXISTS event_entities (
     valid_from      TEXT,
     valid_to        TEXT,
     observed_at     TEXT,
+    recorded_at     TEXT DEFAULT (datetime('now')),
+    superseded_at   TEXT,
     metadata_json   TEXT,
     FOREIGN KEY (event_id) REFERENCES events(id) ON DELETE CASCADE,
     FOREIGN KEY (entity_id) REFERENCES entities(id) ON DELETE CASCADE,
@@ -787,6 +899,7 @@ CREATE TABLE IF NOT EXISTS event_timeline (
     content_item_id INTEGER,
     document_content_id INTEGER,
     sort_order      INTEGER DEFAULT 0,
+    superseded_at   TEXT,
     metadata_json   TEXT,
     FOREIGN KEY (event_id) REFERENCES events(id) ON DELETE CASCADE,
     FOREIGN KEY (content_item_id) REFERENCES content_items(id) ON DELETE SET NULL,
@@ -824,6 +937,7 @@ CREATE TABLE IF NOT EXISTS fact_evidence (
     evidence_class  TEXT DEFAULT 'support',
     source_strength TEXT DEFAULT 'support',
     added_at        TEXT DEFAULT (datetime('now')),
+    superseded_at   TEXT,
     metadata_json   TEXT,
     FOREIGN KEY (fact_id) REFERENCES event_facts(id) ON DELETE CASCADE,
     FOREIGN KEY (content_item_id) REFERENCES content_items(id) ON DELETE SET NULL,
@@ -832,6 +946,84 @@ CREATE TABLE IF NOT EXISTS fact_evidence (
 );
 CREATE INDEX IF NOT EXISTS idx_fact_evidence_fact ON fact_evidence(fact_id);
 CREATE INDEX IF NOT EXISTS idx_fact_evidence_content ON fact_evidence(content_item_id);
+
+CREATE TABLE IF NOT EXISTS agent_tasks (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_key        TEXT NOT NULL UNIQUE,
+    task_type       TEXT NOT NULL,
+    requester_group TEXT NOT NULL,
+    target_group    TEXT NOT NULL,
+    subject_type    TEXT NOT NULL,
+    subject_id      INTEGER,
+    priority        INTEGER NOT NULL DEFAULT 50,
+    status          TEXT NOT NULL DEFAULT 'pending',
+    input_hash      TEXT,
+    payload_json    TEXT,
+    acceptance_json TEXT,
+    result_json     TEXT,
+    lease_owner     TEXT,
+    lease_expires_at TEXT,
+    failure_kind    TEXT,
+    error_text      TEXT,
+    created_at      TEXT DEFAULT (datetime('now')),
+    updated_at      TEXT DEFAULT (datetime('now')),
+    completed_at    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_agent_tasks_status ON agent_tasks(status, target_group, priority);
+CREATE INDEX IF NOT EXISTS idx_agent_tasks_subject ON agent_tasks(subject_type, subject_id);
+CREATE INDEX IF NOT EXISTS idx_agent_tasks_type ON agent_tasks(task_type, target_group);
+
+CREATE TABLE IF NOT EXISTS agent_messages (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id         INTEGER NOT NULL,
+    message_type    TEXT NOT NULL,
+    sender_group    TEXT NOT NULL,
+    recipient_group TEXT NOT NULL,
+    payload_json    TEXT,
+    created_at      TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (task_id) REFERENCES agent_tasks(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_agent_messages_task ON agent_messages(task_id);
+CREATE INDEX IF NOT EXISTS idx_agent_messages_type ON agent_messages(message_type);
+
+CREATE TABLE IF NOT EXISTS agent_artifacts (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id         INTEGER,
+    artifact_type   TEXT NOT NULL,
+    subject_type    TEXT,
+    subject_id      INTEGER,
+    payload_json    TEXT,
+    confidence      REAL DEFAULT 0,
+    source_links_json TEXT,
+    created_at      TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (task_id) REFERENCES agent_tasks(id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_agent_artifacts_task ON agent_artifacts(task_id);
+CREATE INDEX IF NOT EXISTS idx_agent_artifacts_subject ON agent_artifacts(subject_type, subject_id);
+CREATE INDEX IF NOT EXISTS idx_agent_artifacts_type ON agent_artifacts(artifact_type);
+
+CREATE TABLE IF NOT EXISTS search_evidence (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id         INTEGER,
+    query_hash      TEXT NOT NULL,
+    query_text      TEXT NOT NULL,
+    provider        TEXT,
+    model           TEXT,
+    url             TEXT,
+    title           TEXT,
+    snippet         TEXT,
+    retrieved_at    TEXT DEFAULT (datetime('now')),
+    citation_json   TEXT,
+    source_tier     TEXT,
+    confidence      REAL DEFAULT 0,
+    dedupe_key      TEXT NOT NULL,
+    created_at      TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (task_id) REFERENCES agent_tasks(id) ON DELETE SET NULL,
+    UNIQUE(query_hash, dedupe_key)
+);
+CREATE INDEX IF NOT EXISTS idx_search_evidence_task ON search_evidence(task_id);
+CREATE INDEX IF NOT EXISTS idx_search_evidence_query ON search_evidence(query_hash);
+CREATE INDEX IF NOT EXISTS idx_search_evidence_url ON search_evidence(url);
 """
 
 
@@ -1063,6 +1255,13 @@ def ensure_additive_schema(conn: sqlite3.Connection):
     )
     _create_index_if_columns_exist(
         conn,
+        table_name="events",
+        index_name="idx_events_event_key",
+        columns_sql="event_key",
+        required_columns=("event_key",),
+    )
+    _create_index_if_columns_exist(
+        conn,
         table_name="ai_task_attempts",
         index_name="idx_ai_task_attempts_failure_kind",
         columns_sql="failure_kind",
@@ -1074,6 +1273,27 @@ def ensure_additive_schema(conn: sqlite3.Connection):
         index_name="idx_source_sync_state_quality",
         columns_sql="quality_state",
         required_columns=("quality_state",),
+    )
+    _create_index_if_columns_exist(
+        conn,
+        table_name="content_items",
+        index_name="idx_content_items_body_hash",
+        columns_sql="body_hash",
+        required_columns=("body_hash",),
+    )
+    _create_index_if_columns_exist(
+        conn,
+        table_name="telegram_sessions",
+        index_name="idx_telegram_sessions_collecting",
+        columns_sql="collecting_now, status",
+        required_columns=("collecting_now", "status"),
+    )
+    _create_index_if_columns_exist(
+        conn,
+        table_name="job_runs",
+        index_name="idx_job_runs_heartbeat",
+        columns_sql="heartbeat_at",
+        required_columns=("heartbeat_at",),
     )
     conn.commit()
 
@@ -1114,9 +1334,13 @@ def get_db(settings: dict = None) -> sqlite3.Connection:
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA busy_timeout = 30000")
+    # Reduced busy_timeout for fast-fail under contention; callers should retry/backoff.
+    conn.execute("PRAGMA busy_timeout = 5000")
     conn.execute("PRAGMA journal_mode = WAL")
-    if settings.get("ensure_schema_on_connect", True):
+    # More frequent checkpoints to keep WAL size bounded
+    conn.execute("PRAGMA wal_autocheckpoint = 100")
+    conn.execute("PRAGMA journal_size_limit = 10485760")
+    if settings.get("ensure_schema_on_connect", False):
         exec_schema(conn, SCHEMA_PATH)
     return conn
 
@@ -1133,19 +1357,50 @@ def ensure_dirs(settings: dict = None):
         p.mkdir(parents=True, exist_ok=True)
 
 
+class _LogContextFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        context = current_log_context()
+        for field in LOG_CONTEXT_FIELDS:
+            value = context.get(field, "")
+            setattr(record, field, "" if value is None else value)
+        return True
+
+
+class _ReopenableRotatingFileHandler(RotatingFileHandler):
+    """Rotating file handler that releases the file after each record on Windows."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            super().emit(record)
+        finally:
+            if self.stream:
+                try:
+                    self.flush()
+                finally:
+                    self.close()
+
+
 def setup_logging(settings: dict = None):
     if settings is None:
         settings = load_settings()
 
     log_level = getattr(logging, settings.get("log_level", "INFO").upper(), logging.INFO)
-    log_file = settings.get("log_file", str(PROJECT_ROOT / "app.log"))
+    log_file = settings.get("log_file", str(PROJECT_ROOT / "log.log"))
     log_path = Path(log_file)
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
     root_logger = logging.getLogger()
     root_logger.setLevel(log_level)
 
-    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    fmt = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s "
+        "job_run_id=%(job_run_id)s pipeline_run_id=%(pipeline_run_id)s "
+        "source_key=%(source_key)s source_type=%(source_type)s "
+        "telegram_session=%(telegram_session)s channel=%(channel)s "
+        "provider=%(provider)s model=%(model)s item_id=%(item_id)s "
+        "raw_item_id=%(raw_item_id)s content_item_id=%(content_item_id)s: %(message)s"
+    )
+    context_filter = _LogContextFilter()
 
     managed_handlers = [
         h for h in root_logger.handlers
@@ -1158,14 +1413,20 @@ def setup_logging(settings: dict = None):
     ch = logging.StreamHandler(sys.stdout)
     ch.setLevel(log_level)
     ch.setFormatter(fmt)
+    ch.addFilter(context_filter)
     ch._news_archive_handler = True
     root_logger.addHandler(ch)
 
-    fh = RotatingFileHandler(
-        str(log_path), maxBytes=20 * 1024 * 1024, backupCount=5, encoding="utf-8"
+    fh = _ReopenableRotatingFileHandler(
+        str(log_path),
+        maxBytes=20 * 1024 * 1024,
+        backupCount=5,
+        encoding="utf-8",
+        delay=True,
     )
     fh.setLevel(log_level)
     fh.setFormatter(fmt)
+    fh.addFilter(context_filter)
     fh._news_archive_handler = True
     root_logger.addHandler(fh)
 

@@ -188,7 +188,7 @@ class ClassifierV3Tests(unittest.TestCase):
             create_classifier_db(db_path)
             settings = {"db_path": str(db_path), "ensure_schema_on_connect": True}
 
-            with patch("classifier.llm_classifier_v2._call_ollama", return_value=None):
+            with patch("classifier.llm_classifier_v2._call_cloud_llm", return_value=None):
                 result = classify_content_llm_v2(settings=settings, batch_size=20)
 
             self.assertEqual(result["classified"], 0)

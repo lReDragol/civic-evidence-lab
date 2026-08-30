@@ -184,85 +184,94 @@ def process_content_entities(settings: dict = None, batch_size: int = 500):
         settings = load_settings()
 
     conn = get_db(settings)
+    try:
+        rows = conn.execute(
+            """
+            SELECT c.id, c.body_text, c.title
+            FROM content_items c
+            WHERE (length(c.body_text) > 10 OR length(c.title) > 5)
+              AND c.ner_processed = 0
+            ORDER BY c.id
+            LIMIT ?
+            """,
+            (batch_size,),
+        ).fetchall()
 
-    rows = conn.execute(
-        """
-        SELECT c.id, c.body_text, c.title
-        FROM content_items c
-        WHERE (length(c.body_text) > 10 OR length(c.title) > 5)
-          AND c.ner_processed = 0
-        ORDER BY c.id
-        LIMIT ?
-        """,
-        (batch_size,),
-    ).fetchall()
+        if not rows:
+            log.info("No new content items for NER processing")
+            return None
 
-    if not rows:
-        log.info("No new content items for NER processing")
-        conn.close()
-        return
+        log.info("Processing %d content items for entities", len(rows))
 
-    log.info("Processing %d content items for entities", len(rows))
+        total_entities = 0
+        total_mentions = 0
+        entity_cache: Dict[Tuple[str, str], int] = {}
 
-    total_entities = 0
-    total_mentions = 0
-    entity_cache: Dict[Tuple[str, str], int] = {}
+        for row in rows:
+            content_id = row["id"]
+            text = f"{row['title'] or ''}\n{row['body_text'] or ''}"
+            if not text.strip():
+                conn.execute("UPDATE content_items SET ner_processed=1 WHERE id=?", (content_id,))
+                continue
 
-    for row in rows:
-        content_id = row["id"]
-        text = f"{row['title'] or ''}\n{row['body_text'] or ''}"
-        if not text.strip():
+            entities = extract_entities(text)
+            entities = _deduplicate_entities(entities)
+
+            for ent in entities:
+                etype = ent["entity_type"]
+                name = ent["name"]
+
+                cache_key = (etype, name)
+                if cache_key in entity_cache:
+                    entity_id = entity_cache[cache_key]
+                else:
+                    entity_id = _resolve_entity(conn, etype, name)
+                    is_new = entity_id is None
+                    if is_new:
+                        entity_id = _get_or_create_entity(conn, etype, name)
+                        if etype == "person" and len(name.split()) >= 2:
+                            short = name.split()[0]
+                            if short != name:
+                                _add_alias(conn, entity_id, short, "surname_only")
+                    entity_cache[cache_key] = entity_id
+                    total_entities += 1
+                    if is_new:
+                        try:
+                            conn.execute(
+                                "INSERT OR IGNORE INTO ner_new_entities(entity_id, entity_type, canonical_name, source_content_id) VALUES(?,?,?,?)",
+                                (entity_id, etype, name, content_id),
+                            )
+                        except Exception as exc:
+                            log.warning("ner_new_entities insert failed: %s", exc)
+
+                try:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO entity_mentions(entity_id, content_item_id, mention_type, confidence) VALUES(?,?,?,?)",
+                        (entity_id, content_id, etype, 1.0 if ent["source"] == "natasha" else 0.7),
+                    )
+                    total_mentions += 1
+                except Exception as exc:
+                    log.warning("entity_mentions insert failed: %s", exc)
+
             conn.execute("UPDATE content_items SET ner_processed=1 WHERE id=?", (content_id,))
-            continue
 
-        entities = extract_entities(text)
-        entities = _deduplicate_entities(entities)
+        conn.commit()
 
-        for ent in entities:
-            etype = ent["entity_type"]
-            name = ent["name"]
+        stats = {
+            "entities_total": conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0],
+            "persons": conn.execute("SELECT COUNT(*) FROM entities WHERE entity_type='person'").fetchone()[0],
+            "organizations": conn.execute("SELECT COUNT(*) FROM entities WHERE entity_type='organization'").fetchone()[0],
+            "locations": conn.execute("SELECT COUNT(*) FROM entities WHERE entity_type='location'").fetchone()[0],
+            "mentions_total": conn.execute("SELECT COUNT(*) FROM entity_mentions").fetchone()[0],
+        }
+        log.info(
+            "NER done: %d entities (%d persons, %d orgs, %d locs), %d mentions",
+            stats["entities_total"], stats["persons"], stats["organizations"], stats["locations"], stats["mentions_total"],
+        )
 
-            cache_key = (etype, name)
-            if cache_key in entity_cache:
-                entity_id = entity_cache[cache_key]
-            else:
-                entity_id = _resolve_entity(conn, etype, name)
-                if entity_id is None:
-                    entity_id = _get_or_create_entity(conn, etype, name)
-                    if etype == "person" and len(name.split()) >= 2:
-                        short = name.split()[0]
-                        if short != name:
-                            _add_alias(conn, entity_id, short, "surname_only")
-                entity_cache[cache_key] = entity_id
-                total_entities += 1
-
-            try:
-                conn.execute(
-                    "INSERT OR IGNORE INTO entity_mentions(entity_id, content_item_id, mention_type, confidence) VALUES(?,?,?,?)",
-                    (entity_id, content_id, etype, 1.0 if ent["source"] == "natasha" else 0.7),
-                )
-                total_mentions += 1
-            except Exception:
-                pass
-
-        conn.execute("UPDATE content_items SET ner_processed=1 WHERE id=?", (content_id,))
-
-    conn.commit()
-
-    stats = {
-        "entities_total": conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0],
-        "persons": conn.execute("SELECT COUNT(*) FROM entities WHERE entity_type='person'").fetchone()[0],
-        "organizations": conn.execute("SELECT COUNT(*) FROM entities WHERE entity_type='organization'").fetchone()[0],
-        "locations": conn.execute("SELECT COUNT(*) FROM entities WHERE entity_type='location'").fetchone()[0],
-        "mentions_total": conn.execute("SELECT COUNT(*) FROM entity_mentions").fetchone()[0],
-    }
-    log.info(
-        "NER done: %d entities (%d persons, %d orgs, %d locs), %d mentions",
-        stats["entities_total"], stats["persons"], stats["organizations"], stats["locations"], stats["mentions_total"],
-    )
-
-    conn.close()
-    return stats
+        return stats
+    finally:
+        conn.close()
 
 
 def main():

@@ -1026,22 +1026,59 @@
   }
 
   function renderOps247Screen(payload) {
+    const overview = payload.overview || {};
     const runtime = payload.runtime || {};
     const ingest = payload.ingest || {};
     const telegram = payload.telegram || {};
     const ai = payload.ai || {};
+    const agents = payload.agents || {};
     const quality = payload.quality || {};
+    const coverage = payload.coverage || {};
+    const sources = payload.sources || [];
+    const activeJobs = payload.active_jobs || runtime.running_jobs || [];
+    const models = payload.models || [];
+    const funnel = payload.funnel || {};
+    const duplicates = payload.duplicates || {};
+    const errors = payload.errors || {};
     const sessions = telegram.sessions || [];
     const providers = ai.providers || [];
     const logs = payload.logs || [];
     const relationGate = quality.relation_gate || {};
 
+    const opsTable = (columns, rows, emptyTitle, emptySubtitle) => {
+      if (!rows.length) return emptyState(emptyTitle, emptySubtitle);
+      return `
+        <div class="table-scroll compact-table-scroll">
+          <table class="data-table ops-table">
+            <thead><tr>${columns.map((column) => `<th>${escapeHtml(column.label)}</th>`).join("")}</tr></thead>
+            <tbody>
+              ${rows
+                .map(
+                  (row) => `
+                    <tr class="${escapeHtml(row.__rowClass || "")}">
+                      ${columns.map((column) => `<td>${column.render ? column.render(row) : escapeHtml(row[column.key] ?? "—")}</td>`).join("")}
+                    </tr>
+                  `
+                )
+                .join("")}
+            </tbody>
+          </table>
+        </div>
+      `;
+    };
+
     const runtimeCards = [
       ["24/7", runtime.enabled ? "ON" : "OFF", `autostart ${runtime.autostart_status || "unknown"}`],
       ["Daemon", runtime.daemon_running ? "RUNNING" : "OFF", runtime.last_heartbeat || "heartbeat —"],
-      ["Last catch-up", runtime.last_catchup || "—", `${(runtime.running_jobs || []).length} running jobs`],
+      ["Uptime", overview.uptime_started_at || "—", `${overview.active_jobs_now || activeJobs.length || 0} active jobs`],
+      ["Collected today", overview.collected_today || 0, `${overview.collected_current_run || 0} current run`],
+      ["Processed", overview.processed_current_run || 0, `${overview.classified_current_run || 0} classified`],
+      ["Dead letters", overview.dead_letters_unresolved || 0, `${overview.failed_jobs_24h || 0} failed jobs / 24h`],
+      ["Coverage", coverage.coverage_days || overview.coverage_days || 0, `${coverage.earliest_item_date || overview.earliest_item_date || "—"} → ${coverage.latest_item_date || overview.latest_item_date || "—"}`],
+      ["Duplicates", overview.duplicate_ratio ?? duplicates.duplicate_ratio ?? 0, "estimated ratio"],
       ["Telegram sessions", telegram.active_sessions || 0, `${telegram.failed_sessions || 0} failed · ${telegram.cooldown_sessions || 0} cooldown`],
       ["AI keys", ai.keys?.active || 0, `${ai.keys?.cooldown || 0} cooldown · ${ai.keys?.removed || 0} removed`],
+      ["Agent tasks", agents.open_tasks || 0, "pending / running"],
       ["Relations gate", relationGate.promoted_same_case_cluster || 0, "bad same_case promoted"],
     ]
       .map(
@@ -1078,16 +1115,21 @@
       ? sessions
           .map((session) => {
             const status = session.status || "unknown";
-            const level = status === "active" ? "success" : status === "cooldown" ? "warning" : "error";
+            const collecting = Number(session.collecting_now || 0) === 1;
+            const level = collecting || status === "active" ? "success" : status === "cooldown" || status === "flood_wait" ? "warning" : status === "idle" ? "info" : "error";
             return `
               <article class="mini-item ops-session ${escapeHtml(level)}">
                 <div class="table-row-head">
                   <div class="table-primary">${escapeHtml(session.session_key || "—")} · ${escapeHtml(session.client_type || "—")}</div>
-                  <span class="badge ${level === "success" ? "" : level === "warning" ? "amber" : "rose"}">${escapeHtml(status)}</span>
+                  <span class="badge ${level === "success" ? "" : level === "warning" ? "amber" : "rose"}">${escapeHtml(collecting ? "collecting_now" : status)}</span>
                 </div>
                 <div class="table-secondary">
-                  channels ${escapeHtml(String(session.assigned_count || 0))}
-                  · last ${escapeHtml(session.last_success_at || session.last_attempt_at || "—")}
+                  channel ${escapeHtml(session.current_channel || "—")}
+                  · assigned ${escapeHtml(String(session.assigned_count || 0))}
+                  · run ${escapeHtml(String(session.collected_current_run || 0))}
+                  · dup ${escapeHtml(String(session.duplicates_skipped || 0))}
+                  · last msg ${escapeHtml(session.last_message_id || "—")} / ${escapeHtml(formatDate(session.last_message_date))}
+                  · heartbeat ${escapeHtml(session.heartbeat_at || "—")}
                   ${session.failure_class ? `· ${escapeHtml(session.failure_class)}` : ""}
                 </div>
               </article>
@@ -1112,6 +1154,102 @@
           .join("")
       : emptyState("Нет provider health", "AI-пул ещё не обновлял health-состояние.");
 
+    const activeJobsMarkup = opsTable(
+      [
+        { label: "Job", key: "job_id" },
+        { label: "Status", render: (row) => escapeHtml(row.status || "running") },
+        { label: "Started", render: (row) => escapeHtml(formatDate(row.started_at)) },
+        { label: "Heartbeat", render: (row) => escapeHtml(row.heartbeat_at || "—") },
+        { label: "Items", render: (row) => `${escapeHtml(String(row.items_seen || 0))} / +${escapeHtml(String(row.items_new || 0))} / fail ${escapeHtml(String(row.items_failed || 0))}` },
+        { label: "Owner", render: (row) => escapeHtml(row.lease_owner || row.owner || "—") },
+        { label: "Last", render: (row) => escapeHtml(row.error_summary || row.last_message || "—") },
+      ],
+      activeJobs,
+      "Нет активных процессов",
+      "Daemon не держит lease или jobs сейчас простаивают."
+    );
+
+    const modelRows = models.length ? models : providers.map((item) => ({ ...item, model: item.provider, task_type: "provider_health", success: item.active_key_count || 0, failed: 0 }));
+    const modelsTable = opsTable(
+      [
+        { label: "Provider", key: "provider" },
+        { label: "Model", render: (row) => escapeHtml(row.model || row.model_name || "—") },
+        { label: "Task", render: (row) => escapeHtml(row.task_type || row.task || "—") },
+        { label: "Status", render: (row) => `<span class="badge ${row.status === "failed" ? "rose" : row.status === "rate_limited" ? "amber" : ""}">${escapeHtml(row.status || "unknown")}</span>` },
+        { label: "Processed", render: (row) => escapeHtml(String(row.requests || row.processed || 0)) },
+        { label: "OK/Fail", render: (row) => `${escapeHtml(String(row.success || 0))} / ${escapeHtml(String(row.failed || 0))}` },
+        { label: "Latency", render: (row) => `${escapeHtml(String(row.avg_latency_ms ?? "—"))} / p95 ${escapeHtml(String(row.p95_latency_ms ?? "—"))}` },
+        { label: "Last error", render: (row) => escapeHtml(row.last_error || "—") },
+      ],
+      modelRows.slice(0, 80),
+      "Нет model metrics",
+      "AI attempts ещё не писали provider/model статистику."
+    );
+
+    const sourceRows = sources.slice(0, 120).map((source) => ({
+      ...source,
+      __rowClass: Number(source.is_collecting || 0) === 1 ? "row-working" : source.status === "degraded" || source.status === "failed" ? "row-error" : "",
+    }));
+    const sourcesTable = opsTable(
+      [
+        { label: "Source", render: (row) => escapeHtml(row.source_name || row.name || "—") },
+        { label: "Type", render: (row) => escapeHtml(row.source_type || "—") },
+        { label: "Status", render: (row) => `<span class="badge ${row.status === "degraded" || row.status === "failed" ? "rose" : Number(row.is_collecting || 0) ? "" : "cyan"}">${escapeHtml(Number(row.is_collecting || 0) ? "collecting" : row.status || "unknown")}</span>` },
+        { label: "Session/channel", render: (row) => escapeHtml([row.current_telegram_session, row.current_channel].filter(Boolean).join(" / ") || "—") },
+        { label: "Run/today/total", render: (row) => `${escapeHtml(String(row.collected_current_run || 0))} / ${escapeHtml(String(row.collected_today || 0))} / ${escapeHtml(String(row.total_collected || 0))}` },
+        { label: "Coverage", render: (row) => `${escapeHtml(String(row.coverage_days || 0))} дн.` },
+        { label: "Last error", render: (row) => escapeHtml(row.failure_class || row.last_error || "—") },
+      ],
+      sourceRows,
+      "Нет источников",
+      "Sources table пустая или недоступна."
+    );
+
+    const funnelMarkup = Object.entries(funnel).length
+      ? Object.entries(funnel)
+          .map(
+            ([stage, info]) => `
+              <div class="detail-kv compact-kpi">
+                <div class="k">${escapeHtml(stage.replace(/_/g, " "))}</div>
+                <div class="v">${escapeHtml(String(info?.count ?? 0))}</div>
+                <div class="muted">${escapeHtml(info?.success_rate ? `${info.success_rate}% ok` : "")}</div>
+              </div>
+            `
+          )
+          .join("")
+      : `<div class="muted">Воронка пока недоступна.</div>`;
+
+    const errorRows = [
+      ...(errors.dead_letters || []).map((item) => ({ ...item, __rowClass: item.resolved ? "" : "row-error" })),
+      ...(errors.runtime_errors || []).map((item) => ({ ...item, __rowClass: "row-error" })),
+      ...(errors.failed_jobs || []).map((item) => ({ ...item, __rowClass: "row-error" })),
+    ].slice(0, 80);
+    const errorsTable = opsTable(
+      [
+        { label: "Time", render: (row) => escapeHtml(formatDate(row.time)) },
+        { label: "Stage", render: (row) => escapeHtml(row.stage || "—") },
+        { label: "Source", render: (row) => escapeHtml(row.source_key || "—") },
+        { label: "Item", render: (row) => escapeHtml(row.content_item_id || row.raw_item_id || "—") },
+        { label: "Type", render: (row) => escapeHtml(row.error_type || "—") },
+        { label: "Message", render: (row) => escapeHtml(truncate(row.short_message || row.message || "—", 120)) },
+      ],
+      errorRows,
+      "Нет ошибок",
+      "Unresolved dead letters и runtime errors не найдены."
+    );
+
+    const duplicateMarkup = `
+      <div class="detail-grid health-grid">
+        <div class="detail-kv compact-kpi"><div class="k">body hash dupes</div><div class="v">${escapeHtml(String(duplicates.duplicate_body_hashes || 0))}</div></div>
+        <div class="detail-kv compact-kpi"><div class="k">external_id dupes</div><div class="v">${escapeHtml(String((duplicates.content_external_id_duplicates || []).length))}</div></div>
+        <div class="detail-kv compact-kpi"><div class="k">multi clusters</div><div class="v">${escapeHtml(String(duplicates.multi_item_clusters || 0))}</div></div>
+        <div class="detail-kv compact-kpi"><div class="k">log repeats</div><div class="v">${escapeHtml(String((duplicates.log_duplicates || []).length))}</div></div>
+      </div>
+      <div class="mini-list">
+        ${(duplicates.log_duplicates || []).slice(0, 10).map((item) => `<div class="log-item warning"><span class="status-dot status-warning"></span>${escapeHtml(String(item.count || 0))}× ${escapeHtml(truncate(item.message || "", 140))}</div>`).join("") || `<div class="muted">Повторяющиеся log lines не найдены.</div>`}
+      </div>
+    `;
+
     const failuresMarkup = Object.entries(ai.failure_kinds || {}).length
       ? Object.entries(ai.failure_kinds || {})
           .map(
@@ -1124,6 +1262,42 @@
           )
           .join("")
       : `<div class="muted">Нет failed AI attempts.</div>`;
+
+    const agentGroupMarkup = Object.entries(agents.tasks_by_group || {}).length
+      ? Object.entries(agents.tasks_by_group || {})
+          .map(([group, byStatus]) => {
+            const total = Object.values(byStatus || {}).reduce((sum, value) => sum + Number(value || 0), 0);
+            const statusLine = Object.entries(byStatus || {})
+              .map(([status, count]) => `${status}: ${count}`)
+              .join(" · ");
+            return `
+              <article class="mini-item">
+                <div class="table-row-head">
+                  <div class="table-primary">${escapeHtml(group)}</div>
+                  <span class="badge">${escapeHtml(String(total))}</span>
+                </div>
+                <div class="table-secondary">${escapeHtml(statusLine || "—")}</div>
+              </article>
+            `;
+          })
+          .join("")
+      : emptyState("Нет MAS-задач", "Agent bus пока не получил задач на поиск или проверку.");
+
+    const searchMarkup = (agents.search_evidence?.recent || []).length
+      ? (agents.search_evidence.recent || [])
+          .map(
+            (item) => `
+              <article class="mini-item">
+                <div class="table-row-head">
+                  <div class="table-primary">${escapeHtml(item.title || item.url || "search evidence")}</div>
+                  <span class="badge">${escapeHtml(item.source_tier || item.provider || "source")}</span>
+                </div>
+                <div class="table-secondary">${escapeHtml(item.url || "—")} · ${escapeHtml(String(item.confidence || 0))}</div>
+              </article>
+            `
+          )
+          .join("")
+      : `<div class="muted">Search evidence: ${escapeHtml(String(agents.search_evidence?.total || 0))}</div>`;
 
     const logsMarkup = logs.length
       ? logs
@@ -1147,6 +1321,14 @@
             <h3>Telegram sessions</h3>
             <div class="mini-list">${sessionMarkup}</div>
           </section>
+          <section class="overview-panel scrollable wide-panel">
+            <h3>Активные процессы</h3>
+            ${activeJobsMarkup}
+          </section>
+          <section class="overview-panel scrollable wide-panel">
+            <h3>Сбор данных по источникам</h3>
+            ${sourcesTable}
+          </section>
         </div>
 
         <div class="overview-column">
@@ -1154,6 +1336,10 @@
             <h3>AI providers</h3>
             <div class="mini-list">${providerMarkup}</div>
             <div class="detail-grid health-grid">${failuresMarkup}</div>
+          </section>
+          <section class="overview-panel scrollable wide-panel">
+            <h3>Модели / нейросети</h3>
+            ${modelsTable}
           </section>
           <section class="overview-panel">
             <h3>Quality gate</h3>
@@ -1163,6 +1349,23 @@
               <div class="detail-kv compact-kpi"><div class="k">review zero support</div><div class="v">${escapeHtml(String(relationGate.review_zero_support || 0))}</div></div>
               <div class="detail-kv compact-kpi"><div class="k">degraded sources</div><div class="v">${escapeHtml(String(quality.degraded_sources || 0))}</div></div>
             </div>
+          </section>
+          <section class="overview-panel scrollable">
+            <h3>MAS / Search</h3>
+            <div class="mini-list">${agentGroupMarkup}</div>
+            <div class="mini-list">${searchMarkup}</div>
+          </section>
+          <section class="overview-panel">
+            <h3>Воронка обработки</h3>
+            <div class="detail-grid health-grid">${funnelMarkup}</div>
+          </section>
+          <section class="overview-panel scrollable">
+            <h3>Ошибки и dead letters</h3>
+            ${errorsTable}
+          </section>
+          <section class="overview-panel scrollable">
+            <h3>Дубли</h3>
+            ${duplicateMarkup}
           </section>
           <section class="overview-panel scrollable">
             <h3>Логи</h3>
@@ -4039,7 +4242,7 @@
     function bootstrap() {
       return {
         navigation: [
-          { key: "monitoring", label: "Мониторинг", sections: [{ key: "overview", label: "Обзор" }, { key: "ops247", label: "24/7" }, { key: "content", label: "Контент" }, { key: "search", label: "Поиск" }] },
+          { key: "monitoring", label: "📡 Мониторинг", sections: [{ key: "overview", label: "Обзор" }, { key: "ops247", label: "24/7" }, { key: "content", label: "Контент" }, { key: "search", label: "Поиск" }] },
           { key: "verification", label: "Проверка", sections: [{ key: "claims", label: "Заявления" }, { key: "cases", label: "Дела" }, { key: "review_ops", label: "Review Ops" }] },
           { key: "analytics", label: "Аналитика", sections: [{ key: "events", label: "События" }, { key: "entities", label: "Сущности" }, { key: "relations", label: "Связи" }, { key: "officials", label: "Руководство" }] },
           { key: "system", label: "Система", sections: [{ key: "settings", label: "Настройки" }] },

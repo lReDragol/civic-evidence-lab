@@ -73,7 +73,7 @@ CREATE TABLE IF NOT EXISTS content_items (
     source_id       INTEGER NOT NULL,
     raw_item_id     INTEGER,
     external_id     TEXT,
-    content_type    TEXT NOT NULL,
+    content_type    TEXT NOT NULL DEFAULT 'article',
     title           TEXT,
     body_text       TEXT,
     published_at    TEXT,
@@ -81,6 +81,7 @@ CREATE TABLE IF NOT EXISTS content_items (
     url             TEXT,
     language        TEXT DEFAULT 'ru',
     status          TEXT DEFAULT 'raw_signal',
+    body_hash       TEXT,
     ner_processed   INTEGER DEFAULT 0,
     llm_processed   INTEGER DEFAULT 0,
     quotes_processed INTEGER DEFAULT 0,
@@ -94,6 +95,7 @@ CREATE INDEX IF NOT EXISTS idx_content_type ON content_items(content_type);
 CREATE INDEX IF NOT EXISTS idx_content_status ON content_items(status);
 CREATE INDEX IF NOT EXISTS idx_content_source ON content_items(source_id);
 CREATE INDEX IF NOT EXISTS idx_content_published ON content_items(published_at);
+CREATE INDEX IF NOT EXISTS idx_content_body_hash ON content_items(body_hash);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS content_search USING fts5(
     title, body_text,
@@ -607,6 +609,15 @@ CREATE TABLE IF NOT EXISTS job_runs (
     items_seen      INTEGER DEFAULT 0,
     items_new       INTEGER DEFAULT 0,
     items_updated   INTEGER DEFAULT 0,
+    items_skipped   INTEGER DEFAULT 0,
+    items_failed    INTEGER DEFAULT 0,
+    duplicate_items INTEGER DEFAULT 0,
+    heartbeat_at    TEXT,
+    duration_ms     INTEGER,
+    warnings_count  INTEGER DEFAULT 0,
+    fatal_errors_count INTEGER DEFAULT 0,
+    retriable_errors_count INTEGER DEFAULT 0,
+    last_message    TEXT,
     warnings_json   TEXT,
     retriable_errors_json TEXT,
     fatal_errors_json TEXT,
@@ -692,6 +703,15 @@ CREATE TABLE IF NOT EXISTS source_sync_state (
     last_http_status INTEGER,
     transport_mode  TEXT,
     last_error      TEXT,
+    current_job_id  TEXT,
+    is_collecting   INTEGER DEFAULT 0,
+    current_channel TEXT,
+    current_telegram_session TEXT,
+    items_current_run INTEGER DEFAULT 0,
+    items_today     INTEGER DEFAULT 0,
+    duplicates_current_run INTEGER DEFAULT 0,
+    failed_items_current_run INTEGER DEFAULT 0,
+    heartbeat_at    TEXT,
     metadata_json   TEXT,
     FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE SET NULL
 );
@@ -712,6 +732,17 @@ CREATE TABLE IF NOT EXISTS telegram_sessions (
     failure_class   TEXT,
     cooldown_until  TEXT,
     assigned_count  INTEGER DEFAULT 0,
+    current_job_id  TEXT,
+    current_source_id INTEGER,
+    current_channel TEXT,
+    collecting_now  INTEGER DEFAULT 0,
+    last_message_id TEXT,
+    last_message_date TEXT,
+    collected_current_run INTEGER DEFAULT 0,
+    collected_today INTEGER DEFAULT 0,
+    duplicates_skipped INTEGER DEFAULT 0,
+    failed_items    INTEGER DEFAULT 0,
+    heartbeat_at    TEXT,
     metadata_json   TEXT,
     created_at      TEXT DEFAULT (datetime('now')),
     updated_at      TEXT DEFAULT (datetime('now'))
@@ -720,6 +751,7 @@ CREATE TABLE IF NOT EXISTS telegram_sessions (
 CREATE INDEX IF NOT EXISTS idx_telegram_sessions_status ON telegram_sessions(status);
 CREATE INDEX IF NOT EXISTS idx_telegram_sessions_type ON telegram_sessions(client_type);
 CREATE INDEX IF NOT EXISTS idx_telegram_sessions_cooldown ON telegram_sessions(cooldown_until);
+CREATE INDEX IF NOT EXISTS idx_telegram_sessions_collecting ON telegram_sessions(collecting_now, status);
 
 CREATE TABLE IF NOT EXISTS telegram_source_assignments (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -899,12 +931,18 @@ CREATE INDEX IF NOT EXISTS idx_ai_work_items_campaign ON ai_work_items(campaign_
 
 CREATE TABLE IF NOT EXISTS ai_task_attempts (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    work_item_id    INTEGER NOT NULL,
+    work_item_id    INTEGER,
     provider        TEXT,
     model_name      TEXT,
     llm_key_id      INTEGER,
     status          TEXT NOT NULL,
     failure_kind    TEXT,
+    task_type       TEXT,
+    latency_ms      INTEGER,
+    tokens_in       INTEGER,
+    tokens_out      INTEGER,
+    estimated_cost  REAL,
+    current_item_key TEXT,
     error_text      TEXT,
     output_json     TEXT,
     started_at      TEXT DEFAULT (datetime('now')),
@@ -914,6 +952,126 @@ CREATE TABLE IF NOT EXISTS ai_task_attempts (
 );
 CREATE INDEX IF NOT EXISTS idx_ai_task_attempts_work_item ON ai_task_attempts(work_item_id);
 CREATE INDEX IF NOT EXISTS idx_ai_task_attempts_key ON ai_task_attempts(llm_key_id);
+CREATE INDEX IF NOT EXISTS idx_ai_task_attempts_failure_kind ON ai_task_attempts(failure_kind);
+
+CREATE TABLE IF NOT EXISTS runtime_events (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at      TEXT DEFAULT (datetime('now')),
+    level           TEXT NOT NULL DEFAULT 'info',
+    event_type      TEXT NOT NULL,
+    stage           TEXT,
+    job_id          TEXT,
+    job_run_id      INTEGER,
+    pipeline_run_id INTEGER,
+    source_key      TEXT,
+    source_type     TEXT,
+    telegram_session TEXT,
+    channel         TEXT,
+    provider        TEXT,
+    model           TEXT,
+    item_id         INTEGER,
+    raw_item_id     INTEGER,
+    content_item_id INTEGER,
+    message         TEXT,
+    error_type      TEXT,
+    traceback_text  TEXT,
+    payload_json    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_runtime_events_created ON runtime_events(created_at, event_type, level);
+CREATE INDEX IF NOT EXISTS idx_runtime_events_job ON runtime_events(job_id, job_run_id);
+CREATE INDEX IF NOT EXISTS idx_runtime_events_source ON runtime_events(source_key, created_at);
+CREATE INDEX IF NOT EXISTS idx_runtime_events_model ON runtime_events(provider, model, created_at);
+
+CREATE TABLE IF NOT EXISTS processing_skips (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at      TEXT DEFAULT (datetime('now')),
+    stage           TEXT NOT NULL,
+    reason          TEXT NOT NULL,
+    source_key      TEXT,
+    content_item_id INTEGER,
+    raw_item_id     INTEGER,
+    external_id     TEXT,
+    payload_json    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_processing_skips_stage ON processing_skips(stage, created_at);
+
+CREATE TABLE IF NOT EXISTS agent_tasks (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_key        TEXT NOT NULL UNIQUE,
+    task_type       TEXT NOT NULL,
+    requester_group TEXT NOT NULL,
+    target_group    TEXT NOT NULL,
+    subject_type    TEXT NOT NULL,
+    subject_id      INTEGER,
+    priority        INTEGER NOT NULL DEFAULT 50,
+    status          TEXT NOT NULL DEFAULT 'pending',
+    input_hash      TEXT,
+    payload_json    TEXT,
+    acceptance_json TEXT,
+    result_json     TEXT,
+    lease_owner     TEXT,
+    lease_expires_at TEXT,
+    failure_kind    TEXT,
+    error_text      TEXT,
+    created_at      TEXT DEFAULT (datetime('now')),
+    updated_at      TEXT DEFAULT (datetime('now')),
+    completed_at    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_agent_tasks_status ON agent_tasks(status, target_group, priority);
+CREATE INDEX IF NOT EXISTS idx_agent_tasks_subject ON agent_tasks(subject_type, subject_id);
+CREATE INDEX IF NOT EXISTS idx_agent_tasks_type ON agent_tasks(task_type, target_group);
+
+CREATE TABLE IF NOT EXISTS agent_messages (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id         INTEGER NOT NULL,
+    message_type    TEXT NOT NULL,
+    sender_group    TEXT NOT NULL,
+    recipient_group TEXT NOT NULL,
+    payload_json    TEXT,
+    created_at      TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (task_id) REFERENCES agent_tasks(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_agent_messages_task ON agent_messages(task_id);
+CREATE INDEX IF NOT EXISTS idx_agent_messages_type ON agent_messages(message_type);
+
+CREATE TABLE IF NOT EXISTS agent_artifacts (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id         INTEGER,
+    artifact_type   TEXT NOT NULL,
+    subject_type    TEXT,
+    subject_id      INTEGER,
+    payload_json    TEXT,
+    confidence      REAL DEFAULT 0,
+    source_links_json TEXT,
+    created_at      TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (task_id) REFERENCES agent_tasks(id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_agent_artifacts_task ON agent_artifacts(task_id);
+CREATE INDEX IF NOT EXISTS idx_agent_artifacts_subject ON agent_artifacts(subject_type, subject_id);
+CREATE INDEX IF NOT EXISTS idx_agent_artifacts_type ON agent_artifacts(artifact_type);
+
+CREATE TABLE IF NOT EXISTS search_evidence (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id         INTEGER,
+    query_hash      TEXT NOT NULL,
+    query_text      TEXT NOT NULL,
+    provider        TEXT,
+    model           TEXT,
+    url             TEXT,
+    title           TEXT,
+    snippet         TEXT,
+    retrieved_at    TEXT DEFAULT (datetime('now')),
+    citation_json   TEXT,
+    source_tier     TEXT,
+    confidence      REAL DEFAULT 0,
+    dedupe_key      TEXT NOT NULL,
+    created_at      TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (task_id) REFERENCES agent_tasks(id) ON DELETE SET NULL,
+    UNIQUE(query_hash, dedupe_key)
+);
+CREATE INDEX IF NOT EXISTS idx_search_evidence_task ON search_evidence(task_id);
+CREATE INDEX IF NOT EXISTS idx_search_evidence_query ON search_evidence(query_hash);
+CREATE INDEX IF NOT EXISTS idx_search_evidence_url ON search_evidence(url);
 
 CREATE TABLE IF NOT EXISTS event_candidates (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -964,6 +1122,7 @@ CREATE INDEX IF NOT EXISTS idx_event_merge_reviews_status ON event_merge_reviews
 
 CREATE TABLE IF NOT EXISTS events (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_key       TEXT,
     canonical_title TEXT NOT NULL,
     event_type      TEXT,
     summary_short   TEXT,
@@ -976,10 +1135,12 @@ CREATE TABLE IF NOT EXISTS events (
     importance_score REAL DEFAULT 0,
     confidence      REAL DEFAULT 0,
     metadata_json   TEXT,
+    superseded_at   TEXT,
     created_at      TEXT DEFAULT (datetime('now')),
     updated_at      TEXT DEFAULT (datetime('now'))
 );
 
+CREATE UNIQUE INDEX IF NOT EXISTS idx_events_event_key ON events(event_key);
 CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type);
 CREATE INDEX IF NOT EXISTS idx_events_status ON events(status);
 CREATE INDEX IF NOT EXISTS idx_events_date_start ON events(event_date_start);
@@ -992,6 +1153,7 @@ CREATE TABLE IF NOT EXISTS event_items (
     item_role       TEXT NOT NULL DEFAULT 'origin',
     source_strength TEXT DEFAULT 'support',
     added_at        TEXT DEFAULT (datetime('now')),
+    superseded_at   TEXT,
     metadata_json   TEXT,
     FOREIGN KEY (event_id) REFERENCES events(id) ON DELETE CASCADE,
     FOREIGN KEY (content_item_id) REFERENCES content_items(id) ON DELETE CASCADE,
@@ -1011,6 +1173,8 @@ CREATE TABLE IF NOT EXISTS event_entities (
     valid_from      TEXT,
     valid_to        TEXT,
     observed_at     TEXT,
+    recorded_at     TEXT DEFAULT (datetime('now')),
+    superseded_at   TEXT,
     metadata_json   TEXT,
     FOREIGN KEY (event_id) REFERENCES events(id) ON DELETE CASCADE,
     FOREIGN KEY (entity_id) REFERENCES entities(id) ON DELETE CASCADE,
@@ -1030,6 +1194,7 @@ CREATE TABLE IF NOT EXISTS event_timeline (
     content_item_id INTEGER,
     document_content_id INTEGER,
     sort_order      INTEGER DEFAULT 0,
+    superseded_at   TEXT,
     metadata_json   TEXT,
     FOREIGN KEY (event_id) REFERENCES events(id) ON DELETE CASCADE,
     FOREIGN KEY (content_item_id) REFERENCES content_items(id) ON DELETE SET NULL,
@@ -1069,6 +1234,7 @@ CREATE TABLE IF NOT EXISTS fact_evidence (
     evidence_class  TEXT DEFAULT 'support',
     source_strength TEXT DEFAULT 'support',
     added_at        TEXT DEFAULT (datetime('now')),
+    superseded_at   TEXT,
     metadata_json   TEXT,
     FOREIGN KEY (fact_id) REFERENCES event_facts(id) ON DELETE CASCADE,
     FOREIGN KEY (content_item_id) REFERENCES content_items(id) ON DELETE SET NULL,

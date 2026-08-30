@@ -529,6 +529,12 @@ async def collect_channel(app: Client, channel_url: str, source_id: int, conn: s
         if not relevance.get("keep", True):
             continue
 
+        from classifier.garbage_filter import filter_telegram_post
+        garbage_label, garbage_keep = filter_telegram_post(text or "")
+        if not garbage_keep:
+            log.debug("Garbage filtered: %s [%s]", (text or "")[:60], garbage_label)
+            continue
+
         cur = conn.execute(
             """INSERT INTO raw_source_items(source_id, external_id, raw_payload, collected_at, hash_sha256, is_processed)
                VALUES(?,?,?,?,?,0)""",

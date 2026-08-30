@@ -6,6 +6,7 @@ import os
 import re
 import sqlite3
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
@@ -111,7 +112,7 @@ def _ai_settings(settings: dict[str, Any]) -> dict[str, Any]:
     cfg.setdefault("max_units_per_run", 0)
     cfg.setdefault("max_failures_per_provider_stage", 25)
     cfg.setdefault("max_transient_failures_per_provider_stage", 32)
-    cfg.setdefault("provider_priority", ["mistral", "perplexity", "groq", "openrouter", "openai"])
+    cfg.setdefault("provider_priority", ["deepseek", "groq", "mistral", "fireworks", "together", "perplexity", "huggingface", "openrouter", "openai"])
     cfg.setdefault("mode", "pilot")
     cfg.setdefault("campaign_seed", "ai-pilot-2026-04-27")
     cfg.setdefault("campaign_key", f"pilot:{cfg['campaign_seed']}")
@@ -134,7 +135,7 @@ def _ai_settings(settings: dict[str, Any]) -> dict[str, Any]:
 
 
 def _provider_priority(settings: dict[str, Any]) -> list[str]:
-    return list(_ai_settings(settings).get("provider_priority") or ["mistral", "perplexity", "groq", "openrouter", "openai"])
+    return list(_ai_settings(settings).get("provider_priority") or ["deepseek", "groq", "mistral", "fireworks", "together", "perplexity", "huggingface", "openrouter", "openai"])
 
 
 def _prompt_version_for_stage(stage: str, settings: dict[str, Any]) -> str:
@@ -2629,6 +2630,8 @@ def _worker_run(
             key_id = int(chosen["key_id"])
             provider = str(chosen["provider"])
             model_name = str(chosen["model_name"])
+            started_perf = time.perf_counter()
+            started_iso = now_iso()
             try:
                 response = run_ai_task(
                     conn=None,
@@ -2651,7 +2654,17 @@ def _worker_run(
                     "model": model_name,
                     "key_id": key_id,
                     "result": dict(response or {}),
-                    "attempts": failures + [{"provider": provider, "model": model_name, "key_id": key_id, "status": "ok"}],
+                    "attempts": failures + [{
+                        "provider": provider,
+                        "model": model_name,
+                        "key_id": key_id,
+                        "status": "ok",
+                        "started_at": started_iso,
+                        "finished_at": now_iso(),
+                        "latency_ms": int((time.perf_counter() - started_perf) * 1000),
+                        "task_type": stage,
+                        "current_item_key": unit.get("unit_key") or unit.get("key") or unit.get("id"),
+                    }],
                 }
             except Exception as error:  # pragma: no cover - exercised via higher-level retry behavior
                 failure_text = str(error)
@@ -2674,6 +2687,11 @@ def _worker_run(
                         "error_text": failure_text,
                         "failure_kind": failure_kind,
                         "removed": bool(record.get("removed")),
+                        "started_at": started_iso,
+                        "finished_at": now_iso(),
+                        "latency_ms": int((time.perf_counter() - started_perf) * 1000),
+                        "task_type": stage,
+                        "current_item_key": unit.get("unit_key") or unit.get("key") or unit.get("id"),
                     }
                 )
                 exclude.add(key_id)
@@ -2770,6 +2788,12 @@ def build_ai_sweep_doctor(settings: dict[str, Any]) -> dict[str, Any]:
 
 def _record_attempts(conn: sqlite3.Connection, work_item_id: int, attempts: list[dict[str, Any]], final_result: dict[str, Any] | None = None) -> int:
     count = 0
+    work_row = conn.execute(
+        "SELECT stage, unit_key FROM ai_work_items WHERE id=?",
+        (work_item_id,),
+    ).fetchone() if _table_exists(conn, "ai_work_items") else None
+    default_task_type = work_row["stage"] if isinstance(work_row, sqlite3.Row) and "stage" in work_row.keys() else (work_row[0] if work_row else None)
+    default_item_key = work_row["unit_key"] if isinstance(work_row, sqlite3.Row) and "unit_key" in work_row.keys() else (work_row[1] if work_row and len(work_row) > 1 else None)
     for attempt in attempts:
         key_id = attempt.get("key_id")
         status = attempt.get("status") or "unknown"
@@ -2787,9 +2811,10 @@ def _record_attempts(conn: sqlite3.Connection, work_item_id: int, attempts: list
             """
             INSERT INTO ai_task_attempts(
                 work_item_id, provider, model_name, llm_key_id, status, failure_kind,
+                task_type, latency_ms, tokens_in, tokens_out, estimated_cost, current_item_key,
                 error_text, output_json, started_at, finished_at
             )
-            VALUES(?,?,?,?,?,?,?,?,?,?)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 work_item_id,
@@ -2798,10 +2823,16 @@ def _record_attempts(conn: sqlite3.Connection, work_item_id: int, attempts: list
                 int(row[0]) if row else None,
                 status,
                 failure_kind,
+                attempt.get("task_type") or default_task_type,
+                attempt.get("latency_ms"),
+                attempt.get("tokens_in"),
+                attempt.get("tokens_out"),
+                attempt.get("estimated_cost"),
+                attempt.get("current_item_key") or default_item_key,
                 attempt.get("error_text"),
                 _json_dumps(final_result) if final_result and attempt.get("status") == "ok" else None,
-                now_iso(),
-                now_iso(),
+                attempt.get("started_at") or now_iso(),
+                attempt.get("finished_at") or now_iso(),
             ),
         )
         count += 1

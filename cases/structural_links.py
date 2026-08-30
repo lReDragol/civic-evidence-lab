@@ -200,8 +200,8 @@ def link_bills_to_cases(conn) -> int:
             try:
                 kws = json.loads(keywords_json)
                 search_terms.extend(kws[:5])
-            except Exception:
-                pass
+            except Exception as exc:
+                log.warning("Failed to parse keywords_json: %s", exc)
 
         for term in search_terms[:5]:
             like = f"%{term}%"

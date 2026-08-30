@@ -129,6 +129,19 @@ STAGE_SPECS: dict[str, dict[str, Any]] = {
             '"output_json" should contain bridge_types, support_hints, official_bridges, and blocker_hints.'
         ),
     },
+    "agent_search": {
+        "goal": (
+            "Search for official or documentary corroboration requested by another evidence-platform agent."
+        ),
+        "web_policy": (
+            "Use web search only to answer the specific request. Prefer official, archive, court, registry, "
+            "parliamentary, or primary-source pages. Keep unsupported context separate from source facts."
+        ),
+        "output_contract": (
+            'Return JSON with keys: "output_text", "output_json" and "confidence". '
+            '"output_json" should contain search_results, citations, source_facts, unresolved_questions, and external_context.'
+        ),
+    },
     "event_synthesis": {
         "goal": (
             "Synthesize a canonical event summary, ordered timeline, and participant roles from the provided packet."
@@ -188,7 +201,7 @@ def _stage_prompt(task: dict[str, Any]) -> tuple[str, str]:
 
 
 def _stage_allows_web(stage: str) -> bool:
-    return stage in {"relation_reasoning"}
+    return stage in {"relation_reasoning", "agent_search"}
 
 
 def _stage_schema(stage: str) -> dict[str, Any] | None:
@@ -492,6 +505,40 @@ def _openrouter_run(model: str, api_key: str, task: dict[str, Any]) -> dict[str,
     return _normalize_result("openrouter", model, stage, data)
 
 
+_OPENAI_COMPAT_ENDPOINTS: dict[str, str] = {
+    "deepseek": "https://api.deepseek.com/v1/chat/completions",
+    "fireworks": "https://api.fireworks.ai/inference/v1/chat/completions",
+    "together": "https://api.together.xyz/v1/chat/completions",
+    "huggingface": "https://router.huggingface.co/v1/chat/completions",
+}
+
+
+def _openai_compat_run(provider: str, model: str, api_key: str, task: dict[str, Any]) -> dict[str, Any]:
+    system_prompt, user_prompt = _stage_prompt(task)
+    stage = _task_stage(task)
+    response_format = _response_format_for_stage(stage)
+    endpoint = _OPENAI_COMPAT_ENDPOINTS.get(provider)
+    if not endpoint:
+        raise ProviderTaskError(f"no_endpoint_for_provider:{provider}")
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+    }
+    if response_format:
+        payload["response_format"] = response_format
+    if provider == "deepseek" and stage in ("relation_reasoning", "arbiter", "evidence_research"):
+        payload.setdefault("extra_body", {})["reasoning_effort"] = "high"
+    data = _post_json(
+        endpoint,
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        payload=payload,
+    )
+    return _normalize_result(provider, model, stage, data)
+
+
 def run_ai_task(*, conn: Any = None, provider: str, model: str, api_key: str, task: dict[str, Any]) -> dict[str, Any]:
     provider_name = str(provider or "").strip().lower()
     if provider_name == "openai":
@@ -504,4 +551,6 @@ def run_ai_task(*, conn: Any = None, provider: str, model: str, api_key: str, ta
         return _mistral_run(model, api_key, task)
     if provider_name == "openrouter":
         return _openrouter_run(model, api_key, task)
+    if provider_name in _OPENAI_COMPAT_ENDPOINTS:
+        return _openai_compat_run(provider_name, model, api_key, task)
     raise ProviderTaskError(f"unsupported_provider:{provider_name}")

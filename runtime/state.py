@@ -299,6 +299,15 @@ def heartbeat_job_lease(
         """,
         (now.isoformat(), expires_at, job_id, lease_owner),
     )
+    if table_exists(conn, "job_runs"):
+        conn.execute(
+            """
+            UPDATE job_runs
+            SET heartbeat_at=?
+            WHERE job_id=? AND owner=? AND status='running' AND finished_at IS NULL
+            """,
+            (now.isoformat(), job_id, lease_owner),
+        )
     conn.commit()
 
 
@@ -364,7 +373,19 @@ def start_job_run(
         ),
     )
     conn.commit()
-    return int(cur.lastrowid)
+    run_id = int(cur.lastrowid)
+    record_runtime_event(
+        conn,
+        level="info",
+        event_type="job_started",
+        stage="runtime",
+        job_id=job_id,
+        job_run_id=run_id,
+        pipeline_run_id=pipeline_run_id,
+        message=f"{job_id} started",
+        payload={"trigger_mode": trigger_mode, "requested_by": requested_by, "owner": owner},
+    )
+    return run_id
 
 
 def finish_job_run(conn: sqlite3.Connection, run_id: int, result: dict[str, Any]):
@@ -377,6 +398,20 @@ def finish_job_run(conn: sqlite3.Connection, run_id: int, result: dict[str, Any]
     elif retriable_errors:
         error_summary = "; ".join(str(item) for item in retriable_errors[:3])
 
+    started_row = conn.execute("SELECT started_at FROM job_runs WHERE id=?", (run_id,)).fetchone()
+    started_dt = parse_iso(started_row[0]) if started_row else None
+    finished_at = result.get("finished_at") or now_iso()
+    finished_dt = parse_iso(finished_at)
+    duration_ms = None
+    if started_dt and finished_dt:
+        duration_ms = int(max(0, (finished_dt - started_dt).total_seconds() * 1000))
+    warnings = result.get("warnings") or []
+    artifacts = result.get("artifacts") or {}
+    items_skipped = int(result.get("items_skipped") or artifacts.get("items_skipped") or 0)
+    items_failed = int(result.get("items_failed") or artifacts.get("items_failed") or len(fatal_errors))
+    duplicate_items = int(result.get("duplicate_items") or artifacts.get("duplicate_items") or 0)
+    last_message = str(result.get("last_message") or error_summary or status)
+
     conn.execute(
         """
         UPDATE job_runs
@@ -385,6 +420,15 @@ def finish_job_run(conn: sqlite3.Connection, run_id: int, result: dict[str, Any]
             items_seen=?,
             items_new=?,
             items_updated=?,
+            items_skipped=?,
+            items_failed=?,
+            duplicate_items=?,
+            heartbeat_at=?,
+            duration_ms=?,
+            warnings_count=?,
+            fatal_errors_count=?,
+            retriable_errors_count=?,
+            last_message=?,
             warnings_json=?,
             retriable_errors_json=?,
             fatal_errors_json=?,
@@ -396,21 +440,50 @@ def finish_job_run(conn: sqlite3.Connection, run_id: int, result: dict[str, Any]
         """,
         (
             status,
-            result.get("finished_at") or now_iso(),
+            finished_at,
             int(result.get("items_seen") or 0),
             int(result.get("items_new") or 0),
             int(result.get("items_updated") or 0),
-            json_dumps(result.get("warnings") or []),
+            items_skipped,
+            items_failed,
+            duplicate_items,
+            now_iso(),
+            duration_ms,
+            len(warnings),
+            len(fatal_errors),
+            len(retriable_errors),
+            last_message,
+            json_dumps(warnings),
             json_dumps(result.get("retriable_errors") or []),
             json_dumps(result.get("fatal_errors") or []),
             result.get("next_cursor"),
             json_dumps(result.get("health") or {}),
-            json_dumps(result.get("artifacts") or {}),
+            json_dumps(artifacts),
             error_summary,
             run_id,
         ),
     )
     conn.commit()
+    record_runtime_event(
+        conn,
+        level="info" if status == "ok" else "error",
+        event_type="job_finished",
+        stage="runtime",
+        job_id=str(result.get("job_id") or ""),
+        job_run_id=run_id,
+        message=f"{result.get('job_id') or 'job'} {status}",
+        error_type=None if status == "ok" else "job_failed",
+        payload={
+            "status": status,
+            "items_seen": result.get("items_seen", 0),
+            "items_new": result.get("items_new", 0),
+            "items_updated": result.get("items_updated", 0),
+            "items_skipped": items_skipped,
+            "items_failed": items_failed,
+            "duplicate_items": duplicate_items,
+            "duration_ms": duration_ms,
+        },
+    )
 
 
 def recover_abandoned_runs(conn: sqlite3.Connection, *, stale_seconds: int = 1800) -> dict[str, int]:
@@ -517,6 +590,15 @@ def finish_pipeline_run(
     conn.commit()
 
 
+def has_recent_successful_run(conn: sqlite3.Connection, job_id: str, within_hours: int = 48) -> bool:
+    cutoff = (utc_now_naive() - timedelta(hours=max(1, within_hours))).isoformat()
+    row = conn.execute(
+        "SELECT 1 FROM job_runs WHERE job_id=? AND status='ok' AND finished_at>=? LIMIT 1",
+        (job_id, cutoff),
+    ).fetchone()
+    return row is not None
+
+
 def latest_successful_pipeline_version(conn: sqlite3.Connection, mode: str | None = None) -> str | None:
     if mode:
         row = conn.execute(
@@ -548,6 +630,14 @@ def update_source_sync_state(
     quality_issue: str | None = None,
     failure_class: str | None = None,
     metadata: dict[str, Any] | None = None,
+    current_job_id: str | None = None,
+    is_collecting: bool | None = None,
+    current_channel: str | None = None,
+    current_telegram_session: str | None = None,
+    items_current_run: int | None = None,
+    items_today: int | None = None,
+    duplicates_current_run: int | None = None,
+    failed_items_current_run: int | None = None,
 ):
     existing = conn.execute(
         """
@@ -592,8 +682,10 @@ def update_source_sync_state(
         INSERT INTO source_sync_state(
             source_key, source_id, state, quality_state, quality_issue, failure_class, last_success_at, last_attempt_at,
             consecutive_failures, last_cursor, last_external_id, last_etag, last_hash,
-            last_http_status, transport_mode, last_error, metadata_json
-        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            last_http_status, transport_mode, last_error, current_job_id, is_collecting,
+            current_channel, current_telegram_session, items_current_run, items_today,
+            duplicates_current_run, failed_items_current_run, heartbeat_at, metadata_json
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(source_key) DO UPDATE SET
             source_id=COALESCE(excluded.source_id, source_sync_state.source_id),
             state=COALESCE(excluded.state, source_sync_state.state),
@@ -610,6 +702,15 @@ def update_source_sync_state(
             last_http_status=COALESCE(excluded.last_http_status, source_sync_state.last_http_status),
             transport_mode=COALESCE(excluded.transport_mode, source_sync_state.transport_mode),
             last_error=excluded.last_error,
+            current_job_id=COALESCE(excluded.current_job_id, source_sync_state.current_job_id),
+            is_collecting=COALESCE(excluded.is_collecting, source_sync_state.is_collecting),
+            current_channel=COALESCE(excluded.current_channel, source_sync_state.current_channel),
+            current_telegram_session=COALESCE(excluded.current_telegram_session, source_sync_state.current_telegram_session),
+            items_current_run=COALESCE(excluded.items_current_run, source_sync_state.items_current_run),
+            items_today=COALESCE(excluded.items_today, source_sync_state.items_today),
+            duplicates_current_run=COALESCE(excluded.duplicates_current_run, source_sync_state.duplicates_current_run),
+            failed_items_current_run=COALESCE(excluded.failed_items_current_run, source_sync_state.failed_items_current_run),
+            heartbeat_at=COALESCE(excluded.heartbeat_at, source_sync_state.heartbeat_at),
             metadata_json=excluded.metadata_json
         """,
         (
@@ -629,10 +730,114 @@ def update_source_sync_state(
             last_http_status,
             transport_mode,
             last_error,
+            current_job_id,
+            int(is_collecting) if is_collecting is not None else None,
+            current_channel,
+            current_telegram_session,
+            items_current_run,
+            items_today,
+            duplicates_current_run,
+            failed_items_current_run,
+            now,
             json_dumps(merged_metadata),
         ),
     )
     conn.commit()
+
+
+def record_runtime_event(
+    conn: sqlite3.Connection,
+    *,
+    level: str = "info",
+    event_type: str,
+    stage: str | None = None,
+    job_id: str | None = None,
+    job_run_id: int | None = None,
+    pipeline_run_id: int | None = None,
+    source_key: str | None = None,
+    source_type: str | None = None,
+    telegram_session: str | None = None,
+    channel: str | None = None,
+    provider: str | None = None,
+    model: str | None = None,
+    item_id: int | None = None,
+    raw_item_id: int | None = None,
+    content_item_id: int | None = None,
+    message: str | None = None,
+    error_type: str | None = None,
+    traceback_text: str | None = None,
+    payload: dict[str, Any] | None = None,
+) -> int | None:
+    if not table_exists(conn, "runtime_events"):
+        return None
+    cur = conn.execute(
+        """
+        INSERT INTO runtime_events(
+            created_at, level, event_type, stage, job_id, job_run_id, pipeline_run_id,
+            source_key, source_type, telegram_session, channel, provider, model,
+            item_id, raw_item_id, content_item_id, message, error_type, traceback_text, payload_json
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            now_iso(),
+            level,
+            event_type,
+            stage,
+            job_id,
+            job_run_id,
+            pipeline_run_id,
+            source_key,
+            source_type,
+            telegram_session,
+            channel,
+            provider,
+            model,
+            item_id,
+            raw_item_id,
+            content_item_id,
+            message,
+            error_type,
+            traceback_text,
+            json_dumps(payload or {}),
+        ),
+    )
+    conn.commit()
+    return int(cur.lastrowid)
+
+
+def record_processing_skip(
+    conn: sqlite3.Connection,
+    *,
+    stage: str,
+    reason: str,
+    source_key: str | None = None,
+    content_item_id: int | None = None,
+    raw_item_id: int | None = None,
+    external_id: str | None = None,
+    payload: dict[str, Any] | None = None,
+) -> int | None:
+    if not table_exists(conn, "processing_skips"):
+        return None
+    cur = conn.execute(
+        """
+        INSERT INTO processing_skips(stage, reason, source_key, content_item_id, raw_item_id, external_id, payload_json)
+        VALUES(?,?,?,?,?,?,?)
+        """,
+        (stage, reason, source_key, content_item_id, raw_item_id, external_id, json_dumps(payload or {})),
+    )
+    conn.commit()
+    record_runtime_event(
+        conn,
+        level="warning",
+        event_type="processing_skip",
+        stage=stage,
+        source_key=source_key,
+        content_item_id=content_item_id,
+        raw_item_id=raw_item_id,
+        message=f"{stage} skipped: {reason}",
+        payload={"reason": reason, "external_id": external_id, **(payload or {})},
+    )
+    return int(cur.lastrowid)
 
 
 def record_source_health_report(
@@ -871,7 +1076,26 @@ def record_dead_letter(
         ),
     )
     conn.commit()
-    return int(cur.lastrowid)
+    dead_id = int(cur.lastrowid)
+    record_runtime_event(
+        conn,
+        level="error",
+        event_type="dead_letter",
+        stage=failure_stage,
+        source_key=source_key,
+        raw_item_id=raw_item_id,
+        content_item_id=content_item_id,
+        message=error_message or failure_stage,
+        error_type=error_type,
+        payload={
+            "dead_letter_id": dead_id,
+            "source_id": source_id,
+            "external_id": external_id,
+            "attachment_id": attachment_id,
+            **(payload or {}),
+        },
+    )
+    return dead_id
 
 
 def runtime_summary(conn: sqlite3.Connection) -> dict[str, Any]:
@@ -931,7 +1155,9 @@ def open_runtime_db(db_path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA busy_timeout = 30000")
+    conn.execute("PRAGMA busy_timeout = 5000")
     conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA wal_autocheckpoint = 100")
+    conn.execute("PRAGMA journal_size_limit = 10485760")
     ensure_runtime_schema(conn)
     return conn

@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 from collections import defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -118,6 +119,10 @@ def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
 
 
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0).isoformat()
+
+
 def _parse_json(raw_value: Any, default: Any):
     if not raw_value:
         return default
@@ -208,6 +213,304 @@ def _infer_event_role(mention: dict[str, Any], votes: list[dict[str, Any]]) -> s
 
 def _coalesce_datetime(item: dict[str, Any]) -> str:
     return str(item.get("published_at") or item.get("collected_at") or item.get("event_date") or "")
+
+
+def _event_key(group: dict[str, Any]) -> str:
+    cluster_id = group.get("cluster_id")
+    if cluster_id is not None:
+        return f"cluster:{int(cluster_id)}"
+    canonical_content_id = group.get("canonical_content_id")
+    if canonical_content_id is not None:
+        return f"content:{int(canonical_content_id)}"
+    cluster_key = _normalize_space(group.get("cluster_key"))
+    if cluster_key:
+        return f"key:{cluster_key}"
+    item_ids = [str(item.get("id")) for item in group.get("items", []) if item.get("id") is not None]
+    return f"items:{','.join(item_ids) or 'unknown'}"
+
+
+def _supersede_current_event_projection(conn, event_id: int, timestamp: str) -> None:
+    conn.execute("UPDATE event_items SET superseded_at=? WHERE event_id=? AND superseded_at IS NULL", (timestamp, event_id))
+    conn.execute("UPDATE event_timeline SET superseded_at=? WHERE event_id=? AND superseded_at IS NULL", (timestamp, event_id))
+    conn.execute("UPDATE event_entities SET superseded_at=? WHERE event_id=? AND superseded_at IS NULL", (timestamp, event_id))
+    conn.execute(
+        """
+        UPDATE fact_evidence
+        SET superseded_at=?
+        WHERE superseded_at IS NULL
+          AND fact_id IN (SELECT id FROM event_facts WHERE event_id=?)
+        """,
+        (timestamp, event_id),
+    )
+    conn.execute("UPDATE event_facts SET superseded_at=? WHERE event_id=? AND superseded_at IS NULL", (timestamp, event_id))
+
+
+def _upsert_event(
+    conn,
+    *,
+    event_key: str,
+    event_title: str,
+    event_type: str,
+    summary_short: str,
+    summary_long: str,
+    event_date_start: str,
+    event_date_end: str,
+    importance_score: float,
+    confidence: float,
+    metadata_json: str,
+) -> tuple[int, bool]:
+    row = conn.execute("SELECT id FROM events WHERE event_key=?", (event_key,)).fetchone()
+    if not row:
+        metadata = _parse_json(metadata_json, {})
+        for legacy in conn.execute("SELECT id, metadata_json FROM events WHERE event_key IS NULL").fetchall():
+            legacy_metadata = _parse_json(legacy["metadata_json"] if hasattr(legacy, "keys") else legacy[1], {})
+            if not isinstance(legacy_metadata, dict):
+                continue
+            same_cluster = (
+                metadata.get("cluster_id") is not None
+                and legacy_metadata.get("cluster_id") == metadata.get("cluster_id")
+            )
+            same_cluster_key = (
+                metadata.get("cluster_key")
+                and legacy_metadata.get("cluster_key") == metadata.get("cluster_key")
+            )
+            same_canonical = (
+                metadata.get("cluster_id") is None
+                and metadata.get("canonical_content_id") is not None
+                and legacy_metadata.get("canonical_content_id") == metadata.get("canonical_content_id")
+            )
+            if same_cluster or same_cluster_key or same_canonical:
+                row = legacy
+                conn.execute("UPDATE events SET event_key=? WHERE id=?", (event_key, int(legacy["id"] if hasattr(legacy, "keys") else legacy[0])))
+                break
+    if row:
+        event_id = int(row["id"] if hasattr(row, "keys") else row[0])
+        conn.execute(
+            """
+            UPDATE events
+            SET canonical_title=?, event_type=?, summary_short=?, summary_long=?, status='active',
+                event_date_start=?, event_date_end=?, first_observed_at=?,
+                last_observed_at=?, importance_score=?, confidence=?, metadata_json=?,
+                superseded_at=NULL, updated_at=?
+            WHERE id=?
+            """,
+            (
+                event_title,
+                event_type,
+                summary_short,
+                summary_long,
+                event_date_start or None,
+                event_date_end or None,
+                event_date_start or None,
+                event_date_end or None,
+                importance_score,
+                confidence,
+                metadata_json,
+                _now_iso(),
+                event_id,
+            ),
+        )
+        return event_id, False
+    cursor = conn.execute(
+        """
+        INSERT INTO events(
+            event_key, canonical_title, event_type, summary_short, summary_long, status,
+            event_date_start, event_date_end, first_observed_at, last_observed_at,
+            importance_score, confidence, metadata_json
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            event_key,
+            event_title,
+            event_type,
+            summary_short,
+            summary_long,
+            "active",
+            event_date_start or None,
+            event_date_end or None,
+            event_date_start or None,
+            event_date_end or None,
+            importance_score,
+            confidence,
+            metadata_json,
+        ),
+    )
+    return int(cursor.lastrowid), True
+
+
+def _upsert_timeline(
+    conn,
+    *,
+    event_id: int,
+    timeline_date: str | None,
+    title: str,
+    description: str,
+    content_item_id: int,
+    document_content_id: int | None,
+    sort_order: int,
+    metadata_json: str,
+) -> bool:
+    row = conn.execute(
+        """
+        SELECT id
+        FROM event_timeline
+        WHERE event_id=? AND content_item_id=? AND COALESCE(title, '')=?
+        LIMIT 1
+        """,
+        (event_id, content_item_id, title or ""),
+    ).fetchone()
+    if row:
+        timeline_id = int(row["id"] if hasattr(row, "keys") else row[0])
+        conn.execute(
+            """
+            UPDATE event_timeline
+            SET timeline_date=?, description=?, document_content_id=?, sort_order=?,
+                metadata_json=?, superseded_at=NULL
+            WHERE id=?
+            """,
+            (timeline_date, description, document_content_id, sort_order, metadata_json, timeline_id),
+        )
+        return False
+    conn.execute(
+        """
+        INSERT INTO event_timeline(
+            event_id, timeline_date, title, description, content_item_id,
+            document_content_id, sort_order, metadata_json, superseded_at
+        ) VALUES(?,?,?,?,?,?,?,?,NULL)
+        """,
+        (event_id, timeline_date, title, description, content_item_id, document_content_id, sort_order, metadata_json),
+    )
+    return True
+
+
+def _upsert_fact(
+    conn,
+    *,
+    event_id: int,
+    claim_id: int | None,
+    fact_type: str,
+    canonical_text: str,
+    polarity: str,
+    valid_from: str | None,
+    valid_to: str | None,
+    observed_at: str | None,
+    confidence: float,
+    metadata_json: str,
+) -> tuple[int, bool]:
+    if claim_id is not None:
+        row = conn.execute(
+            "SELECT id FROM event_facts WHERE event_id=? AND claim_id=? LIMIT 1",
+            (event_id, claim_id),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            """
+            SELECT id
+            FROM event_facts
+            WHERE event_id=? AND claim_id IS NULL AND fact_type=? AND canonical_text=?
+            LIMIT 1
+            """,
+            (event_id, fact_type, canonical_text),
+        ).fetchone()
+    if row:
+        fact_id = int(row["id"] if hasattr(row, "keys") else row[0])
+        conn.execute(
+            """
+            UPDATE event_facts
+            SET fact_type=?, canonical_text=?, polarity=?, valid_from=?, valid_to=?,
+                observed_at=?, confidence=?, metadata_json=?, superseded_at=NULL
+            WHERE id=?
+            """,
+            (
+                fact_type,
+                canonical_text,
+                polarity,
+                valid_from,
+                valid_to,
+                observed_at,
+                confidence,
+                metadata_json,
+                fact_id,
+            ),
+        )
+        return fact_id, False
+    cursor = conn.execute(
+        """
+        INSERT INTO event_facts(
+            event_id, claim_id, fact_type, canonical_text, polarity, valid_from, valid_to,
+            observed_at, confidence, metadata_json, superseded_at
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,NULL)
+        """,
+        (
+            event_id,
+            claim_id,
+            fact_type,
+            canonical_text,
+            polarity,
+            valid_from,
+            valid_to,
+            observed_at,
+            confidence,
+            metadata_json,
+        ),
+    )
+    return int(cursor.lastrowid), True
+
+
+def _upsert_fact_evidence(
+    conn,
+    *,
+    fact_id: int,
+    content_item_id: int | None,
+    document_content_id: int | None,
+    evidence_type: str | None,
+    evidence_class: str,
+    source_strength: str,
+    metadata_json: str,
+) -> bool:
+    if document_content_id is None:
+        row = conn.execute(
+            """
+            SELECT id
+            FROM fact_evidence
+            WHERE fact_id=? AND content_item_id IS ? AND document_content_id IS NULL
+              AND COALESCE(evidence_type, '')=COALESCE(?, '')
+            LIMIT 1
+            """,
+            (fact_id, content_item_id, evidence_type),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            """
+            SELECT id
+            FROM fact_evidence
+            WHERE fact_id=? AND content_item_id IS ? AND document_content_id=?
+              AND COALESCE(evidence_type, '')=COALESCE(?, '')
+            LIMIT 1
+            """,
+            (fact_id, content_item_id, document_content_id, evidence_type),
+        ).fetchone()
+    if row:
+        evidence_id = int(row["id"] if hasattr(row, "keys") else row[0])
+        conn.execute(
+            """
+            UPDATE fact_evidence
+            SET evidence_class=?, source_strength=?, metadata_json=?, superseded_at=NULL
+            WHERE id=?
+            """,
+            (evidence_class, source_strength, metadata_json, evidence_id),
+        )
+        return False
+    conn.execute(
+        """
+        INSERT INTO fact_evidence(
+            fact_id, content_item_id, document_content_id, evidence_type,
+            evidence_class, source_strength, metadata_json, superseded_at
+        ) VALUES(?,?,?,?,?,?,?,NULL)
+        """,
+        (fact_id, content_item_id, document_content_id, evidence_type, evidence_class, source_strength, metadata_json),
+    )
+    return True
 
 
 def _first_sentence(text: str, max_len: int = 220) -> str:
@@ -436,12 +739,6 @@ def _canonical_content_groups(conn, limit: int | None = None) -> list[dict[str, 
 def build_event_pipeline(settings: dict[str, Any] | None = None, limit: int | None = None) -> dict[str, Any]:
     conn = get_db(settings or {})
     try:
-        conn.execute("DELETE FROM fact_evidence")
-        conn.execute("DELETE FROM event_facts")
-        conn.execute("DELETE FROM event_timeline")
-        conn.execute("DELETE FROM event_entities")
-        conn.execute("DELETE FROM event_items")
-        conn.execute("DELETE FROM events")
         conn.execute(
             """
             DELETE FROM content_derivations
@@ -646,31 +943,22 @@ def build_event_pipeline(settings: dict[str, Any] | None = None, limit: int | No
                 "canonical_content_id": group.get("canonical_content_id"),
                 "item_ids": item_ids,
             }
-            cursor = conn.execute(
-                """
-                INSERT INTO events(
-                    canonical_title, event_type, summary_short, summary_long, status,
-                    event_date_start, event_date_end, first_observed_at, last_observed_at,
-                    importance_score, confidence, metadata_json
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
-                """,
-                (
-                    event_title,
-                    event_type,
-                    summary_short,
-                    summary_long,
-                    "active",
-                    event_date_start or None,
-                    event_date_end or None,
-                    event_date_start or None,
-                    event_date_end or None,
-                    0.8 if group_restrictions else 0.6,
-                    0.88 if group_restrictions or group_claims else 0.5,
-                    _json(event_metadata),
-                ),
+            event_id, created = _upsert_event(
+                conn,
+                event_key=_event_key(group),
+                event_title=event_title,
+                event_type=event_type,
+                summary_short=summary_short,
+                summary_long=summary_long,
+                event_date_start=event_date_start,
+                event_date_end=event_date_end,
+                importance_score=0.8 if group_restrictions else 0.6,
+                confidence=0.88 if group_restrictions or group_claims else 0.5,
+                metadata_json=_json(event_metadata),
             )
-            event_id = int(cursor.lastrowid)
-            events_created += 1
+            if created:
+                events_created += 1
+            _supersede_current_event_projection(conn, event_id, _now_iso())
 
             for sort_order, item in enumerate(sorted_items):
                 content_id = int(item["id"])
@@ -678,8 +966,15 @@ def build_event_pipeline(settings: dict[str, Any] | None = None, limit: int | No
                 strength = _source_strength(item, item_role)
                 conn.execute(
                     """
-                    INSERT INTO event_items(event_id, content_item_id, content_cluster_id, item_role, source_strength, metadata_json)
-                    VALUES(?,?,?,?,?,?)
+                    INSERT INTO event_items(
+                        event_id, content_item_id, content_cluster_id, item_role,
+                        source_strength, metadata_json, superseded_at
+                    ) VALUES(?,?,?,?,?,?,NULL)
+                    ON CONFLICT(event_id, content_item_id, item_role) DO UPDATE SET
+                        content_cluster_id=excluded.content_cluster_id,
+                        source_strength=excluded.source_strength,
+                        metadata_json=excluded.metadata_json,
+                        superseded_at=NULL
                     """,
                     (
                         event_id,
@@ -696,22 +991,16 @@ def build_event_pipeline(settings: dict[str, Any] | None = None, limit: int | No
                         ),
                     ),
                 )
-                conn.execute(
-                    """
-                    INSERT INTO event_timeline(
-                        event_id, timeline_date, title, description, content_item_id, document_content_id, sort_order, metadata_json
-                    ) VALUES(?,?,?,?,?,?,?,?)
-                    """,
-                    (
-                        event_id,
-                        _coalesce_datetime(item) or None,
-                        _normalize_space(item.get("title")) or event_title,
-                        cleaned_by_item.get(content_id) or _normalize_space(item.get("body_text")),
-                        content_id,
-                        content_id if content_id in official_ids else None,
-                        sort_order,
-                        _json({"item_role": item_role}),
-                    ),
+                _upsert_timeline(
+                    conn,
+                    event_id=event_id,
+                    timeline_date=_coalesce_datetime(item) or None,
+                    title=_normalize_space(item.get("title")) or event_title,
+                    description=cleaned_by_item.get(content_id) or _normalize_space(item.get("body_text")),
+                    content_item_id=content_id,
+                    document_content_id=content_id if content_id in official_ids else None,
+                    sort_order=sort_order,
+                    metadata_json=_json({"item_role": item_role}),
                 )
                 timeline_written += 1
 
@@ -750,8 +1039,17 @@ def build_event_pipeline(settings: dict[str, Any] | None = None, limit: int | No
             for entity in sorted(event_entity_map.values(), key=lambda item: (item["role"], item["entity_id"])):
                 conn.execute(
                     """
-                    INSERT INTO event_entities(event_id, entity_id, role, confidence, valid_from, valid_to, observed_at, metadata_json)
-                    VALUES(?,?,?,?,?,?,?,?)
+                    INSERT INTO event_entities(
+                        event_id, entity_id, role, confidence, valid_from, valid_to,
+                        observed_at, metadata_json, superseded_at
+                    ) VALUES(?,?,?,?,?,?,?,?,NULL)
+                    ON CONFLICT(event_id, entity_id, role) DO UPDATE SET
+                        confidence=excluded.confidence,
+                        valid_from=excluded.valid_from,
+                        valid_to=excluded.valid_to,
+                        observed_at=excluded.observed_at,
+                        metadata_json=excluded.metadata_json,
+                        superseded_at=NULL
                     """,
                     (
                         event_id,
@@ -784,52 +1082,37 @@ def build_event_pipeline(settings: dict[str, Any] | None = None, limit: int | No
                 attachment_meta = attachments_by_content.get(content_id, {})
                 document_like = _is_document_like(tag_names, item, attachment_meta)
                 evidence_class = "hard" if document_like else ("support" if str(item.get("source_category") or "").startswith("official") else "signal")
-                fact_cursor = conn.execute(
-                    """
-                    INSERT INTO event_facts(
-                        event_id, claim_id, fact_type, canonical_text, polarity, valid_from, valid_to,
-                        observed_at, confidence, metadata_json
-                    ) VALUES(?,?,?,?,?,?,?,?,?,?)
-                    """,
-                    (
-                        event_id,
-                        None,
-                        fact_type,
-                        canonical_text,
-                        "negative" if any(tag.startswith("negative:") for tag in tag_names) or any(tag.startswith("restriction/") for tag in tag_names) else "neutral",
-                        event_date_start or None,
-                        event_date_end or None,
-                        observed_at_by_content.get(content_id) or event_date_start or None,
-                        _tag_fact_confidence(votes, document_like=document_like),
-                        _json(
-                            {
-                                "content_item_id": content_id,
-                                "derived_from": "content_tag_votes",
-                                "tags": sorted(tag_names),
-                                "attachment_count": attachment_meta.get("attachment_count", 0),
-                                "ocr_ready": attachment_meta.get("ocr_ready", 0),
-                            }
-                        ),
+                fact_id, _created_fact = _upsert_fact(
+                    conn,
+                    event_id=event_id,
+                    claim_id=None,
+                    fact_type=fact_type,
+                    canonical_text=canonical_text,
+                    polarity="negative" if any(tag.startswith("negative:") for tag in tag_names) or any(tag.startswith("restriction/") for tag in tag_names) else "neutral",
+                    valid_from=event_date_start or None,
+                    valid_to=event_date_end or None,
+                    observed_at=observed_at_by_content.get(content_id) or event_date_start or None,
+                    confidence=_tag_fact_confidence(votes, document_like=document_like),
+                    metadata_json=_json(
+                        {
+                            "content_item_id": content_id,
+                            "derived_from": "content_tag_votes",
+                            "tags": sorted(tag_names),
+                            "attachment_count": attachment_meta.get("attachment_count", 0),
+                            "ocr_ready": attachment_meta.get("ocr_ready", 0),
+                        }
                     ),
                 )
-                fact_id = int(fact_cursor.lastrowid)
                 facts_written += 1
-                conn.execute(
-                    """
-                    INSERT INTO fact_evidence(
-                        fact_id, content_item_id, document_content_id, evidence_type,
-                        evidence_class, source_strength, metadata_json
-                    ) VALUES(?,?,?,?,?,?,?)
-                    """,
-                    (
-                        fact_id,
-                        content_id,
-                        content_id if document_like else None,
-                        "document_screenshot" if document_like else "content_item",
-                        evidence_class,
-                        "strong" if evidence_class == "hard" else evidence_class,
-                        _json({"derived_from": "content_tag_votes", "tags": sorted(tag_names)}),
-                    ),
+                _upsert_fact_evidence(
+                    conn,
+                    fact_id=fact_id,
+                    content_item_id=content_id,
+                    document_content_id=content_id if document_like else None,
+                    evidence_type="document_screenshot" if document_like else "content_item",
+                    evidence_class=evidence_class,
+                    source_strength="strong" if evidence_class == "hard" else evidence_class,
+                    metadata_json=_json({"derived_from": "content_tag_votes", "tags": sorted(tag_names)}),
                 )
 
             for claim in group_claims:
@@ -839,65 +1122,43 @@ def build_event_pipeline(settings: dict[str, Any] | None = None, limit: int | No
                 fact_type = CLAIM_TO_FACT_TYPE.get(str(claim.get("claim_type") or "").strip().lower()) or str(
                     claim.get("claim_type") or "statement"
                 )
-                fact_cursor = conn.execute(
-                    """
-                    INSERT INTO event_facts(
-                        event_id, claim_id, fact_type, canonical_text, polarity, valid_from, valid_to,
-                        observed_at, confidence, metadata_json
-                    ) VALUES(?,?,?,?,?,?,?,?,?,?)
-                    """,
-                    (
-                        event_id,
-                        claim["id"],
-                        fact_type,
-                        canonical_text,
-                        "neutral",
-                        event_date_start or None,
-                        event_date_end or None,
-                        event_date_start or None,
-                        float(claim.get("confidence_final") or 0.75),
-                        _json({"content_item_id": claim.get("content_item_id"), "status": claim.get("status")}),
-                    ),
+                fact_id, _created_fact = _upsert_fact(
+                    conn,
+                    event_id=event_id,
+                    claim_id=int(claim["id"]) if claim.get("id") is not None else None,
+                    fact_type=fact_type,
+                    canonical_text=canonical_text,
+                    polarity="neutral",
+                    valid_from=event_date_start or None,
+                    valid_to=event_date_end or None,
+                    observed_at=event_date_start or None,
+                    confidence=float(claim.get("confidence_final") or 0.75),
+                    metadata_json=_json({"content_item_id": claim.get("content_item_id"), "status": claim.get("status")}),
                 )
-                fact_id = int(fact_cursor.lastrowid)
                 facts_written += 1
                 linked_rows = evidence_by_claim.get(int(claim["id"]), [])
                 if linked_rows:
                     for evidence in linked_rows:
-                        conn.execute(
-                            """
-                            INSERT INTO fact_evidence(
-                                fact_id, content_item_id, document_content_id, evidence_type,
-                                evidence_class, source_strength, metadata_json
-                            ) VALUES(?,?,?,?,?,?,?)
-                            """,
-                            (
-                                fact_id,
-                                claim.get("content_item_id"),
-                                evidence.get("evidence_item_id"),
-                                evidence.get("evidence_type"),
-                                evidence.get("evidence_class") or "support",
-                                evidence.get("strength") or "support",
-                                _json({"evidence_link_id": evidence.get("id"), "notes": evidence.get("notes")}),
-                            ),
+                        _upsert_fact_evidence(
+                            conn,
+                            fact_id=fact_id,
+                            content_item_id=claim.get("content_item_id"),
+                            document_content_id=evidence.get("evidence_item_id"),
+                            evidence_type=evidence.get("evidence_type"),
+                            evidence_class=evidence.get("evidence_class") or "support",
+                            source_strength=evidence.get("strength") or "support",
+                            metadata_json=_json({"evidence_link_id": evidence.get("id"), "notes": evidence.get("notes")}),
                         )
                 else:
-                    conn.execute(
-                        """
-                        INSERT INTO fact_evidence(
-                            fact_id, content_item_id, document_content_id, evidence_type,
-                            evidence_class, source_strength, metadata_json
-                        ) VALUES(?,?,?,?,?,?,?)
-                        """,
-                        (
-                            fact_id,
-                            claim.get("content_item_id"),
-                            None,
-                            "content_item",
-                            "support",
-                            "support",
-                            _json({"derived_from_claim": claim.get("id")}),
-                        ),
+                    _upsert_fact_evidence(
+                        conn,
+                        fact_id=fact_id,
+                        content_item_id=claim.get("content_item_id"),
+                        document_content_id=None,
+                        evidence_type="content_item",
+                        evidence_class="support",
+                        source_strength="support",
+                        metadata_json=_json({"derived_from_claim": claim.get("id")}),
                     )
 
         conn.commit()

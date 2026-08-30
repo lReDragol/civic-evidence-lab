@@ -1931,6 +1931,26 @@ button:disabled {
   vertical-align: middle;
 }
 
+.compact-table-scroll {
+  max-height: 340px;
+}
+
+.ops-table tbody tr.row-working td {
+  color: var(--text-main);
+  background: rgba(78, 242, 178, 0.045);
+}
+
+.ops-table tbody tr.row-error td {
+  color: #ffd9d9;
+  background: rgba(255, 75, 92, 0.075);
+}
+
+.ops-table td {
+  max-width: 280px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .data-table-row {
   cursor: pointer;
   transition: background 150ms ease;

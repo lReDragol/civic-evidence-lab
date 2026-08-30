@@ -139,7 +139,7 @@ class AiKeyPoolTests(unittest.TestCase):
             self.assertIsNotNone(row[2])
 
     def test_bootstrap_provider_catalog_registers_search_capable_models(self):
-        from llm.key_pool import bootstrap_provider_catalog
+        from llm.key_pool import PROVIDER_CATALOG, bootstrap_provider_catalog
 
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "ai.db"
@@ -160,14 +160,14 @@ class AiKeyPoolTests(unittest.TestCase):
             finally:
                 conn.close()
 
+            expected_providers = sorted(
+                provider
+                for provider, models in PROVIDER_CATALOG.items()
+                if any(model.get("supports_web_search") for model in models)
+            )
+
             self.assertGreaterEqual(result["inserted"] + result["updated"], 5)
-            self.assertEqual([provider for provider, _count in providers], [
-                "groq",
-                "mistral",
-                "openai",
-                "openrouter",
-                "perplexity",
-            ])
+            self.assertEqual([provider for provider, _count in providers], expected_providers)
 
     def test_reactivate_recoverable_keys_restores_provider_and_rate_removed_keys(self):
         from llm.key_pool import reactivate_recoverable_keys

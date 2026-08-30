@@ -11,7 +11,7 @@ sys_path = str(Path(__file__).resolve().parent.parent)
 if sys_path not in os.sys.path:
     os.sys.path.insert(0, sys_path)
 
-from config.db_utils import get_db, load_settings
+from config.db_utils import get_db, load_settings, setup_logging
 from runtime.state import record_dead_letter, update_source_sync_state
 
 log = logging.getLogger(__name__)
@@ -430,6 +430,20 @@ def _update_document_review_after_ocr(
                 int(row["id"]),
             ),
         )
+        try:
+            from agents.bus import enqueue_document_search_task
+
+            if any(identifiers.get(key) for key in ("dates", "numbers", "laws", "issuer", "organizations")):
+                enqueue_document_search_task(
+                    conn,
+                    content_id=int(content_id),
+                    document_identifiers=identifiers,
+                    review_task_id=int(row["id"]),
+                    source_links=payload.get("source_links") or payload.get("source_links_json") or [],
+                )
+        except sqlite3.OperationalError as exc:
+            if "agent_tasks" not in str(exc):
+                raise
 
 
 def process_unprocessed_ocr(settings: dict = None):
@@ -519,7 +533,7 @@ def process_unprocessed_ocr(settings: dict = None):
             )
             continue
 
-        log.info("OCR: %s (%s)", os.path.basename(file_path), att_type)
+        log.debug("OCR target: %s (%s)", os.path.basename(file_path), att_type)
         text = ""
 
         if att_type == "pdf":
@@ -602,8 +616,9 @@ def process_unprocessed_ocr(settings: dict = None):
 
 
 def main():
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-    process_unprocessed_ocr()
+    settings = load_settings()
+    setup_logging(settings)
+    process_unprocessed_ocr(settings)
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ import traceback
 from typing import Any
 
 from config.db_utils import get_db, load_settings
+from runtime.logging_context import bind_log_context, clear_log_context
 from runtime.contracts import JobResult, normalize_job_output, now_iso
 from runtime.registry import get_job_spec, run_job_callable
 from runtime.state import (
@@ -64,7 +65,8 @@ def _is_retriable_exception(exc: Exception) -> bool:
 
 
 def _heartbeat_loop(stop_event: threading.Event, settings: dict[str, Any], job_id: str, owner: str, ttl_seconds: int):
-    interval = max(10, min(15, ttl_seconds // 3))
+    # Slow heartbeat to 30-60s to reduce SQLite write contention under many parallel jobs
+    interval = max(30, min(60, ttl_seconds // 3))
     while not stop_event.wait(interval):
         conn = get_db(settings)
         try:
@@ -164,10 +166,13 @@ def _finalize_job_state(
     spec,
     result: dict[str, Any],
     pipeline_version: str | None,
+    initial_conn: sqlite3.Connection | None = None,
 ):
     last_error: Exception | None = None
     for attempt in range(FINALIZATION_RETRIES):
-        conn = get_db(settings)
+        # Reuse the main job connection for the first attempt to avoid
+        # reopening under heavy write contention.
+        conn = initial_conn if (attempt == 0 and initial_conn is not None) else get_db(settings)
         try:
             if job_id == "source_health" and result.get("ok"):
                 record_source_health_report(conn, result.get("artifacts") or {}, settings=settings)
@@ -202,7 +207,9 @@ def _finalize_job_state(
             log.warning("Finalization retry for %s skipped on locked DB (%d/%d): %s", job_id, attempt + 1, FINALIZATION_RETRIES, error)
             time.sleep(FINALIZATION_RETRY_DELAY_SEC)
         finally:
-            conn.close()
+            # Only close connections we opened ourselves; caller owns initial_conn.
+            if not (attempt == 0 and initial_conn is not None):
+                conn.close()
     if last_error:
         raise last_error
 
@@ -264,6 +271,7 @@ def run_job_once(
             pipeline_version=pipeline_version,
             pipeline_run_id=pipeline_run_id,
         )
+        bind_log_context(job_run_id=run_id, pipeline_run_id=pipeline_run_id)
         set_runtime_metadata(conn, f"last_job_started:{job_id}", started_at)
 
         heartbeat_thread = threading.Thread(
@@ -295,9 +303,11 @@ def run_job_once(
         stop_event.set()
         if heartbeat_thread is not None:
             heartbeat_thread.join(timeout=2)
+        clear_log_context()
 
         try:
-            conn.close()
+            # Pass the main connection into finalize so the first attempt
+            # avoids reopening a new connection under SQLite write contention.
             _finalize_job_state(
                 settings,
                 job_id=job_id,
@@ -306,6 +316,7 @@ def run_job_once(
                 spec=spec,
                 result=result,
                 pipeline_version=pipeline_version,
+                initial_conn=conn,
             )
         except Exception as error:
             message = f"finalization_error:{type(error).__name__}: {error}"
@@ -315,6 +326,9 @@ def run_job_once(
                 result.setdefault("fatal_errors", []).append(message)
                 result["ok"] = False
         finally:
-            conn.close()
+            try:
+                conn.close()
+            except Exception:
+                pass
 
     return result

@@ -7,7 +7,6 @@ import sys
 from pathlib import Path
 from datetime import datetime
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -20,7 +19,9 @@ SETTINGS_PATH = CONFIG_DIR / "settings.json"
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from config.db_utils import exec_schema as safe_exec_schema, setup_logging
 from db.file_store import attach_file, materialize_attachment
+from db.migration_runner import apply_pending_migrations
 
 
 def load_settings() -> dict:
@@ -40,9 +41,7 @@ def get_legacy_db_path(settings: dict) -> Path:
 
 
 def exec_schema(conn: sqlite3.Connection, schema_path: Path):
-    sql = schema_path.read_text(encoding="utf-8")
-    conn.executescript(sql)
-    conn.commit()
+    safe_exec_schema(conn, schema_path)
     log.info("Schema executed from %s", schema_path)
 
 
@@ -494,6 +493,73 @@ def backfill_attachment_blobs(conn: sqlite3.Connection):
     return updated
 
 
+def backfill_content_body_hash(conn: sqlite3.Connection, *, batch_size: int = 1000) -> int:
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(content_items)").fetchall()}
+    if "body_hash" not in cols:
+        return 0
+    updated = 0
+    while True:
+        rows = conn.execute(
+            """
+            SELECT id, body_text
+            FROM content_items
+            WHERE (body_hash IS NULL OR body_hash='')
+              AND body_text IS NOT NULL
+              AND TRIM(body_text) != ''
+            LIMIT ?
+            """,
+            (batch_size,),
+        ).fetchall()
+        if not rows:
+            break
+        for content_id, body_text in rows:
+            normalized = " ".join(str(body_text or "").split())
+            digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest() if normalized else None
+            conn.execute("UPDATE content_items SET body_hash=? WHERE id=?", (digest, content_id))
+            updated += 1
+        conn.commit()
+    if updated:
+        log.info("Backfilled %d content body hashes", updated)
+    return updated
+
+
+def cleanup_suppressed_template_claims(conn: sqlite3.Connection) -> int:
+    """Remove stale claims created before template suppression was enforced.
+
+    Suppressed templates are explicitly excluded from classifier/relation inputs.
+    Keeping old claims attached to them makes the quality gate fail and can leak
+    CTA/noise back into cases or exports.
+    """
+
+    rows = conn.execute(
+        """
+        SELECT cl.id
+        FROM claims cl
+        JOIN content_items ci ON ci.id = cl.content_item_id
+        WHERE COALESCE(ci.status, '')='suppressed_template'
+        """
+    ).fetchall()
+    claim_ids = [int(row[0]) for row in rows]
+    if not claim_ids:
+        return 0
+    placeholders = ",".join("?" for _ in claim_ids)
+    for table, column in (
+        ("case_claims", "claim_id"),
+        ("claim_occurrences", "claim_id"),
+        ("evidence_links", "claim_id"),
+    ):
+        table_exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (table,),
+        ).fetchone()
+        if table_exists:
+            conn.execute(f"DELETE FROM {table} WHERE {column} IN ({placeholders})", claim_ids)
+    conn.execute(f"DELETE FROM claims WHERE id IN ({placeholders})", claim_ids)
+    conn.commit()
+    log.info("Removed %d stale claims from suppressed_template content", len(claim_ids))
+    return len(claim_ids)
+
+
 def apply_migrations(conn: sqlite3.Connection):
     _add_column_if_missing(conn, "raw_blobs", "original_filename", "original_filename TEXT")
     _add_column_if_missing(conn, "raw_blobs", "storage_rel_path", "storage_rel_path TEXT")
@@ -516,32 +582,53 @@ def apply_migrations(conn: sqlite3.Connection):
     legacy_source_id = get_or_create_legacy_telegram_source(conn)
     reassign_existing_legacy_items(conn, legacy_source_id)
 
-    cur = conn.execute("PRAGMA table_info(evidence_links)")
-    cols = {row[1]: row[2] for row in cur.fetchall()}
-    if "evidence_item_id" in cols and cols["evidence_item_id"] == "INTEGER NOT NULL":
-        count = conn.execute("SELECT COUNT(*) FROM evidence_links").fetchone()[0]
-        if count == 0:
-            conn.execute("DROP TABLE IF EXISTS evidence_links")
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS evidence_links (
-                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                    claim_id        INTEGER NOT NULL,
+    evidence_columns = {
+        row[1]: {"type": str(row[2] or "").upper(), "notnull": bool(row[3])}
+        for row in conn.execute("PRAGMA table_info(evidence_links)").fetchall()
+    }
+    evidence_item_column = evidence_columns.get("evidence_item_id")
+    if evidence_item_column and evidence_item_column["notnull"]:
+        conn.execute("PRAGMA foreign_keys=OFF")
+        try:
+            conn.executescript(
+                """
+                BEGIN IMMEDIATE;
+                ALTER TABLE evidence_links RENAME TO evidence_links_legacy_notnull;
+                CREATE TABLE evidence_links (
+                    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                    claim_id         INTEGER NOT NULL,
                     evidence_item_id INTEGER,
-                    evidence_type   TEXT NOT NULL,
-                    strength        TEXT DEFAULT 'moderate',
-                    notes           TEXT,
-                    linked_by       TEXT,
-                    linked_at       TEXT DEFAULT (datetime('now')),
+                    evidence_type    TEXT NOT NULL,
+                    evidence_class   TEXT DEFAULT 'support',
+                    strength         TEXT DEFAULT 'moderate',
+                    notes            TEXT,
+                    linked_by        TEXT,
+                    linked_at        TEXT DEFAULT (datetime('now')),
                     FOREIGN KEY (claim_id) REFERENCES claims(id) ON DELETE CASCADE,
                     FOREIGN KEY (evidence_item_id) REFERENCES content_items(id) ON DELETE CASCADE
+                );
+                INSERT INTO evidence_links(
+                    id, claim_id, evidence_item_id, evidence_type, evidence_class,
+                    strength, notes, linked_by, linked_at
                 )
-            """)
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_evidence_claim ON evidence_links(claim_id)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_evidence_item ON evidence_links(evidence_item_id)")
-            conn.commit()
-            log.info("Migrated evidence_links: evidence_item_id now nullable")
-        else:
-            log.warning("evidence_links has %d rows — manual migration needed for NOT NULL -> nullable", count)
+                SELECT
+                    id, claim_id, evidence_item_id, evidence_type, 'support',
+                    strength, notes, linked_by, linked_at
+                FROM evidence_links_legacy_notnull;
+                DROP TABLE evidence_links_legacy_notnull;
+                CREATE INDEX IF NOT EXISTS idx_evidence_claim ON evidence_links(claim_id);
+                CREATE INDEX IF NOT EXISTS idx_evidence_item ON evidence_links(evidence_item_id);
+                CREATE INDEX IF NOT EXISTS idx_evidence_class ON evidence_links(evidence_class);
+                COMMIT;
+                """
+            )
+            log.info("Migrated evidence_links: evidence_item_id is now nullable")
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        finally:
+            conn.execute("PRAGMA foreign_keys=ON")
 
     content_cols = {row[1] for row in conn.execute("PRAGMA table_info(content_items)")}
     if "ner_processed" not in content_cols:
@@ -567,6 +654,7 @@ def apply_migrations(conn: sqlite3.Connection):
 
 def migrate(legacy_import: bool = True):
     settings = load_settings()
+    setup_logging(settings)
     db_path = get_db_path(settings)
     legacy_path = get_legacy_db_path(settings)
 
@@ -576,6 +664,9 @@ def migrate(legacy_import: bool = True):
     log.info("DB: %s", db_path)
 
     exec_schema(conn, SCHEMA_PATH)
+    migration_result = apply_pending_migrations(conn)
+    if migration_result["applied"]:
+        log.info("Applied versioned migrations: %s", migration_result["applied"])
     apply_migrations(conn)
     seed_sources(conn, SEED_PATH)
 
@@ -583,6 +674,8 @@ def migrate(legacy_import: bool = True):
         import_legacy_data(conn, legacy_path, settings)
 
     backfill_attachment_blobs(conn)
+    backfill_content_body_hash(conn)
+    cleanup_suppressed_template_claims(conn)
 
     tables = [row[0] for row in conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"

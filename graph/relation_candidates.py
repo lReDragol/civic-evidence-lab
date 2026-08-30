@@ -812,6 +812,7 @@ def _load_event_fact_bridge_support_rows(
                 COALESCE(fe.evidence_type, '') AS evidence_type,
                 COALESCE(fe.source_strength, '') AS source_strength
             FROM fact_evidence fe
+            WHERE fe.superseded_at IS NULL
             """
         ).fetchall():
             evidence_rows[int(row[0])].append(
@@ -828,6 +829,7 @@ def _load_event_fact_bridge_support_rows(
         SELECT event_id, entity_id, COALESCE(role, '') AS role
         FROM event_entities
         WHERE entity_id IS NOT NULL
+          AND superseded_at IS NULL
         ORDER BY event_id, entity_id
         """
     ).fetchall():

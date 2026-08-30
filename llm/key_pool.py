@@ -15,24 +15,112 @@ def now_iso() -> str:
 
 
 PROVIDER_CATALOG: dict[str, list[dict[str, Any]]] = {
-    "openai": [
+    "deepseek": [
         {
-            "model_name": "gpt-5",
-            "capability_tier": 5,
-            "supports_web_search": 1,
+            "model_name": "deepseek-v4-flash",
+            "capability_tier": 3,
+            "supports_web_search": 0,
             "supports_reasoning": 1,
-            "supports_background": 1,
-            "stage_roles": ["structured_extract", "event_synthesis", "arbiter", "relation_reasoning"],
-        }
+            "supports_background": 0,
+            "stage_roles": ["tag_reasoning", "structured_extract", "clean_factual_text", "triage"],
+        },
+        {
+            "model_name": "deepseek-v4-pro",
+            "capability_tier": 4,
+            "supports_web_search": 0,
+            "supports_reasoning": 1,
+            "supports_background": 0,
+            "stage_roles": ["relation_reasoning", "arbiter", "event_synthesis"],
+        },
+    ],
+    "groq": [
+        {
+            "model_name": "qwen/qwen3-32b",
+            "capability_tier": 3,
+            "supports_web_search": 0,
+            "supports_reasoning": 1,
+            "supports_background": 0,
+            "stage_roles": ["tag_reasoning", "triage", "structured_extract"],
+        },
+        {
+            "model_name": "llama-3.3-70b-versatile",
+            "capability_tier": 3,
+            "supports_web_search": 0,
+            "supports_reasoning": 1,
+            "supports_background": 0,
+            "stage_roles": ["tag_reasoning", "triage", "clean_factual_text"],
+        },
+    ],
+    "mistral": [
+        {
+            "model_name": "mistral-medium-2505",
+            "capability_tier": 4,
+            "supports_web_search": 0,
+            "supports_reasoning": 1,
+            "supports_background": 0,
+            "stage_roles": ["structured_extract", "event_link_hint", "clean_factual_text", "tag_reasoning"],
+        },
+        {
+            "model_name": "mistral-small-latest",
+            "capability_tier": 3,
+            "supports_web_search": 0,
+            "supports_reasoning": 1,
+            "supports_background": 0,
+            "stage_roles": ["triage", "tag_reasoning", "clean_factual_text"],
+        },
+        {
+            "model_name": "open-mistral-nemo",
+            "capability_tier": 2,
+            "supports_web_search": 0,
+            "supports_reasoning": 0,
+            "supports_background": 0,
+            "stage_roles": ["triage", "tag_reasoning"],
+        },
+    ],
+    "fireworks": [
+        {
+            "model_name": "accounts/fireworks/models/glm-5p1",
+            "capability_tier": 4,
+            "supports_web_search": 0,
+            "supports_reasoning": 1,
+            "supports_background": 0,
+            "stage_roles": ["structured_extract", "event_link_hint", "relation_reasoning"],
+        },
+        {
+            "model_name": "fireworks/gpt-oss-120b",
+            "capability_tier": 3,
+            "supports_web_search": 0,
+            "supports_reasoning": 1,
+            "supports_background": 0,
+            "stage_roles": ["tag_reasoning", "triage"],
+        },
+    ],
+    "together": [
+        {
+            "model_name": "Qwen/Qwen3.5-397B-A17B",
+            "capability_tier": 4,
+            "supports_web_search": 0,
+            "supports_reasoning": 1,
+            "supports_background": 0,
+            "stage_roles": ["structured_extract", "event_synthesis", "relation_reasoning"],
+        },
+        {
+            "model_name": "openai/gpt-oss-120b",
+            "capability_tier": 3,
+            "supports_web_search": 0,
+            "supports_reasoning": 1,
+            "supports_background": 0,
+            "stage_roles": ["tag_reasoning", "triage"],
+        },
     ],
     "perplexity": [
         {
             "model_name": "sonar-reasoning-pro",
-            "capability_tier": 5,
+            "capability_tier": 4,
             "supports_web_search": 1,
             "supports_reasoning": 1,
             "supports_background": 0,
-            "stage_roles": ["structured_extract", "event_link_hint", "relation_reasoning"],
+            "stage_roles": ["relation_reasoning", "evidence_research", "agent_search"],
         },
         {
             "model_name": "sonar-deep-research",
@@ -42,43 +130,51 @@ PROVIDER_CATALOG: dict[str, list[dict[str, Any]]] = {
             "supports_background": 0,
             "stage_roles": ["event_synthesis", "evidence_research"],
         },
-    ],
-    "groq": [
         {
-            "model_name": "groq/compound",
-            "capability_tier": 4,
+            "model_name": "sonar",
+            "capability_tier": 2,
             "supports_web_search": 1,
-            "supports_reasoning": 1,
+            "supports_reasoning": 0,
             "supports_background": 0,
-            "stage_roles": ["clean_factual_text", "structured_extract", "tag_reasoning"],
-        },
-        {
-            "model_name": "groq/compound-mini",
-            "capability_tier": 3,
-            "supports_web_search": 1,
-            "supports_reasoning": 1,
-            "supports_background": 0,
-            "stage_roles": ["triage", "tag_reasoning"],
+            "stage_roles": ["agent_search", "quick_check"],
         },
     ],
-    "mistral": [
+    "huggingface": [
         {
-            "model_name": "mistral-medium-2505",
+            "model_name": "Qwen/Qwen3.5-397B-A17B",
             "capability_tier": 4,
-            "supports_web_search": 1,
+            "supports_web_search": 0,
             "supports_reasoning": 1,
             "supports_background": 0,
-            "stage_roles": ["clean_factual_text", "structured_extract", "event_link_hint"],
-        }
+            "stage_roles": ["structured_extract", "event_synthesis"],
+        },
     ],
     "openrouter": [
         {
             "model_name": "openrouter/auto",
             "capability_tier": 3,
-            "supports_web_search": 1,
+            "supports_web_search": 0,
             "supports_reasoning": 1,
             "supports_background": 0,
             "stage_roles": ["overflow", "fallback"],
+        },
+        {
+            "model_name": "inclusionai/ring-2.6-1t:free",
+            "capability_tier": 4,
+            "supports_web_search": 0,
+            "supports_reasoning": 1,
+            "supports_background": 0,
+            "stage_roles": ["overflow_reasoning"],
+        },
+    ],
+    "openai": [
+        {
+            "model_name": "gpt-5",
+            "capability_tier": 5,
+            "supports_web_search": 1,
+            "supports_reasoning": 1,
+            "supports_background": 1,
+            "stage_roles": ["structured_extract", "event_synthesis", "arbiter", "relation_reasoning"],
         }
     ],
 }
@@ -426,9 +522,10 @@ def record_key_success(conn: sqlite3.Connection, key_id: int) -> None:
     _with_sqlite_write_retry(operation, conn)
 
 
-def list_active_keys(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+def list_active_keys(conn: sqlite3.Connection, *, requires_web_search: bool = False) -> list[dict[str, Any]]:
+    web_filter = "AND m.supports_web_search = 1" if requires_web_search else ""
     rows = conn.execute(
-        """
+        f"""
         SELECT
             k.id,
             k.provider,
@@ -442,7 +539,7 @@ def list_active_keys(conn: sqlite3.Connection) -> list[dict[str, Any]]:
         JOIN llm_provider_models m
           ON m.provider = k.provider
          AND m.is_active = 1
-         AND m.supports_web_search = 1
+         {web_filter}
         WHERE k.status='active'
         ORDER BY
             k.failure_count ASC,
@@ -474,12 +571,13 @@ def choose_key_for_stage(
     stage: str,
     provider_priority: list[str] | tuple[str, ...] | None = None,
     exclude_key_ids: set[int] | None = None,
+    requires_web_search: bool = False,
 ) -> dict[str, Any] | None:
     exclude = exclude_key_ids or set()
-    candidates = [item for item in list_active_keys(conn) if item["key_id"] not in exclude]
+    candidates = [item for item in list_active_keys(conn, requires_web_search=requires_web_search) if item["key_id"] not in exclude]
     if not candidates:
         return None
-    priority = list(provider_priority or ["mistral", "perplexity", "groq", "openrouter", "openai"])
+    priority = list(provider_priority or ["deepseek", "groq", "mistral", "fireworks", "together", "perplexity", "huggingface", "openrouter", "openai"])
     if priority:
         allowed_providers = set(priority)
         candidates = [item for item in candidates if item["provider"] in allowed_providers]

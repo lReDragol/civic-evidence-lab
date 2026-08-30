@@ -216,25 +216,139 @@ def _extract_json_robust(text: str) -> Optional[Dict]:
     return fields if fields else None
 
 
-def _call_ollama(text: str, model: str = "qwen2.5:14b",
-                 host: str = "http://localhost:11434") -> Optional[Dict]:
+_OPENAI_COMPAT = {
+    "deepseek": "https://api.deepseek.com/v1/chat/completions",
+    "fireworks": "https://api.fireworks.ai/inference/v1/chat/completions",
+    "together": "https://api.together.xyz/v1/chat/completions",
+    "huggingface": "https://router.huggingface.co/v1/chat/completions",
+    "groq": "https://api.groq.com/openai/v1/chat/completions",
+    "mistral": "https://api.mistral.ai/v1/chat/completions",
+    "openrouter": "https://openrouter.ai/api/v1/chat/completions",
+    "perplexity": "https://api.perplexity.ai/chat/completions",
+    "openai": "https://api.openai.com/v1/chat/completions",
+}
+
+
+def _direct_llm_call(provider: str, model: str, api_key: str, system_msg: str, user_msg: str) -> Optional[str]:
+    import requests
+    endpoint = _OPENAI_COMPAT.get(provider.lower())
+    if not endpoint:
+        log.warning("No endpoint for provider %s", provider)
+        return None
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_msg},
+        ],
+        "temperature": 0.15,
+        "max_tokens": 1024,
+    }
     try:
-        from ollama import Client
-        client = Client(host=host)
-        prompt = f"{_build_prompt()}\n\nТекст:\n{text[:3000]}"
-        response = client.chat(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            options={"temperature": 0.1, "num_predict": 800},
+        resp = requests.post(
+            endpoint,
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json=payload,
+            timeout=90,
         )
-        content = response["message"]["content"].strip()
-        raw = _extract_json_robust(content)
-        if raw:
-            return _validate_and_normalize(raw)
-        log.warning("No valid JSON from LLM: %s", content[:100])
+        if resp.status_code >= 400:
+            log.warning("LLM API %s returned %d: %s", provider, resp.status_code, resp.text[:200])
+            return None
+        data = resp.json()
+        choices = data.get("choices") or []
+        if choices:
+            content = (choices[0].get("message") or {}).get("content", "")
+            if content:
+                return content.strip()
+        return None
     except Exception as e:
-        log.warning("Ollama call failed: %s", e)
+        log.warning("LLM API call failed (%s): %s", provider, e)
+        return None
+
+
+_SYSTEM_MSG = (
+    "Ты — аналитик российских новостей. Ты получаешь текст новости и должна вернуть ТОЛЬКО JSON-объект. "
+    "Никакого дополнительного текста, пояснений или markdown-обёрток. Только чистый JSON."
+)
+
+
+def _call_cloud_llm(text: str, settings: dict = None, conn=None) -> Optional[Dict]:
+    from llm.key_pool import choose_key_for_stage, bootstrap_provider_catalog, import_keys_from_file, record_key_failure, record_key_success
+    from config.db_utils import get_db, load_settings
+    from pathlib import Path
+
+    if settings is None:
+        settings = load_settings()
+
+    own_conn = conn is None
+    if own_conn:
+        conn = get_db(settings)
+    try:
+        key_file = str(Path(settings.get("project_root", ".")) / "key.json")
+        try:
+            import_keys_from_file(conn, key_file)
+        except Exception as exc:
+            log.warning("import_keys_from_file failed: %s", exc)
+        bootstrap_provider_catalog(conn)
+
+        prompt = f"{_build_prompt()}\n\nТекст:\n{text[:3000]}"
+        user_msg = prompt
+
+        exclude_keys: set = set()
+        max_attempts = 3
+
+        for attempt in range(max_attempts):
+            key_info = choose_key_for_stage(
+                conn, stage="tag_reasoning",
+                provider_priority=["deepseek", "mistral", "groq", "fireworks", "together", "huggingface", "openrouter", "perplexity", "openai"],
+                exclude_key_ids=exclude_keys,
+            )
+            if not key_info:
+                break
+
+            model_name = key_info.get("model_name") or key_info.get("model") or ""
+            if not model_name:
+                exclude_keys.add(key_info["key_id"])
+                continue
+
+            output = _direct_llm_call(
+                provider=key_info["provider"],
+                model=model_name,
+                api_key=key_info["api_key"],
+                system_msg=_SYSTEM_MSG,
+                user_msg=user_msg,
+            )
+
+            key_id = key_info.get("key_id")
+            if output:
+                raw = _extract_json_robust(output)
+                if raw:
+                    if key_id:
+                        record_key_success(conn, key_id)
+                    return _validate_and_normalize(raw)
+                log.warning("No valid JSON from %s/%s (attempt %d): %s", key_info["provider"], model_name, attempt+1, output[:100])
+                if key_id:
+                    record_key_failure(conn, key_id, failure_kind="bad_output", error_text="non_json_response")
+                    exclude_keys.add(key_id)
+            else:
+                if key_id:
+                    record_key_failure(conn, key_id, failure_kind="empty_response", error_text="empty")
+                    exclude_keys.add(key_id)
+
+    except Exception as e:
+        log.warning("Cloud LLM call failed: %s", e)
+    finally:
+        if own_conn:
+            try:
+                conn.close()
+            except Exception as exc:
+                log.warning("conn.close failed: %s", exc)
     return None
+
+
+def _call_ollama(text: str, settings: dict = None, conn=None, **_kwargs) -> Optional[Dict]:
+    """Compatibility shim for older tests/callers; LLM v2 now routes via the key pool."""
+    return _call_cloud_llm(text, settings=settings, conn=conn)
 
 
 def _store_llm_results(conn: sqlite3.Connection, content_id: int, result: Dict):
@@ -265,8 +379,8 @@ def _store_llm_results(conn: sqlite3.Connection, content_id: int, result: Dict):
                     "INSERT INTO tag_explanations(content_tag_id, trigger_text, trigger_rule, matched_pattern, confidence_raw) VALUES(?,?,?,?,?)",
                     (tag_row[0], result["reasoning"][:300], result["l1"], "llm_v2", 0.8),
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                log.warning("tag_explanation insert failed: %s", exc)
 
     if result.get("l2"):
         existing = conn.execute(
@@ -348,21 +462,40 @@ def _store_llm_results(conn: sqlite3.Connection, content_id: int, result: Dict):
             pass
 
 
+_IMAGE_PATTERN = re.compile(r'^(фото в телеграмме\s*\(photo_\d+.*\)|\s*)$', re.IGNORECASE)
+
+
+def _is_image_only(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return True
+    if len(stripped) < 15 and _IMAGE_PATTERN.match(stripped):
+        return True
+    if re.match(r'^\s*фото в телеграмме\s*\(photo_\d+.*?\)\s*$', stripped, re.IGNORECASE):
+        return True
+    return False
+
+
 def classify_content(settings: dict = None, batch_size: int = 100):
     if settings is None:
         settings = load_settings()
 
-    model = settings.get("ollama_model", "qwen2.5:14b")
-    host = settings.get("ollama_host", "http://localhost:11434")
-
     conn = get_db(settings)
+
+    skipped_images = conn.execute(
+        "UPDATE content_items SET llm_processed=1 WHERE llm_processed=0 AND length(body_text) <= 15"
+    ).rowcount
+    if skipped_images:
+        conn.commit()
+        log.info("Pre-marked %d image-only/empty items as llm_processed", skipped_images)
 
     rows = conn.execute(
         """
         SELECT c.id, c.body_text, c.title
         FROM content_items c
-        WHERE (length(c.body_text) > 30 OR length(c.title) > 10)
+        WHERE (length(c.body_text) > 15 OR length(c.title) > 10)
           AND c.llm_processed = 0
+          AND COALESCE(c.status, '') NOT IN ('suppressed_garbage', 'suppressed_promo', 'suppressed_template')
         ORDER BY c.id
         LIMIT ?
         """,
@@ -374,18 +507,18 @@ def classify_content(settings: dict = None, batch_size: int = 100):
         conn.close()
         return
 
-    log.info("LLM v2 classifying %d items (model=%s)", len(rows), model)
+    log.info("LLM v2 classifying %d items (cloud API)", len(rows))
 
     classified = 0
     failed = 0
     for row in rows:
         content_id = row["id"]
         text = f"{row['title'] or ''}\n{row['body_text'] or ''}"
-        if len(text.strip()) < 30:
+        if _is_image_only(text) or len(text.strip()) < 30:
             conn.execute("UPDATE content_items SET llm_processed=1 WHERE id=?", (content_id,))
             continue
 
-        result = _call_ollama(text, model=model, host=host)
+        result = _call_cloud_llm(text, settings=settings, conn=conn)
         if result:
             _store_llm_results(conn, content_id, result)
             conn.execute("UPDATE content_items SET llm_processed=1 WHERE id=?", (content_id,))
@@ -402,14 +535,185 @@ def classify_content(settings: dict = None, batch_size: int = 100):
     return {"classified": classified, "failed": failed}
 
 
+_PROVIDER_MODEL_OVERRIDE = {
+    "mistral": "mistral-small-latest",
+    "groq": "qwen/qwen3-32b",
+    "fireworks": "fireworks/gpt-oss-120b",
+    "deepseek": "deepseek-v4-flash",
+    "together": "openai/gpt-oss-120b",
+    "huggingface": "Qwen/Qwen3.5-397B-A17B",
+    "openrouter": "openrouter/auto",
+    "perplexity": "sonar",
+    "openai": "gpt-5",
+}
+
+
+def classify_content_parallel(settings: dict = None, batch_size: int = 500, workers: int = 10):
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from llm.key_pool import list_active_keys, bootstrap_provider_catalog, import_keys_from_file, record_key_failure, record_key_success
+    from pathlib import Path
+    import threading
+
+    if settings is None:
+        settings = load_settings()
+
+    conn_main = get_db(settings)
+
+    skipped_images = conn_main.execute(
+        "UPDATE content_items SET llm_processed=1 WHERE llm_processed=0 AND length(body_text) <= 15"
+    ).rowcount
+    if skipped_images:
+        conn_main.commit()
+        log.info("Pre-marked %d image-only/empty items as llm_processed", skipped_images)
+
+    rows = conn_main.execute(
+        """
+        SELECT c.id, c.body_text, c.title
+        FROM content_items c
+        WHERE (length(c.body_text) > 15 OR length(c.title) > 10)
+          AND c.llm_processed = 0
+          AND COALESCE(c.status, '') NOT IN ('suppressed_garbage', 'suppressed_promo', 'suppressed_template')
+        ORDER BY c.id
+        LIMIT ?
+        """,
+        (batch_size,),
+    ).fetchall()
+    conn_main.close()
+
+    if not rows:
+        log.info("No content items to classify via LLM")
+        return
+
+    prompt_template = _build_prompt()
+    log.info("LLM v2 parallel classifying %d items with %d workers", len(rows), workers)
+
+    key_file = str(Path(settings.get("project_root", ".")) / "key.json")
+
+    _key_lock = threading.Lock()
+    _key_index = [0]
+    _all_keys = []
+
+    def _load_keys():
+        c = get_db(settings)
+        try:
+            import_keys_from_file(c, key_file)
+            bootstrap_provider_catalog(c)
+            ks = list_active_keys(c)
+            ks = [k for k in ks if k.get("model_name") and k.get("api_key")]
+            return ks
+        finally:
+            c.close()
+
+    _all_keys = _load_keys()
+    _all_keys.sort(key=lambda k: (k.get("failure_count", 0), str(k.get("last_used_at") or "")))
+    _all_keys = [k for k in _all_keys if k.get("failure_count", 0) == 0]
+    _dead_providers = {"together"}
+    _all_keys = [k for k in _all_keys if k["provider"] not in _dead_providers]
+    log.info("Loaded %d healthy keys for parallel classification", len(_all_keys))
+
+    classified = 0
+    failed = 0
+    _count_lock = threading.Lock()
+    _db_lock = threading.Lock()
+
+    def _process_item(row_tuple):
+        nonlocal classified, failed
+        content_id = row_tuple[0]
+        text = (row_tuple[2] or '') + '\n' + (row_tuple[1] or '')
+        if _is_image_only(text) or len(text.strip()) < 30:
+            c = get_db(settings)
+            try:
+                c.execute("UPDATE content_items SET llm_processed=1 WHERE id=?", (content_id,))
+                c.commit()
+            finally:
+                c.close()
+            return True
+
+        user_msg = prompt_template + '\n\nТекст:\n' + text[:3000]
+
+        with _key_lock:
+            if not _all_keys:
+                return False
+            idx = _key_index[0] % len(_all_keys)
+            _key_index[0] += 1
+            key_info = _all_keys[idx]
+
+        provider = key_info["provider"]
+        model_name = _PROVIDER_MODEL_OVERRIDE.get(provider, key_info.get("model_name", ""))
+        api_key = key_info["api_key"]
+        key_id = key_info.get("key_id")
+
+        output = _direct_llm_call(
+            provider=provider,
+            model=model_name,
+            api_key=api_key,
+            system_msg=_SYSTEM_MSG,
+            user_msg=user_msg,
+        )
+
+        if output:
+            raw = _extract_json_robust(output)
+            if raw:
+                result = _validate_and_normalize(raw)
+                with _db_lock:
+                    c = get_db(settings)
+                    try:
+                        _store_llm_results(c, content_id, result)
+                        c.execute("UPDATE content_items SET llm_processed=1 WHERE id=?", (content_id,))
+                        c.commit()
+                    finally:
+                        c.close()
+                if key_id:
+                    c2 = get_db(settings)
+                    try:
+                        record_key_success(c2, key_id)
+                    except Exception:
+                        pass
+                    finally:
+                        c2.close()
+                with _count_lock:
+                    classified += 1
+                return True
+
+        if key_id:
+            c2 = get_db(settings)
+            try:
+                record_key_failure(c2, key_id, failure_kind="bad_output", error_text="non_json_parallel")
+            except Exception:
+                pass
+            finally:
+                c2.close()
+
+        with _count_lock:
+            failed += 1
+        return False
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(_process_item, row): row for row in rows}
+        done_count = 0
+        for future in as_completed(futures):
+            done_count += 1
+            if done_count % 50 == 0:
+                log.info("Progress: %d/%d (classified=%d, failed=%d)", done_count, len(rows), classified, failed)
+
+    log.info("LLM v2 parallel classification done: %d classified, %d failed", classified, failed)
+    return {"classified": classified, "failed": failed}
+
+
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--batch", type=int, default=100)
+    parser.add_argument("--batch", type=int, default=500)
+    parser.add_argument("--workers", type=int, default=10)
+    parser.add_argument("--parallel", action="store_true", default=True)
+    parser.add_argument("--sequential", action="store_true", default=False)
     args = parser.parse_args()
 
-    result = classify_content(batch_size=args.batch)
+    if args.sequential:
+        result = classify_content(batch_size=args.batch)
+    else:
+        result = classify_content_parallel(batch_size=args.batch, workers=args.workers)
     if result:
         print(json.dumps(result, ensure_ascii=False))
 

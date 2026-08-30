@@ -38,6 +38,7 @@ DEFAULT_CONFIG = {
     "max_same_case_review_ratio": 0.60,
     "max_location_role_only_review_ratio": 0.35,
     "max_duplicate_leakage": 0,
+    "max_report_relation_rows": 50,
     "report_path": str(PROJECT_ROOT / "reports" / "qa_quality_latest.json"),
 }
 GENERIC_RELATION_LOCATIONS = {"россии", "россия", "москва", "москвы", "рф"}
@@ -199,6 +200,19 @@ def _sync_relation_review_tasks(conn, rows: list[dict[str, Any]]) -> set[str]:
             machine_reason=row["issue"],
             source_links=row.get("source_links", []),
         )
+        if row["issue"] in {
+            "blocked_official_bridge",
+            "promoted_without_nonseed_bridge",
+            "promoted_without_event_fact_or_official_bridge",
+        }:
+            try:
+                from agents.bus import enqueue_relation_gap_task
+
+                enqueue_relation_gap_task(conn, row)
+            except Exception:
+                # The quality gate must remain reportable even if the optional MAS
+                # task layer is unavailable on a legacy database.
+                pass
     conn.commit()
     return active_task_keys
 
@@ -939,6 +953,7 @@ def build_quality_gate(settings: dict[str, Any] | None = None) -> dict[str, Any]
                 document_verdict_counts[verdict] = document_verdict_counts.get(verdict, 0) + 1
                 document_stage_counts[stage] = document_stage_counts.get(stage, 0) + 1
 
+        max_relation_rows = max(1, int(cfg.get("max_report_relation_rows", 50)))
         report = {
             "ok": not degrade_reasons,
             "generated_at": now_iso(),
@@ -994,8 +1009,10 @@ def build_quality_gate(settings: dict[str, Any] | None = None) -> dict[str, Any]
                 "promoted_without_nonseed_bridge_rows": promoted_without_nonseed_bridge,
                 "promoted_without_event_fact_or_official_bridge_rows": promoted_without_event_fact_or_official_bridge,
                 "duplicate_amplified_promotion_rows": duplicate_amplified_promotions,
-                "blocked_official_candidates": blocked_official_candidates,
-                "blocked_seed_candidates": blocked_seed_candidates,
+                "blocked_official_candidates_total": len(blocked_official_candidates),
+                "blocked_seed_candidates_total": len(blocked_seed_candidates),
+                "blocked_official_candidates": blocked_official_candidates[:max_relation_rows],
+                "blocked_seed_candidates": blocked_seed_candidates[:max_relation_rows],
             },
             "ai_sweep": {
                 "failure_kind_breakdown": {str(row[0]): int(row[1] or 0) for row in ai_failure_rows},

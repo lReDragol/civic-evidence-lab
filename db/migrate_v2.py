@@ -68,7 +68,7 @@ CREATE INDEX IF NOT EXISTS idx_bill_sponsors_bill ON bill_sponsors(bill_id);
 CREATE INDEX IF NOT EXISTS idx_bill_sponsors_entity ON bill_sponsors(entity_id);
 CREATE INDEX IF NOT EXISTS idx_bill_sponsors_faction ON bill_sponsors(faction);
 
-CREATE TABLE IF NOT EXISTS bill_votes_sessions (
+CREATE TABLE IF NOT EXISTS bill_vote_sessions (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     bill_id         INTEGER NOT NULL,
     vote_date       TEXT NOT NULL,

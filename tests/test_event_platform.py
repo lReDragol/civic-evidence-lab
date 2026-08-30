@@ -184,6 +184,72 @@ class EventPlatformTests(unittest.TestCase):
             self.assertTrue(any(row[1] == "hard" and row[3] == 12 for row in fact_evidence))
             self.assertIn("Пользователи начали жаловаться", raw_text)
 
+    def test_event_pipeline_supersedes_missing_facts_without_deleting_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "events.db"
+            create_event_db(db_path)
+            first = build_event_pipeline({"db_path": str(db_path), "ensure_schema_on_connect": True})
+            self.assertTrue(first["ok"])
+
+            conn = sqlite3.connect(db_path)
+            try:
+                original_event_id = conn.execute("SELECT id FROM events LIMIT 1").fetchone()[0]
+                removed_fact_id = conn.execute(
+                    "SELECT id FROM event_facts WHERE claim_id=22"
+                ).fetchone()[0]
+                conn.execute("DELETE FROM claims WHERE id=22")
+                conn.commit()
+            finally:
+                conn.close()
+
+            second = build_event_pipeline({"db_path": str(db_path), "ensure_schema_on_connect": True})
+            self.assertTrue(second["ok"])
+
+            conn = sqlite3.connect(db_path)
+            try:
+                event_count = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+                active_facts = conn.execute(
+                    "SELECT claim_id FROM event_facts WHERE event_id=? AND superseded_at IS NULL ORDER BY claim_id",
+                    (original_event_id,),
+                ).fetchall()
+                superseded = conn.execute(
+                    "SELECT superseded_at FROM event_facts WHERE id=?",
+                    (removed_fact_id,),
+                ).fetchone()
+            finally:
+                conn.close()
+
+            self.assertEqual(event_count, 1)
+            self.assertEqual(active_facts, [(21,)])
+            self.assertIsNotNone(superseded)
+            self.assertIsNotNone(superseded[0])
+
+    def test_event_pipeline_backfills_legacy_event_key_without_duplicate_events(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "events.db"
+            create_event_db(db_path)
+            first = build_event_pipeline({"db_path": str(db_path), "ensure_schema_on_connect": True})
+            self.assertTrue(first["ok"])
+
+            conn = sqlite3.connect(db_path)
+            try:
+                original_event_id = conn.execute("SELECT id FROM events LIMIT 1").fetchone()[0]
+                conn.execute("UPDATE events SET event_key=NULL WHERE id=?", (original_event_id,))
+                conn.commit()
+            finally:
+                conn.close()
+
+            second = build_event_pipeline({"db_path": str(db_path), "ensure_schema_on_connect": True})
+            self.assertTrue(second["ok"])
+
+            conn = sqlite3.connect(db_path)
+            try:
+                rows = conn.execute("SELECT id, event_key FROM events ORDER BY id").fetchall()
+            finally:
+                conn.close()
+
+            self.assertEqual(rows, [(original_event_id, "cluster:101")])
+
     def test_event_pipeline_promotes_document_votes_to_fact_evidence_without_claims(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "events.db"

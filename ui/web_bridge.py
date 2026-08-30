@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import sqlite3
 from collections import defaultdict
@@ -11,6 +12,9 @@ from typing import Any
 from PySide6.QtCore import QObject, Signal, Slot
 
 from ui.job_registry import JOB_DEFS, get_job_def, interval_for_job, serialize_jobs
+
+
+log = logging.getLogger(__name__)
 
 
 STRUCTURAL_RELATION_TYPES = {
@@ -166,7 +170,7 @@ LAYER_LABELS = {
 NAVIGATION = [
     {
         "key": "monitoring",
-        "label": "Мониторинг",
+        "label": "📡 Мониторинг",
         "sections": [
             {"key": "overview", "label": "Обзор"},
             {"key": "ops247", "label": "24/7"},
@@ -418,6 +422,13 @@ class DashboardDataService:
         }
 
     def ops247_payload(self) -> dict[str, Any]:
+        try:
+            from runtime.monitoring import get_full_monitoring_payload
+
+            return get_full_monitoring_payload(self.db)
+        except Exception:
+            log.exception("failed to build full 24/7 monitoring payload; falling back to legacy ops247 payload")
+
         daemon_lease = None
         daemon_running = False
         if self._table_exists("job_leases"):
@@ -500,6 +511,36 @@ class DashboardDataService:
             ).fetchall():
                 failure_kinds[str(row["failure_kind"] or "unknown")] = int(row["count"] or 0)
 
+        agent_tasks = {}
+        if self._table_exists("agent_tasks"):
+            for row in self.db.execute(
+                """
+                SELECT target_group, status, COUNT(*) AS count
+                FROM agent_tasks
+                GROUP BY target_group, status
+                ORDER BY target_group, status
+                """
+            ).fetchall():
+                group = str(row["target_group"] or "unknown")
+                agent_tasks.setdefault(group, {})[str(row["status"] or "unknown")] = int(row["count"] or 0)
+
+        search_evidence = {
+            "total": self._count("search_evidence") if self._table_exists("search_evidence") else 0,
+            "recent": [],
+        }
+        if self._table_exists("search_evidence"):
+            search_evidence["recent"] = [
+                self._row_to_dict(row)
+                for row in self.db.execute(
+                    """
+                    SELECT provider, model, url, title, source_tier, confidence, retrieved_at
+                    FROM search_evidence
+                    ORDER BY id DESC
+                    LIMIT 12
+                    """
+                ).fetchall()
+            ]
+
         recent_jobs = []
         if self._table_exists("job_runs"):
             recent_jobs = [
@@ -580,6 +621,11 @@ class DashboardDataService:
                 },
                 "providers": provider_rows,
                 "failure_kinds": failure_kinds,
+            },
+            "agents": {
+                "tasks_by_group": agent_tasks,
+                "open_tasks": self._count_where("agent_tasks", "status IN ('pending', 'needs_retry', 'running')") if self._table_exists("agent_tasks") else 0,
+                "search_evidence": search_evidence,
             },
             "quality": quality,
             "logs": logs,
@@ -3075,7 +3121,7 @@ class DashboardDataService:
                         """
                         SELECT id, timeline_date, title, description, content_item_id, document_content_id, sort_order
                         FROM event_timeline
-                        WHERE event_id=?
+                        WHERE event_id=? AND superseded_at IS NULL
                         ORDER BY sort_order, id
                         """,
                         (selected_id,),
@@ -3089,7 +3135,7 @@ class DashboardDataService:
                                e.canonical_name, e.entity_type, e.description
                         FROM event_entities ee
                         JOIN entities e ON e.id = ee.entity_id
-                        WHERE ee.event_id=?
+                        WHERE ee.event_id=? AND ee.superseded_at IS NULL
                         ORDER BY ee.role, e.canonical_name, ee.id
                         """,
                         (selected_id,),
@@ -3104,7 +3150,7 @@ class DashboardDataService:
                                ef.confidence, cl.claim_text
                         FROM event_facts ef
                         LEFT JOIN claims cl ON cl.id = ef.claim_id
-                        WHERE ef.event_id=?
+                        WHERE ef.event_id=? AND ef.superseded_at IS NULL
                         ORDER BY ef.id
                         """,
                         (selected_id,),
@@ -3120,7 +3166,7 @@ class DashboardDataService:
                         FROM event_items ei
                         LEFT JOIN content_items ci ON ci.id = ei.content_item_id
                         LEFT JOIN sources s ON s.id = ci.source_id
-                        WHERE ei.event_id=?
+                        WHERE ei.event_id=? AND ei.superseded_at IS NULL
                         ORDER BY
                             CASE ei.item_role
                                 WHEN 'origin' THEN 0

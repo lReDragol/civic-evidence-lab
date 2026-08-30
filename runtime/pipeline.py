@@ -1,16 +1,20 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from config.db_utils import get_db, load_settings
 from runtime.contracts import JobResult, now_iso
-from runtime.registry import PIPELINE_JOB_IDS
+from runtime.registry import PIPELINE_JOB_IDS, get_job_spec
 from runtime.runner import run_job_once
 from runtime.state import (
     finish_pipeline_run,
     set_runtime_metadata,
     start_pipeline_run,
 )
+
+
+log = logging.getLogger(__name__)
 
 
 def generate_pipeline_version(mode: str) -> str:
@@ -55,9 +59,23 @@ def run_pipeline(
     retriable_errors: list[str] = []
     fatal_errors: list[str] = []
     stage_results: list[dict[str, Any]] = []
+    succeeded_ids: set[str] = set()
+    skipped_ids: set[str] = set()
+    failed_ids: set[str] = set()
 
     try:
         for job_id in stages:
+            spec = get_job_spec(job_id)
+            if spec and spec.depends_on:
+                unmet = [d for d in spec.depends_on if d not in succeeded_ids]
+                if unmet:
+                    skipped_ids.add(job_id)
+                    skip_msg = f"skipped:dependency_not_met:{','.join(unmet)}"
+                    warnings.append(f"{job_id}:{skip_msg}")
+                    stage_results.append({"job_id": job_id, "result": {"ok": False, "skipped": True, "warnings": [skip_msg]}})
+                    log.info("Pipeline job %s skipped: deps not met (%s)", job_id, ", ".join(unmet))
+                    continue
+
             result = run_job_once(
                 job_id,
                 settings=settings,
@@ -74,10 +92,18 @@ def run_pipeline(
             warnings.extend(str(item) for item in (result.get("warnings") or []))
             retriable_errors.extend(str(item) for item in (result.get("retriable_errors") or []))
             fatal_errors.extend(str(item) for item in (result.get("fatal_errors") or []))
-            if not result.get("ok"):
-                break
 
-        ok = not fatal_errors and not retriable_errors
+            if result.get("ok"):
+                succeeded_ids.add(job_id)
+            elif result.get("skipped"):
+                skipped_ids.add(job_id)
+            else:
+                failed_ids.add(job_id)
+
+        ok = not fatal_errors and not retriable_errors and not failed_ids
+        skipped_count = len(skipped_ids)
+        if skipped_count:
+            warnings.insert(0, f"pipeline_skipped_{skipped_count}_jobs")
         result = JobResult(
             ok=ok,
             job_id=f"pipeline:{mode}",
@@ -93,6 +119,9 @@ def run_pipeline(
                 "pipeline_version": pipeline_version,
                 "pipeline_run_id": pipeline_run_id,
                 "stages": stage_results,
+                "succeeded": sorted(succeeded_ids),
+                "skipped": sorted(skipped_ids),
+                "failed": sorted(failed_ids),
             },
         ).to_dict()
 

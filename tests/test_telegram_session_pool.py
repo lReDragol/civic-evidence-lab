@@ -162,3 +162,60 @@ class TelegramSessionPoolTests(unittest.TestCase):
             self.assertEqual(reassigned["assigned_sources"], 4)
             self.assertEqual(set(reassigned["assignments"].values()), {"s2"})
 
+    def test_session_progress_records_current_channel_and_counters(self):
+        from collectors.telegram_session_pool import mark_session_progress, mark_session_result
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "news.db"
+            create_db(db_path)
+            settings = {"db_path": str(db_path), "ensure_schema_on_connect": True}
+            conn = get_db(settings)
+            try:
+                conn.executescript(
+                    """
+                    INSERT INTO sources(id, name, category, url, access_method, is_active)
+                    VALUES(1, 'YEP', 'telegram', 'https://t.me/yep_news', 'telegram_tdlib', 1);
+                    INSERT INTO telegram_sessions(session_key, client_type, session_path, status)
+                    VALUES('s1', 'telethon', 's1.session', 'active');
+                    """
+                )
+                mark_session_progress(
+                    conn,
+                    "s1",
+                    source_id=1,
+                    channel="yep_news",
+                    collecting_now=True,
+                    current_job_id="telegram_telethon_pool",
+                    last_message_id="200",
+                    last_message_date="2026-05-16T10:00:00",
+                    collected_delta=3,
+                    duplicate_delta=1,
+                    failed_delta=2,
+                )
+                mid = conn.execute(
+                    """
+                    SELECT collecting_now, current_channel, current_source_id, current_job_id,
+                           last_message_id, last_message_date, collected_current_run,
+                           duplicates_skipped, failed_items
+                    FROM telegram_sessions WHERE session_key='s1'
+                    """
+                ).fetchone()
+                mark_session_result(conn, "s1", success=True, metadata={"done": True})
+                final = conn.execute(
+                    "SELECT collecting_now, current_channel, failure_class FROM telegram_sessions WHERE session_key='s1'"
+                ).fetchone()
+            finally:
+                conn.close()
+
+            self.assertEqual(mid["collecting_now"], 1)
+            self.assertEqual(mid["current_channel"], "yep_news")
+            self.assertEqual(mid["current_source_id"], 1)
+            self.assertEqual(mid["current_job_id"], "telegram_telethon_pool")
+            self.assertEqual(mid["last_message_id"], "200")
+            self.assertEqual(mid["last_message_date"], "2026-05-16T10:00:00")
+            self.assertEqual(mid["collected_current_run"], 3)
+            self.assertEqual(mid["duplicates_skipped"], 1)
+            self.assertEqual(mid["failed_items"], 2)
+            self.assertEqual(final["collecting_now"], 0)
+            self.assertEqual(final["current_channel"], "yep_news")
+            self.assertIsNone(final["failure_class"])

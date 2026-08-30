@@ -184,138 +184,139 @@ def build_cases_from_entities(settings: dict = None, min_claims: int = 3) -> int
         settings = load_settings()
 
     conn = get_db(settings)
+    try:
+        person_claims = _find_entity_clusters(conn)
+        cases_created = 0
 
-    person_claims = _find_entity_clusters(conn)
-    cases_created = 0
+        for entity_id, claim_ids in person_claims.items():
+            claim_ids = _filter_claim_ids(conn, list(claim_ids))
+            if len(claim_ids) < min_claims:
+                continue
 
-    for entity_id, claim_ids in person_claims.items():
-        claim_ids = _filter_claim_ids(conn, list(claim_ids))
-        if len(claim_ids) < min_claims:
-            continue
+            entity_name = _get_entity_name(conn, entity_id)
+            has_ev = _has_evidence(conn, list(claim_ids))
 
-        entity_name = _get_entity_name(conn, entity_id)
-        has_ev = _has_evidence(conn, list(claim_ids))
+            existing = conn.execute(
+                "SELECT id FROM cases WHERE title LIKE ?", (f"%{entity_name}%",)
+            ).fetchone()
+            if existing:
+                case_id = existing[0]
+                for cid in claim_ids:
+                    try:
+                        conn.execute(
+                            "INSERT OR IGNORE INTO case_claims(case_id, claim_id) VALUES(?,?)",
+                            (case_id, cid),
+                        )
+                    except Exception as exc:
+                        log.warning("case_claims insert failed for case_id=%s claim_id=%s: %s", case_id, cid, exc)
+                continue
 
-        existing = conn.execute(
-            "SELECT id FROM cases WHERE title LIKE ?", (f"%{entity_name}%",)
-        ).fetchone()
-        if existing:
-            case_id = existing[0]
+            claim_list = list(claim_ids)
+            rows = conn.execute(
+                f"SELECT claim_type, COUNT(*) FROM claims WHERE id IN ({','.join('?' * len(claim_list))}) GROUP BY claim_type ORDER BY COUNT(*) DESC",
+                claim_list,
+            ).fetchall()
+
+            case_type = rows[0][0] if rows else "unknown"
+            case_type = CASE_TYPE_MAP.get(case_type, case_type)
+
+            evidence_str = " (с доказательствами)" if has_ev else ""
+            title = f"Дело: {entity_name}{evidence_str}"
+
+            description_parts = []
+            for r in rows[:5]:
+                description_parts.append(f"{r[0]}: {r[1]} утверждений")
+            description = "; ".join(description_parts)
+
+            related_ents = _find_related_entities(conn, claim_list[:20])
+
+            region_row = conn.execute(
+                """
+                SELECT ct.tag_name
+                FROM content_tags ct
+                JOIN claims c ON c.content_item_id = ct.content_item_id
+                WHERE c.id IN ({}) AND ct.tag_level = 2
+                LIMIT 1
+                """.format(",".join("?" * min(5, len(claim_list)))),
+                claim_list[:5],
+            ).fetchone()
+            region = region_row[0] if region_row else None
+
+            cur = conn.execute(
+                """INSERT INTO cases(title, description, case_type, status, region, started_at)
+                   VALUES(?,?,?,?,?,?)""",
+                (title, description, case_type, "open" if has_ev else "draft", region, datetime.now().isoformat()),
+            )
+            case_id = cur.lastrowid
+
+            for cid in claim_ids:
+                try:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO case_claims(case_id, claim_id, role) VALUES(?,?,?)",
+                        (case_id, cid, "central" if has_ev else "allegation"),
+                    )
+                except Exception as exc:
+                    log.warning("case_claims insert failed for case_id=%s claim_id=%s: %s", case_id, cid, exc)
+
+            cases_created += 1
+
+        conn.commit()
+        log.info("Built %d entity-based cases", cases_created)
+
+        topic_clusters = _find_topic_clusters(conn)
+        topic_cases = 0
+
+        for cluster in topic_clusters:
+            claim_ids = _filter_claim_ids(conn, list(cluster["claim_ids"]))
+            if len(claim_ids) < 5:
+                continue
+
+            tag = cluster["tag"]
+            case_type = CASE_TYPE_MAP.get(tag, tag)
+
+            existing = conn.execute(
+                "SELECT id FROM cases WHERE case_type=? AND status != 'closed' LIMIT 1",
+                (case_type,),
+            ).fetchone()
+            if existing:
+                for cid in claim_ids:
+                    try:
+                        conn.execute(
+                            "INSERT OR IGNORE INTO case_claims(case_id, claim_id) VALUES(?,?)",
+                            (existing[0], cid),
+                        )
+                    except Exception as exc:
+                        log.warning("case_claims insert failed for case_id=%s claim_id=%s: %s", existing[0], cid, exc)
+                continue
+
+            has_ev = _has_evidence(conn, claim_ids)
+            title = f"Тематическое дело: {tag} ({len(claim_ids)} утверждений)"
+
+            cur = conn.execute(
+                """INSERT INTO cases(title, description, case_type, status, started_at)
+                   VALUES(?,?,?,?,?)""",
+                (title, f"Автоматически сгруппировано по тегу {tag}", case_type, "open" if has_ev else "draft", datetime.now().isoformat()),
+            )
+            case_id = cur.lastrowid
+
             for cid in claim_ids:
                 try:
                     conn.execute(
                         "INSERT OR IGNORE INTO case_claims(case_id, claim_id) VALUES(?,?)",
                         (case_id, cid),
                     )
-                except Exception:
-                    pass
-            continue
+                except Exception as exc:
+                    log.warning("case_claims insert failed for case_id=%s claim_id=%s: %s", case_id, cid, exc)
 
-        claim_list = list(claim_ids)
-        rows = conn.execute(
-            f"SELECT claim_type, COUNT(*) FROM claims WHERE id IN ({','.join('?' * len(claim_list))}) GROUP BY claim_type ORDER BY COUNT(*) DESC",
-            claim_list,
-        ).fetchall()
+            topic_cases += 1
 
-        case_type = rows[0][0] if rows else "unknown"
-        case_type = CASE_TYPE_MAP.get(case_type, case_type)
+        conn.commit()
 
-        evidence_str = " (с доказательствами)" if has_ev else ""
-        title = f"Дело: {entity_name}{evidence_str}"
-
-        description_parts = []
-        for r in rows[:5]:
-            description_parts.append(f"{r[0]}: {r[1]} утверждений")
-        description = "; ".join(description_parts)
-
-        related_ents = _find_related_entities(conn, claim_list[:20])
-
-        region_row = conn.execute(
-            """
-            SELECT ct.tag_name
-            FROM content_tags ct
-            JOIN claims c ON c.content_item_id = ct.content_item_id
-            WHERE c.id IN ({}) AND ct.tag_level = 2
-            LIMIT 1
-            """.format(",".join("?" * min(5, len(claim_list)))),
-            claim_list[:5],
-        ).fetchone()
-        region = region_row[0] if region_row else None
-
-        cur = conn.execute(
-            """INSERT INTO cases(title, description, case_type, status, region, started_at)
-               VALUES(?,?,?,?,?,?)""",
-            (title, description, case_type, "open" if has_ev else "draft", region, datetime.now().isoformat()),
-        )
-        case_id = cur.lastrowid
-
-        for cid in claim_ids:
-            try:
-                conn.execute(
-                    "INSERT OR IGNORE INTO case_claims(case_id, claim_id, role) VALUES(?,?,?)",
-                    (case_id, cid, "central" if has_ev else "allegation"),
-                ),
-            except Exception:
-                pass
-
-        cases_created += 1
-
-    conn.commit()
-    log.info("Built %d entity-based cases", cases_created)
-
-    topic_clusters = _find_topic_clusters(conn)
-    topic_cases = 0
-
-    for cluster in topic_clusters:
-        claim_ids = _filter_claim_ids(conn, list(cluster["claim_ids"]))
-        if len(claim_ids) < 5:
-            continue
-
-        tag = cluster["tag"]
-        case_type = CASE_TYPE_MAP.get(tag, tag)
-
-        existing = conn.execute(
-            "SELECT id FROM cases WHERE case_type=? AND status != 'closed' LIMIT 1",
-            (case_type,),
-        ).fetchone()
-        if existing:
-            for cid in claim_ids:
-                try:
-                    conn.execute(
-                        "INSERT OR IGNORE INTO case_claims(case_id, claim_id) VALUES(?,?)",
-                        (existing[0], cid),
-                    )
-                except Exception:
-                    pass
-            continue
-
-        has_ev = _has_evidence(conn, claim_ids)
-        title = f"Тематическое дело: {tag} ({len(claim_ids)} утверждений)"
-
-        cur = conn.execute(
-            """INSERT INTO cases(title, description, case_type, status, started_at)
-               VALUES(?,?,?,?,?)""",
-            (title, f"Автоматически сгруппировано по тегу {tag}", case_type, "open" if has_ev else "draft", datetime.now().isoformat()),
-        )
-        case_id = cur.lastrowid
-
-        for cid in claim_ids:
-            try:
-                conn.execute(
-                    "INSERT OR IGNORE INTO case_claims(case_id, claim_id) VALUES(?,?)",
-                    (case_id, cid),
-                )
-            except Exception:
-                pass
-
-        topic_cases += 1
-
-    conn.commit()
-
-    total = conn.execute("SELECT COUNT(*) FROM cases").fetchone()[0]
-    log.info("Cases: %d entity-based, %d topic-based, %d total", cases_created, topic_cases, total)
-    conn.close()
-    return total
+        total = conn.execute("SELECT COUNT(*) FROM cases").fetchone()[0]
+        log.info("Cases: %d entity-based, %d topic-based, %d total", cases_created, topic_cases, total)
+        return total
+    finally:
+        conn.close()
 
 
 def main():

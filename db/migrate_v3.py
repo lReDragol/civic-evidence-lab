@@ -39,6 +39,71 @@ def migrate(conn: sqlite3.Connection):
     conn.commit()
     log.info("migrate_v3: investigation_results table created")
 
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS daemon_alerts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            alert_type TEXT NOT NULL,
+            severity TEXT DEFAULT 'warning',
+            message TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_daemon_alerts_type
+        ON daemon_alerts(alert_type)
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_daemon_alerts_severity
+        ON daemon_alerts(severity)
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS ner_new_entities (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            entity_id INTEGER NOT NULL,
+            entity_type TEXT,
+            canonical_name TEXT,
+            discovered_at TEXT DEFAULT (datetime('now')),
+            source_content_id INTEGER,
+            search_triggered INTEGER DEFAULT 0,
+            FOREIGN KEY (entity_id) REFERENCES entities(id),
+            FOREIGN KEY (source_content_id) REFERENCES content_items(id)
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_ner_new_entities_search
+        ON ner_new_entities(search_triggered)
+    """)
+
+    conn.commit()
+    log.info("migrate_v3: daemon_alerts + ner_new_entities tables created")
+
+    try:
+        conn.execute("ALTER TABLE content_items ADD COLUMN garbage_checked INTEGER DEFAULT 0")
+    except Exception:
+        pass
+
+    try:
+        conn.execute("ALTER TABLE content_items ADD COLUMN claims_processed INTEGER DEFAULT 0")
+    except Exception:
+        pass
+
+    for idx_sql in [
+        "CREATE INDEX IF NOT EXISTS idx_content_items_llm ON content_items(llm_processed)",
+        "CREATE INDEX IF NOT EXISTS idx_content_items_ner ON content_items(ner_processed)",
+        "CREATE INDEX IF NOT EXISTS idx_content_items_classif ON content_items(classification_v3_processed)",
+        "CREATE INDEX IF NOT EXISTS idx_content_items_garbage ON content_items(garbage_checked)",
+        "CREATE INDEX IF NOT EXISTS idx_content_items_claims ON content_items(claims_processed)",
+        "CREATE INDEX IF NOT EXISTS idx_content_items_status ON content_items(status)",
+    ]:
+        try:
+            conn.execute(idx_sql)
+        except Exception:
+            pass
+
+    conn.commit()
+    log.info("migrate_v3: garbage_checked + claims_processed columns + indexes added")
+
 
 def save_investigation(conn, seed_entity_id, result, dossier_text, params=None):
     title = f"Расследование: {result.seed_name}"

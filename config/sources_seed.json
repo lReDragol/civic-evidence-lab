@@ -1081,16 +1081,17 @@
         "update_frequency": "daily"
     },
     {
-        "name": "YEP (Telegram)",
+        "name": "Ёп Новости (Telegram)",
         "category": "telegram",
         "subcategory": "media",
         "url": "t.me/yep_news",
         "access_method": "telegram_tdlib",
         "is_official": 0,
         "credibility_tier": "B",
-        "political_alignment": "media",
-        "update_frequency": "daily",
-        "notes": "Telegram channel with Russian policy, censorship, regulation and document screenshots; collect through negative/document relevance gate"
+        "political_alignment": "opposition",
+        "update_frequency": "300",
+        "is_active": 1,
+        "notes": "Высокочастотный новостной агрегатор. Сбор всех постов, классификация через AI."
     },
     {
         "name": "Новые люди (TikTok)",

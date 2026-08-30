@@ -256,6 +256,61 @@ def assign_telegram_sources(
     }
 
 
+def mark_session_progress(
+    conn: sqlite3.Connection,
+    session_key: str,
+    *,
+    source_id: int | None = None,
+    channel: str | None = None,
+    collecting_now: bool | None = None,
+    current_job_id: str | None = None,
+    last_message_id: str | int | None = None,
+    last_message_date: str | None = None,
+    collected_delta: int = 0,
+    collected_today_delta: int | None = None,
+    duplicate_delta: int = 0,
+    failed_delta: int = 0,
+) -> None:
+    now = _now()
+    updates = ["heartbeat_at=?", "updated_at=?"]
+    values: list[Any] = [now, now]
+    if source_id is not None:
+        updates.append("current_source_id=?")
+        values.append(source_id)
+    if channel is not None:
+        updates.append("current_channel=?")
+        values.append(channel)
+    if collecting_now is not None:
+        updates.append("collecting_now=?")
+        values.append(1 if collecting_now else 0)
+    if current_job_id is not None:
+        updates.append("current_job_id=?")
+        values.append(current_job_id)
+    if last_message_id is not None:
+        updates.append("last_message_id=?")
+        values.append(str(last_message_id))
+    if last_message_date is not None:
+        updates.append("last_message_date=?")
+        values.append(last_message_date)
+    if collected_delta:
+        updates.append("collected_current_run=COALESCE(collected_current_run,0)+?")
+        values.append(int(collected_delta))
+        updates.append("collected_today=COALESCE(collected_today,0)+?")
+        values.append(int(collected_today_delta if collected_today_delta is not None else collected_delta))
+    if duplicate_delta:
+        updates.append("duplicates_skipped=COALESCE(duplicates_skipped,0)+?")
+        values.append(int(duplicate_delta))
+    if failed_delta:
+        updates.append("failed_items=COALESCE(failed_items,0)+?")
+        values.append(int(failed_delta))
+    values.append(session_key)
+    conn.execute(
+        f"UPDATE telegram_sessions SET {', '.join(updates)} WHERE session_key=?",
+        tuple(values),
+    )
+    conn.commit()
+
+
 def mark_session_result(
     conn: sqlite3.Connection,
     session_key: str,
@@ -271,10 +326,11 @@ def mark_session_result(
             """
             UPDATE telegram_sessions
             SET status='active', last_success_at=?, last_attempt_at=?,
-                failure_class=NULL, cooldown_until=NULL, metadata_json=?, updated_at=?
+                failure_class=NULL, cooldown_until=NULL, collecting_now=0,
+                metadata_json=?, updated_at=?, heartbeat_at=?
             WHERE session_key=?
             """,
-            (now, now, _json(metadata), now, session_key),
+            (now, now, _json(metadata), now, now, session_key),
         )
     else:
         status = "cooldown" if cooldown_until else "failed"
@@ -282,10 +338,10 @@ def mark_session_result(
             """
             UPDATE telegram_sessions
             SET status=?, last_attempt_at=?, failure_class=?,
-                cooldown_until=?, metadata_json=?, updated_at=?
+                cooldown_until=?, collecting_now=0, metadata_json=?,
+                updated_at=?, heartbeat_at=?
             WHERE session_key=?
             """,
-            (status, now, failure_class or "runtime_error", cooldown_until, _json(metadata), now, session_key),
+            (status, now, failure_class or "runtime_error", cooldown_until, _json(metadata), now, now, session_key),
         )
     conn.commit()
-

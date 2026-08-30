@@ -105,6 +105,12 @@ news_unified_pipeline.py
 /tmp_*.py
 /check_*.py
 /verify_*.py
+/run_autonomy_test*.py
+/run_autonomy_test*.bat
+/run_metrics_bg.py
+/temp_check*.py
+/todo_autonomy.md
+/test_failures.txt
 tools/telegram_test_collect.py
 tools/_check_*.py
 tools/_explore_*.py
