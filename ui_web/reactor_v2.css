@@ -1,0 +1,471 @@
+/* Civic Evidence Lab - feature-flagged Evidence Workbench v2. */
+/* Hidden must beat the existing legacy shell's display declarations. */
+#app-shell[hidden], #civic-workbench[hidden], .civic-return[hidden], .civic-inspector[hidden] {
+  display: none !important;
+}
+.civic-shell [data-civic-screen][hidden] { display: none !important; }
+
+.civic-shell .main-panel {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  overflow: auto;
+}
+
+.civic-heading { padding: 18px; }
+.civic-collection { padding: 16px 18px; flex-shrink: 0; min-width: 0; border-left: 3px solid var(--rv2-accent); }
+.civic-collection h2 { margin: 0 0 8px; font-size: 18px; }
+.civic-collection p { margin: 7px 0; overflow-wrap: anywhere; }
+.civic-profile { font-size: 13px; color: var(--rv2-muted); }
+.civic-profile code { color: var(--rv2-text); user-select: text; }
+.civic-collection-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
+.civic-collection-actions button { min-height: 40px; }
+.civic-collection-actions button:disabled { opacity: .45; cursor: default; }
+.civic-collection-actions [data-civic-control="start"] { border-color: var(--rv2-accent); }
+.civic-collection-actions [data-civic-control="stop"] { color: var(--rv2-warning); }
+.civic-runtime-status, .civic-report-status { font-size: 13px; }
+.civic-collection-message { color: var(--rv2-warning); font-size: 13px; }
+.civic-collection-message:empty, .civic-report-paths:empty { display: none; }
+.civic-report-paths { max-height: 160px; overflow: auto; padding-left: 20px; font: 12px/1.6 Consolas, monospace; overflow-wrap: anywhere; user-select: text; }
+.civic-collection-note { color: var(--rv2-muted); font-size: 12px; line-height: 1.5; }
+.civic-heading h1 { margin: 6px 0; }
+.civic-heading p, .civic-status { color: var(--rv2-muted); }
+.civic-filters { display: flex; flex-wrap: wrap; align-items: end; gap: 10px; }
+.civic-filters label { display: grid; gap: 4px; font-size: 12px; }
+.civic-filters input { width: 170px; }
+.civic-heading select { margin-bottom: 12px; }
+.civic-status { margin: 8px 4px; }
+.civic-summary { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 12px; flex-shrink: 0; min-width: 0; }
+.civic-summary[hidden] { display: none; }
+.civic-summary-group { padding: 12px; border: 1px solid var(--rv2-border); border-radius: 14px; background: var(--rv2-surface-raised); min-width: 0; }
+.civic-summary-group h2 { margin: 0 0 10px; font-size: 16px; }
+.civic-metric-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+[data-summary="ops"] .civic-metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.civic-metric { display: flex; flex-direction: column; gap: 6px; padding: 10px; border-radius: 8px; background: #152820; min-width: 0; }
+.civic-metric span { font-size: 12px; color: var(--rv2-muted); }
+.civic-metric strong { font-size: 20px; overflow-wrap: anywhere; }
+.civic-metric[data-metric="last_heartbeat"] strong { font-size: 13px; }
+.civic-metric-note, .civic-metric-warning { margin: 10px 0 0; font-size: 12px; color: var(--rv2-muted); }
+.civic-metric-warning { color: var(--rv2-warning); }
+@media (min-width: 761px) {
+  /* Legacy app.css forces a single grid column with !important. Isolate the
+     Civic rail explicitly instead of letting it collapse into an implicit track. */
+  #civic-workbench.app-shell { grid-template-columns: 132px minmax(0, 1fr) !important; }
+  .reactor-v2-enabled .civic-shell .reactor-v2-rail-button { font-size: 12px; line-height: 1.25; overflow-wrap: anywhere; }
+  .civic-shell .civic-table :is(th, td, button) { font-size: 12px; }
+}
+@media (max-width: 760px) {
+  #civic-workbench.app-shell { grid-template-columns: minmax(0, 1fr) !important; }
+  .civic-summary { grid-template-columns: 1fr; }
+  .civic-metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+.civic-results { padding: 12px; flex: 1; overflow: auto; }
+.civic-table-scroll { overflow-x: auto; }
+.civic-table { border-collapse: collapse; width: 100%; font-size: 12px; }
+.civic-table th, .civic-table td {
+  padding: 10px; text-align: left; vertical-align: top;
+  border-bottom: 1px solid var(--rv2-border);
+  min-width: 90px; max-width: 360px; overflow-wrap: anywhere;
+}
+.civic-table th { color: var(--rv2-muted); }
+.civic-pager { display: flex; gap: 10px; margin-top: 15px; }
+.civic-pager button:disabled { opacity: .4; cursor: default; }
+.civic-graph { height: 360px; margin-bottom: 16px; }
+.civic-graph .reactor-v2-relation-viewport { height: 100%; }
+.civic-inspector {
+  position: absolute; inset: 0 0 0 auto; z-index: 50;
+  width: min(720px, 95%); padding: 20px; overflow: auto;
+  background: var(--rv2-surface); border-left: 1px solid var(--rv2-border);
+  box-shadow: -20px 0 60px #0008;
+}
+.civic-detail { white-space: pre-wrap; overflow-wrap: anywhere; font: 13px/1.5 Consolas, monospace; }
+.civic-record-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 16px; margin: 14px 0; }
+.civic-record-field { min-width: 0; }
+.civic-record-field dt { color: var(--rv2-muted); font-size: 12px; margin-bottom: 4px; }
+.civic-record-field dd { margin: 0; font-size: 14px; overflow-wrap: anywhere; }
+.civic-record-field-long { grid-column: 1 / -1; }
+.civic-text-preview { margin: 0 0 6px; white-space: pre-wrap; }
+.civic-inspector summary { cursor: pointer; color: var(--rv2-accent); font-size: 13px; padding: 8px 0; }
+.civic-related-card { border: 1px solid var(--rv2-border); background: var(--rv2-surface-raised); border-radius: 10px; padding: 8px 12px; margin-bottom: 10px; }
+.civic-debug-json { margin-top: 20px; border-top: 1px solid var(--rv2-border); }
+.civic-return { position: fixed; right: 24px; bottom: 16px; z-index: 100; }
+.civic-shell button:focus-visible, .civic-shell input:focus-visible, .civic-shell select:focus-visible {
+  outline: 2px solid var(--rv2-focus); outline-offset: 3px;
+}
+@media (max-width: 760px) {
+  .reactor-v2-enabled .app-shell.civic-shell { grid-template-columns: minmax(0, 1fr); }
+  .civic-shell .reactor-v2-nav-rail { flex-direction: row; height: auto; overflow-x: auto; position: static; grid-column: 1; }
+  .reactor-v2-enabled .civic-shell .main-panel { grid-column: 1; height: auto; min-height: 80vh; }
+  .civic-shell .reactor-v2-rail-button { min-width: 72px; }
+  .civic-inspector { position: fixed; width: 100%; }
+  .civic-filters input { width: 140px; }
+}
+
+:root {
+  --rv2-rail-width: 88px;
+  --rv2-inspector-width: clamp(520px, 52vw, 980px);
+  --rv2-surface: #08110f;
+  --rv2-surface-raised: #0d1916;
+  --rv2-border: rgba(139, 186, 169, 0.2);
+  --rv2-text: #e9f5ef;
+  --rv2-muted: #91a69d;
+  --rv2-accent: #55d6aa;
+  --rv2-accent-strong: #20b985;
+  --rv2-warning: #e4b95d;
+  --rv2-danger: #ff6b68;
+  --rv2-focus: #8de8c8;
+  --rv2-radius: 18px;
+}
+
+.reactor-v2-enabled {
+  color-scheme: dark;
+}
+
+.reactor-v2-enabled .app-shell.reactor-v2-shell {
+  display: grid;
+  grid-template-columns: var(--rv2-rail-width) minmax(0, 1fr);
+  gap: 12px;
+  min-width: 0;
+}
+
+.reactor-v2-enabled .reactor-v2-nav-rail {
+  position: sticky;
+  top: 14px;
+  z-index: 22;
+  grid-column: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+  height: calc(100vh - 28px);
+  padding: 10px 8px;
+  overflow-y: auto;
+  border: 1px solid var(--rv2-border);
+  border-radius: var(--rv2-radius);
+  background:
+    linear-gradient(180deg, rgba(36, 72, 60, 0.24), transparent 34%),
+    rgba(6, 14, 12, 0.94);
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.32);
+}
+
+.reactor-v2-enabled .reactor-v2-rail-mark {
+  display: grid;
+  place-items: center;
+  min-height: 46px;
+  margin-bottom: 4px;
+  border: 1px solid rgba(85, 214, 170, 0.35);
+  border-radius: 14px;
+  color: var(--rv2-accent);
+  font: 800 12px/1 "Aptos Display", "Segoe UI", sans-serif;
+  letter-spacing: 0.16em;
+}
+
+.reactor-v2-enabled .reactor-v2-rail-button {
+  display: grid;
+  justify-items: center;
+  gap: 5px;
+  min-height: 58px;
+  padding: 8px 4px;
+  border: 1px solid transparent;
+  border-radius: 13px;
+  background: transparent;
+  color: var(--rv2-muted);
+  cursor: pointer;
+  font: 700 10px/1.15 "Aptos", "Segoe UI", sans-serif;
+  text-align: center;
+}
+
+.reactor-v2-enabled .reactor-v2-rail-button:hover,
+.reactor-v2-enabled .reactor-v2-rail-button[aria-current="page"] {
+  border-color: rgba(85, 214, 170, 0.38);
+  background: rgba(45, 139, 108, 0.17);
+  color: var(--rv2-text);
+}
+
+.reactor-v2-enabled .reactor-v2-rail-icon {
+  font-size: 18px;
+  line-height: 1;
+}
+
+.reactor-v2-enabled .main-panel.reactor-v2-workspace {
+  grid-column: 2;
+  min-width: 0;
+  height: calc(100vh - 28px);
+}
+
+.reactor-v2-enabled .screen-panel.reactor-v2-workbench {
+  position: relative;
+  min-width: 0;
+  overflow: hidden;
+  background:
+    radial-gradient(circle at 94% 0%, rgba(32, 185, 133, 0.09), transparent 32%),
+    linear-gradient(145deg, rgba(13, 25, 22, 0.96), rgba(5, 12, 10, 0.98));
+}
+
+.reactor-v2-enabled .screen-root {
+  container: reactor-workspace / inline-size;
+}
+
+.reactor-v2-enabled #detail-overlay-host.reactor-v2-inspector-host {
+  position: absolute;
+  inset: 0 0 0 auto;
+  z-index: 40;
+  width: var(--rv2-inspector-width);
+  max-width: calc(100% - 360px);
+  min-height: 0;
+  border-left: 1px solid var(--rv2-border);
+  background: rgba(5, 13, 11, 0.985);
+  box-shadow: -24px 0 70px rgba(0, 0, 0, 0.4);
+}
+
+.reactor-v2-enabled #detail-overlay-host.reactor-v2-inspector-host[aria-hidden="true"] {
+  display: none;
+}
+
+.reactor-v2-enabled #detail-overlay-host.reactor-v2-inspector-host[aria-hidden="false"] {
+  display: block;
+}
+
+.reactor-v2-enabled #detail-overlay-host .detail-drawer {
+  width: 100%;
+  height: 100%;
+  max-width: none;
+  border: 0;
+  border-radius: 0;
+}
+
+.reactor-v2-enabled .reactor-v2-review-actions {
+  position: sticky;
+  bottom: 0;
+  z-index: 24;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  padding: 12px;
+  border-top: 1px solid var(--rv2-border);
+  background: rgba(8, 17, 15, 0.95);
+  backdrop-filter: blur(16px);
+}
+
+.reactor-v2-enabled .reactor-v2-action-button,
+.reactor-v2-enabled .reactor-v2-cockpit-button,
+.reactor-v2-enabled .reactor-v2-map-button {
+  min-height: 38px;
+  padding: 8px 13px;
+  border: 1px solid var(--rv2-border);
+  border-radius: 11px;
+  background: rgba(18, 38, 32, 0.88);
+  color: var(--rv2-text);
+  cursor: pointer;
+  font: 700 12px/1 "Aptos", "Segoe UI", sans-serif;
+}
+
+.reactor-v2-enabled .reactor-v2-action-button[data-tone="confirm"] {
+  border-color: rgba(85, 214, 170, 0.52);
+  background: rgba(32, 185, 133, 0.2);
+}
+
+.reactor-v2-enabled .reactor-v2-action-button[data-tone="danger"] {
+  border-color: rgba(255, 107, 104, 0.48);
+  color: #ffc2c0;
+}
+
+.reactor-v2-enabled .reactor-v2-action-button:disabled {
+  cursor: wait;
+  opacity: 0.56;
+}
+
+.reactor-v2-enabled .reactor-v2-operations-cockpit {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  margin: 0 0 12px;
+  padding: 12px;
+  border: 1px solid var(--rv2-border);
+  border-radius: 16px;
+  background: linear-gradient(135deg, rgba(24, 53, 43, 0.3), rgba(7, 16, 13, 0.76));
+}
+
+.reactor-v2-enabled .reactor-v2-cockpit-title {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.reactor-v2-enabled .reactor-v2-cockpit-title h3 {
+  margin: 0;
+  color: var(--rv2-text);
+  font: 800 16px/1.2 "Aptos Display", "Segoe UI", sans-serif;
+}
+
+.reactor-v2-enabled .reactor-v2-cockpit-card {
+  min-width: 0;
+  padding: 11px;
+  border: 1px solid rgba(139, 186, 169, 0.14);
+  border-radius: 12px;
+  background: rgba(2, 9, 7, 0.5);
+}
+
+.reactor-v2-enabled .reactor-v2-cockpit-card span {
+  display: block;
+  color: var(--rv2-muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+}
+
+.reactor-v2-enabled .reactor-v2-cockpit-card strong {
+  display: block;
+  margin-top: 8px;
+  color: var(--rv2-text);
+  font-size: 22px;
+}
+
+.reactor-v2-enabled .reactor-v2-relation-viewport {
+  position: relative;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  min-height: 520px;
+  overflow: hidden;
+  border: 1px solid var(--rv2-border);
+  border-radius: 18px;
+  background: #06100d;
+}
+
+.reactor-v2-enabled .reactor-v2-map-toolbar {
+  z-index: 2;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--rv2-border);
+  background: rgba(8, 19, 15, 0.94);
+}
+
+.reactor-v2-enabled .reactor-v2-map-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  min-height: 420px;
+  outline: none;
+  cursor: grab;
+  touch-action: none;
+}
+
+.reactor-v2-enabled .reactor-v2-map-canvas:active {
+  cursor: grabbing;
+}
+
+.reactor-v2-enabled .reactor-v2-map-status {
+  min-height: 30px;
+  padding: 7px 12px;
+  border-top: 1px solid var(--rv2-border);
+  color: var(--rv2-muted);
+  font-size: 11px;
+}
+
+.reactor-v2-enabled .reactor-v2-map-fullscreen {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: grid;
+  padding: 14px;
+  background: rgba(1, 6, 5, 0.98);
+}
+
+.reactor-v2-enabled .reactor-v2-map-fullscreen .reactor-v2-relation-viewport {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  border-radius: 16px;
+}
+
+.reactor-v2-enabled :is(button, input, select, textarea, canvas):focus-visible {
+  outline: 2px solid var(--rv2-focus);
+  outline-offset: 2px;
+}
+
+@container reactor-workspace (max-width: 980px) {
+  .reactor-v2-enabled .reactor-v2-operations-cockpit {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 1080px) {
+  :root {
+    --rv2-rail-width: 70px;
+  }
+
+  .reactor-v2-enabled #detail-overlay-host.reactor-v2-inspector-host {
+    width: min(720px, calc(100% - 18px));
+    max-width: none;
+  }
+
+  .reactor-v2-enabled .reactor-v2-rail-button {
+    min-height: 52px;
+    font-size: 9px;
+  }
+}
+
+@media (max-width: 760px) {
+  .reactor-v2-enabled .app-shell.reactor-v2-shell {
+    grid-template-columns: 1fr;
+    padding-bottom: 72px;
+  }
+
+  .reactor-v2-enabled .reactor-v2-nav-rail {
+    position: fixed;
+    inset: auto 10px 8px;
+    z-index: 90;
+    display: flex;
+    flex-direction: row;
+    height: 60px;
+    padding: 5px;
+    overflow-x: auto;
+  }
+
+  .reactor-v2-enabled .reactor-v2-rail-mark {
+    display: none;
+  }
+
+  .reactor-v2-enabled .reactor-v2-rail-button {
+    flex: 0 0 66px;
+    min-height: 48px;
+  }
+
+  .reactor-v2-enabled .main-panel.reactor-v2-workspace {
+    grid-column: 1;
+    height: auto;
+    min-height: calc(100vh - 90px);
+  }
+
+  .reactor-v2-enabled #detail-overlay-host.reactor-v2-inspector-host {
+    position: fixed;
+    inset: 8px;
+    z-index: 800;
+    width: auto;
+    max-width: none;
+    border: 1px solid var(--rv2-border);
+    border-radius: 16px;
+  }
+
+  .reactor-v2-enabled .reactor-v2-operations-cockpit {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .reactor-v2-enabled *,
+  .reactor-v2-enabled *::before,
+  .reactor-v2-enabled *::after {
+    scroll-behavior: auto;
+    transition-duration: 0.01ms;
+    animation-duration: 0.01ms;
+    animation-iteration-count: 1;
+  }
+}

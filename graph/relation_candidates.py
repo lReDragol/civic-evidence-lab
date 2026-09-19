@@ -1568,21 +1568,26 @@ def _vote_seed_pairs(
 
 
 def _delete_previous_candidate_state(conn):
+    owned = "SELECT id FROM relation_candidates WHERE origin LIKE 'candidate_builder:%'"
     if _table_exists(conn, "relation_features"):
-        conn.execute("DELETE FROM relation_features")
-    conn.execute("DELETE FROM relation_support")
+        conn.execute(f"DELETE FROM relation_features WHERE candidate_id IN ({owned})")
+    conn.execute(f"DELETE FROM relation_support WHERE candidate_id IN ({owned})")
+    _delete_owned_candidate_relations(conn)
     conn.execute("DELETE FROM relation_candidates WHERE origin LIKE 'candidate_builder:%'")
+
+
+def _delete_owned_candidate_relations(conn):
+    # Match the candidate id delimiter, not a relation type or another producer's prefix.
     conn.execute(
         """
         DELETE FROM entity_relations
-        WHERE relation_type='mentioned_together'
-           OR COALESCE(detected_by, '') LIKE 'co_occurrence:%'
-           OR COALESCE(detected_by, '') LIKE 'relation_candidate:%'
-           OR relation_type IN ({placeholders})
-        """.format(placeholders=",".join("?" * len(PROMOTED_RELATION_TYPES))),
-        PROMOTED_RELATION_TYPES,
+        WHERE EXISTS (
+            SELECT 1 FROM relation_candidates c
+            WHERE c.origin LIKE 'candidate_builder:%'
+              AND entity_relations.detected_by LIKE 'relation_candidate:' || c.id || ':%'
+        )
+        """
     )
-    conn.commit()
 
 
 def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
@@ -1590,12 +1595,14 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
         settings = load_settings()
     conn = get_db(settings)
     try:
-        _delete_previous_candidate_state(conn)
         if not _table_exists(conn, "entity_mentions") or not _table_exists(conn, "relation_candidates"):
             return {
                 "ok": False,
                 "fatal_errors": ["relation_candidate_schema_missing"],
             }
+
+        conn.execute("BEGIN IMMEDIATE")
+        _delete_previous_candidate_state(conn)
 
         entity_records = {
             int(row[0]): {
@@ -2504,8 +2511,8 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
                 )
                 support_rows_created += 1
 
-        conn.commit()
         promoted = promote_relation_candidates(conn)
+        conn.commit()
         return {
             "ok": True,
             "candidate_pairs": created,
@@ -2515,6 +2522,9 @@ def rebuild_relation_candidates(settings: dict | None = None) -> dict[str, Any]:
             "promoted_candidates": promoted["promoted_candidates"],
             "promoted_relations": promoted["promoted_relations"],
         }
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
@@ -2527,16 +2537,18 @@ def promote_relation_candidates(conn_or_settings: Any = None, score_threshold: f
     else:
         conn = conn_or_settings
 
+    savepoint_open = False
     try:
-        conn.execute(
-            "DELETE FROM entity_relations WHERE COALESCE(detected_by, '') LIKE 'relation_candidate:%'"
-        )
+        conn.execute("SAVEPOINT relation_candidate_promotion")
+        savepoint_open = True
+        _delete_owned_candidate_relations(conn)
         promoted_candidates = 0
         promoted_relations = 0
         for row in conn.execute(
             """
             SELECT id, entity_a_id, entity_b_id, candidate_type, score, calibrated_score, sample_content_ids, metadata_json, candidate_state, promotion_state
             FROM relation_candidates
+            WHERE origin LIKE 'candidate_builder:%'
             ORDER BY score DESC, id
             """
         ).fetchall():
@@ -2598,11 +2610,17 @@ def promote_relation_candidates(conn_or_settings: Any = None, score_threshold: f
                     candidate_id,
                 ),
             )
-        conn.commit()
+        conn.execute("RELEASE SAVEPOINT relation_candidate_promotion")
+        savepoint_open = False
         return {
             "promoted_candidates": promoted_candidates,
             "promoted_relations": promoted_relations,
         }
+    except Exception:
+        if savepoint_open:
+            conn.execute("ROLLBACK TO SAVEPOINT relation_candidate_promotion")
+            conn.execute("RELEASE SAVEPOINT relation_candidate_promotion")
+        raise
     finally:
         if close_conn:
             conn.close()

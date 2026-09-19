@@ -79,7 +79,13 @@ class AgentMasTests(unittest.TestCase):
                     payload={"urls": ["https://official.example.test/doc"]},
                     confidence=0.82,
                 )
-                complete_agent_task(conn, first["task_id"], result={"status": "needs_review"})
+                complete_agent_task(
+                    conn,
+                    first["task_id"],
+                    result={"status": "needs_review"},
+                    lease_owner="worker-1",
+                    lease_token=leased["lease_token"],
+                )
 
                 repeat_completed = enqueue_agent_task(
                     conn,
@@ -112,8 +118,56 @@ class AgentMasTests(unittest.TestCase):
             finally:
                 conn.close()
 
+    def test_agent_lease_reclaims_expired_work_and_rejects_stale_completion(self):
+        from agents.bus import complete_agent_task, enqueue_agent_task, lease_agent_task
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "mas.db"
+            create_db(db_path)
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            try:
+                task = enqueue_agent_task(
+                    conn,
+                    task_type="verification",
+                    requester_group="news_logic",
+                    target_group="relation_audit",
+                    subject_type="fact",
+                    subject_id=7,
+                    payload={"fact_id": 7},
+                )
+                first = lease_agent_task(conn, lease_owner="worker-a", lease_seconds=30)
+                self.assertEqual(first["id"], task["task_id"])
+                conn.execute(
+                    "UPDATE agent_tasks SET lease_expires_at='2000-01-01T00:00:00' WHERE id=?",
+                    (task["task_id"],),
+                )
+                conn.commit()
+                second = lease_agent_task(conn, lease_owner="worker-b", lease_seconds=30)
+                self.assertEqual(second["id"], task["task_id"])
+                self.assertFalse(
+                    complete_agent_task(
+                        conn,
+                        task["task_id"],
+                        result={"stale": True},
+                        lease_owner="worker-a",
+                        lease_token=first["lease_token"],
+                    )
+                )
+                self.assertTrue(
+                    complete_agent_task(
+                        conn,
+                        task["task_id"],
+                        result={"ok": True},
+                        lease_owner="worker-b",
+                        lease_token=second["lease_token"],
+                    )
+                )
+            finally:
+                conn.close()
+
     def test_search_evidence_dedupes_citations_without_writing_truth_layers(self):
-        from agents.bus import enqueue_agent_task
+        from agents.bus import enqueue_agent_task, lease_agent_task
         from agents.search import persist_search_result
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -156,7 +210,9 @@ class AgentMasTests(unittest.TestCase):
                     "citations": [{"url": "https://rkn.gov.ru/doc/123"}],
                 }
 
-                written = persist_search_result(conn, task["task_id"], result)
+                leased = lease_agent_task(conn, lease_owner="search-test")
+                written = persist_search_result(conn, task["task_id"], result,
+                    lease_owner="search-test", lease_token=leased["lease_token"])
 
                 self.assertEqual(written["search_evidence_written"], 1)
                 self.assertEqual(conn.execute("SELECT COUNT(*) FROM search_evidence").fetchone()[0], 1)

@@ -122,6 +122,7 @@ def _build_ai_task(task: dict[str, Any]) -> dict[str, Any]:
 
 def _run_one_search_task(conn: sqlite3.Connection, task: dict[str, Any]) -> dict[str, Any]:
     task_id = int(task["id"])
+    lease_owner = str(task.get("lease_owner") or "")
     key = choose_key_for_stage(conn, stage="agent_search", requires_web_search=True)
     if not key:
         complete_agent_task(
@@ -130,6 +131,8 @@ def _run_one_search_task(conn: sqlite3.Connection, task: dict[str, Any]) -> dict
             status="needs_retry",
             failure_kind="no_web_search_key",
             error_text="No active key/model supports agent_search with web search",
+            lease_owner=lease_owner,
+            lease_token=task.get("lease_token"),
         )
         return {"ok": False, "failure_kind": "no_web_search_key", "search_evidence_written": 0}
 
@@ -141,6 +144,8 @@ def _run_one_search_task(conn: sqlite3.Connection, task: dict[str, Any]) -> dict
             status="needs_retry",
             failure_kind="provider_model",
             error_text=f"No model_name for key {key.get('key_id')}",
+            lease_owner=lease_owner,
+            lease_token=task.get("lease_token"),
         )
         return {"ok": False, "failure_kind": "provider_model", "search_evidence_written": 0}
 
@@ -155,7 +160,7 @@ def _run_one_search_task(conn: sqlite3.Connection, task: dict[str, Any]) -> dict
         result.setdefault("provider", key["provider"])
         result.setdefault("model", model_name)
         record_key_success(conn, int(key["key_id"]))
-        persisted = persist_search_result(conn, task_id, result)
+        persisted = persist_search_result(conn, task_id, result, lease_owner=lease_owner, lease_token=task.get("lease_token"))
         return {"ok": True, **persisted}
     except Exception as exc:
         try:
@@ -168,6 +173,8 @@ def _run_one_search_task(conn: sqlite3.Connection, task: dict[str, Any]) -> dict
             status="needs_retry",
             failure_kind="api_error",
             error_text=str(exc),
+            lease_owner=lease_owner,
+            lease_token=task.get("lease_token"),
         )
         log.warning("agent_search task %s failed: %s", task_id, exc)
         return {"ok": False, "failure_kind": "api_error", "search_evidence_written": 0}

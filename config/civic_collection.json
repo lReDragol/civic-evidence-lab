@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "profile_id": "gosduma-2026",
+  "domain_modules": ["elections"],
+  "title": "Госдума 2026: источники, участки, протоколы и сообщения о нарушениях",
+  "db_dir": "F:/новости/db/civic-shadow",
+  "archive_root": "E:/CivicEvidence",
+  "report_dir": "F:/новости/reports/civic-collection",
+  "archive_max_bytes": 214748364800,
+  "archive_reserve_bytes": 53687091200,
+  "max_http_requests_24h": 600,
+  "max_model_requests_24h": 100,
+  "max_pending_tasks": 1000,
+  "report_interval_seconds": 60,
+  "gateway_config": null,
+  "keywords": ["выбор", "голос", "уик", "цик", "наблюдател", "бюллетен", "явк", "протокол", "вброс"],
+  "sources": [
+    {"url": "https://t.me/s/cikrossii", "allowed_hosts": ["t.me"], "interval_seconds": 300},
+    {"url": "https://www.cikrf.ru/", "allowed_hosts": ["www.cikrf.ru"], "interval_seconds": 600},
+    {"url": "https://www.tiktok.com/@russian_adekvat_/video/7687258781993995540", "allowed_hosts": ["www.tiktok.com"], "interval_seconds": 1800}
+  ]
+}

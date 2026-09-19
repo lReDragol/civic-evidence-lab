@@ -1,6 +1,9 @@
 (function () {
   const state = {
     bridge: null,
+    civic: null,
+    civicConfigPending: true,
+    screenSequence: 0,
     bootstrap: null,
     screenData: null,
     group: "monitoring",
@@ -46,6 +49,18 @@
     cacheUi();
     bindShellEvents();
     await initBridge();
+    const civicConfig = await bridgeCall("getCivicConfig");
+    state.civicConfigPending = false;
+    if (civicConfig?.enabled === true && window.CELReactorV2) {
+      state.civic = window.CELReactorV2.mountCivic({
+        call: bridgeCall,
+        onLegacy: async () => {
+          state.screenSequence += 1;
+          await loadBootstrap();
+        },
+      });
+      return;
+    }
     await loadBootstrap();
   }
 
@@ -89,6 +104,7 @@
 
       if (state.bridge.bootstrapChanged && typeof state.bridge.bootstrapChanged.connect === "function") {
         state.bridge.bootstrapChanged.connect(async () => {
+          if (state.civicConfigPending || state.civic?.active) return;
           await loadBootstrap();
         });
       }
@@ -107,8 +123,9 @@
   }
 
   async function loadBootstrap() {
+    if (state.civic?.active) return;
     const payload = await bridgeCall("getBootstrap");
-    if (!payload) {
+    if (!payload || state.civic?.active) {
       return;
     }
     state.bootstrap = payload;
@@ -128,6 +145,9 @@
   }
 
   async function loadCurrentScreen() {
+    if (state.civic?.active) return;
+    const sequence = ++state.screenSequence;
+    const section = state.section;
     const payload = await bridgeCall(
       "getScreenPayload",
       JSON.stringify({
@@ -135,6 +155,7 @@
         filters: buildScreenFilters(),
       })
     );
+    if (sequence !== state.screenSequence || section !== state.section || state.civic?.active) return;
     state.screenData = payload || { items: [], detail: null };
     renderScreen();
   }

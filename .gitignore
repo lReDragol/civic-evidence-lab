@@ -35,6 +35,8 @@ db/*.db
 db/*.db-*
 db/backups/
 runtime/generated/
+.civic-writer.lock
+civic-stop.json
 
 # Collected source material and generated outputs
 inbox/
@@ -86,7 +88,7 @@ tests/_artifacts/
 tests/.tmp/
 
 # Local planning notes and generated agent plans
-todo.md
+# Implementation checklist is a versioned delivery artifact.
 PLAN_IMPROVEMENTS.md
 docs/superpowers/
 
@@ -129,5 +131,12 @@ tools/check_relations.py
 tools/check_reverify*.py
 tools/check_senators*.py
 tools/check_votes.py
+
+# Rotated runtime logs and local gateway/archive material
+*.log.*
+*.warc
+*.warc.gz
+*.partial
+civic-gateway.local.json
 tools/db_final_report.py
 tools/verify_test_*.py

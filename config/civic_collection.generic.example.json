@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "profile_id": "research-topic",
+  "title": "Universal research collection: replace topic and source configuration",
+  "domain_modules": [],
+  "db_dir": "../db/civic-generic-shadow",
+  "archive_root": "E:/CivicEvidence",
+  "report_dir": "../reports/civic-generic-collection",
+  "archive_max_bytes": 214748364800,
+  "archive_reserve_bytes": 53687091200,
+  "max_http_requests_24h": 100,
+  "max_model_requests_24h": 50,
+  "max_pending_tasks": 500,
+  "report_interval_seconds": 60,
+  "gateway_config": null,
+  "keywords": [],
+  "sources": [
+    {"url": "https://example.org/", "allowed_hosts": ["example.org"], "interval_seconds": 3600}
+  ]
+}

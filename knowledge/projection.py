@@ -61,6 +61,14 @@ def activate_generation(conn: sqlite3.Connection, generation_id: int) -> None:
     now = _now_iso()
     conn.execute("BEGIN IMMEDIATE")
     try:
+        active = conn.execute("SELECT id,source_watermark FROM projection_generations WHERE projection_type=? AND status='active'", (projection_type,)).fetchone()
+        candidate = conn.execute("SELECT source_watermark FROM projection_generations WHERE id=?", (generation_id,)).fetchone()
+        if active and active[0] > generation_id:
+            raise RuntimeError("Stale generation cannot replace a newer active generation")
+        if active and active[1] and not candidate[0]:
+            raise RuntimeError("A versioned projection cannot be replaced by an unversioned one")
+        if active and str(active[1] or "").isdigit() and str(candidate[0] or "").isdigit() and int(candidate[0]) < int(active[1]):
+            raise RuntimeError("Source watermark regression")
         conn.execute(
             """
             UPDATE projection_generations

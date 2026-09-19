@@ -34,7 +34,31 @@ def text_hash(text: Any) -> str | None:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest() if normalized else None
 
 
-def record_source_revision(
+def record_source_revision(conn: sqlite3.Connection, **fields) -> dict[str, Any]:
+    """Atomically record content and its observation, including A -> B -> A."""
+    conn.execute("SAVEPOINT source_revision_write")
+    try:
+        result = _record_source_revision(conn, **fields)
+        previous = conn.execute("SELECT id,source_revision_id,sequence_no FROM source_observations WHERE source_object_id=? ORDER BY sequence_no DESC LIMIT 1", (result["source_object_id"],)).fetchone()
+        if previous is None or previous[1] != result["revision_id"]:
+            cur = conn.execute("""INSERT INTO source_observations(source_object_id,source_revision_id,sequence_no,
+                observed_at,fetched_at,previous_observation_id) VALUES(?,?,?,?,?,?)""",
+                (result["source_object_id"],result["revision_id"],previous[2]+1 if previous else 1,
+                 fields.get("observed_at"),_now_iso(),previous[0] if previous else None))
+            result["observation_id"] = cur.lastrowid
+            result["observation_created"] = True
+        else:
+            result["observation_id"] = previous[0]
+            result["observation_created"] = False
+        conn.execute("RELEASE source_revision_write")
+        return result
+    except Exception:
+        conn.execute("ROLLBACK TO source_revision_write")
+        conn.execute("RELEASE source_revision_write")
+        raise
+
+
+def _record_source_revision(
     conn: sqlite3.Connection,
     *,
     source_id: int,
@@ -56,14 +80,15 @@ def record_source_revision(
     now = _now_iso()
     canonical_payload = _canonical_payload(raw_payload)
     digest = hashlib.sha256(canonical_payload.encode("utf-8")).hexdigest()
+    source_column = "source_system_id" if "source_system_id" in {r[1] for r in conn.execute("PRAGMA table_info(source_objects)")} else "source_id"
 
     conn.execute(
-        """
+        f"""
         INSERT INTO source_objects(
-            source_id, external_id, object_kind, canonical_url,
+            {source_column}, external_id, object_kind, canonical_url,
             first_seen_at, last_seen_at, metadata_json
         ) VALUES(?,?,?,?,?,?,?)
-        ON CONFLICT(source_id, external_id) DO UPDATE SET
+        ON CONFLICT({source_column}, external_id) DO UPDATE SET
             last_seen_at=excluded.last_seen_at,
             canonical_url=COALESCE(excluded.canonical_url, source_objects.canonical_url),
             metadata_json=COALESCE(excluded.metadata_json, source_objects.metadata_json)
@@ -79,7 +104,7 @@ def record_source_revision(
         ),
     )
     object_row = conn.execute(
-        "SELECT id FROM source_objects WHERE source_id=? AND external_id=?",
+        f"SELECT id FROM source_objects WHERE {source_column}=? AND external_id=?",
         (int(source_id), external_id),
     ).fetchone()
     source_object_id = int(object_row[0])
@@ -92,16 +117,6 @@ def record_source_revision(
         (source_object_id,),
     ).fetchone()
     if current is not None and str(current[2]) == digest:
-        conn.execute(
-            """
-            UPDATE source_revisions
-            SET raw_item_id=COALESCE(?, raw_item_id),
-                content_item_id=COALESCE(?, content_item_id),
-                observed_at=COALESCE(?, observed_at)
-            WHERE id=?
-            """,
-            (raw_item_id, content_item_id, observed_at, int(current[0])),
-        )
         return {
             "source_object_id": source_object_id,
             "revision_id": int(current[0]),
@@ -111,24 +126,31 @@ def record_source_revision(
         }
 
     previous_id = int(current[0]) if current is not None else None
-    revision_no = int(current[1]) + 1 if current is not None else 1
+    revision_no = conn.execute("SELECT COALESCE(MAX(revision_no),0)+1 FROM source_revisions WHERE source_object_id=?", (source_object_id,)).fetchone()[0]
     if previous_id is not None:
         conn.execute(
             "UPDATE source_revisions SET is_current=0 WHERE id=?",
             (previous_id,),
         )
+    historical = conn.execute("SELECT id,revision_no FROM source_revisions WHERE source_object_id=? AND payload_hash=?", (source_object_id,digest)).fetchone()
+    if historical:
+        conn.execute("UPDATE source_revisions SET is_current=1 WHERE id=?", (historical[0],))
+        return {"source_object_id": source_object_id, "revision_id": historical[0],
+                "revision_no": historical[1], "created": False, "payload_hash": digest}
+    legacy_columns = "raw_item_id, content_item_id," if source_column == "source_id" else ""
+    legacy_values = (raw_item_id, content_item_id) if legacy_columns else ()
+    placeholders = "?, ?," if legacy_columns else ""
     cur = conn.execute(
-        """
+        f"""
         INSERT INTO source_revisions(
-            source_object_id, raw_item_id, content_item_id, revision_no,
+            source_object_id, {legacy_columns} revision_no,
             payload_hash, text_hash, payload_json, observed_at, fetched_at,
             supersedes_revision_id, is_current, metadata_json
-        ) VALUES(?,?,?,?,?,?,?,?,?,?,1,?)
+        ) VALUES(?,{placeholders}?,?,?,?,?,?,?,1,?)
         """,
         (
             source_object_id,
-            raw_item_id,
-            content_item_id,
+            *legacy_values,
             revision_no,
             digest,
             text_hash(content_text),

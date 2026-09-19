@@ -40,6 +40,18 @@ def _version_and_name(path: Path) -> tuple[str, str]:
     return version, name
 
 
+def _statements(sql: str):
+    # complete_statement understands trigger bodies and quoted semicolons.
+    statement = ""
+    for char in sql:
+        statement += char
+        if char == ";" and sqlite3.complete_statement(statement):
+            yield statement
+            statement = ""
+    if statement.strip():
+        yield statement
+
+
 def apply_pending_migrations(
     conn: sqlite3.Connection,
     *,
@@ -47,6 +59,8 @@ def apply_pending_migrations(
 ) -> dict[str, Any]:
     """Apply immutable SQL migrations and verify already-applied checksums."""
 
+    if conn.in_transaction:
+        raise RuntimeError("Migrations require a connection without pending writes")
     target_dir = migrations_dir or MIGRATIONS_DIR
     _ensure_ledger(conn)
     applied: list[dict[str, Any]] = []
@@ -56,29 +70,28 @@ def apply_pending_migrations(
         version, name = _version_and_name(path)
         sql = path.read_text(encoding="utf-8")
         checksum = hashlib.sha256(sql.encode("utf-8")).hexdigest()
-        row = conn.execute(
-            "SELECT checksum FROM schema_migrations WHERE version=?",
-            (version,),
-        ).fetchone()
-        if row is not None:
-            existing_checksum = str(row[0])
-            if existing_checksum != checksum:
-                raise RuntimeError(
-                    f"Migration checksum mismatch for {path.name}: "
-                    f"database={existing_checksum} file={checksum}"
-                )
-            skipped.append(version)
-            continue
-
         started = time.perf_counter()
-        script = (
-            "PRAGMA defer_foreign_keys=ON;\n"
-            "BEGIN IMMEDIATE;\n"
-            f"{sql}\n"
-            "COMMIT;\n"
-        )
         try:
-            conn.executescript(script)
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT checksum FROM schema_migrations WHERE version=?", (version,)).fetchone()
+            if row is not None:
+                if str(row[0]) != checksum:
+                    raise RuntimeError(f"Migration checksum mismatch for {path.name}")
+                conn.commit()
+                skipped.append(version)
+                continue
+            conn.execute("PRAGMA defer_foreign_keys=ON")
+            # Do not use executescript: it implicitly commits existing transactions.
+            def guard(action, arg1, arg2, database, trigger):
+                if action in (sqlite3.SQLITE_TRANSACTION, sqlite3.SQLITE_ATTACH, sqlite3.SQLITE_DETACH):
+                    return sqlite3.SQLITE_DENY
+                return sqlite3.SQLITE_OK
+            conn.set_authorizer(guard)
+            try:
+                for statement in _statements(sql):
+                    conn.execute(statement)
+            finally:
+                conn.set_authorizer(None)
             duration_ms = int((time.perf_counter() - started) * 1000)
             conn.execute(
                 """

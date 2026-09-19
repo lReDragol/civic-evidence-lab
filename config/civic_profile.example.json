@@ -1,0 +1,22 @@
+{
+  "profile": "civic-shadow-gosduma-2026",
+  "campaign_scope": "Gosduma 2026, nationwide research; official campaign identifiers unresolved",
+  "ballot_scopes": ["federal_list", "single_member_district"],
+  "reactor_db_dir": "F:/новости/db/civic-shadow",
+  "evidence_archive_root": "E:/CivicEvidence",
+  "evidence_archive_max_bytes": 214748364800,
+  "evidence_archive_reserve_bytes": 53687091200,
+  "civic_workbench_enabled": true,
+  "telegram_store_mode": "all",
+  "telegram_edit_scan_limit": 20,
+  "telegram_recent_capture_limit": 20,
+  "max_llm_concurrency": 4,
+  "max_browser_concurrency": 2,
+  "max_http_concurrency": 8,
+  "auto_publish": false,
+  "full_ai_sweep": false,
+  "allow_local_llm": false,
+  "gateway_config": null,
+  "approved_capture_hosts": ["www.cikrf.ru", "t.me", "www.tiktok.com"],
+  "notes": "Example only. Not automatically merged into live settings. Current civic worker is serial; limits are upper bounds for future parallel rollout, not claims that workers are active."
+}

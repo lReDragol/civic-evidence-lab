@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import logging
 import sqlite3
 from datetime import datetime, timezone
 from typing import Any
@@ -41,6 +43,8 @@ def _create_review_task(
                 task_key, queue_key, subject_type, subject_id,
                 suggested_action, confidence, machine_reason, candidate_payload, status, created_at, updated_at
             ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(task_key) DO UPDATE SET updated_at=excluded.updated_at,
+                candidate_payload=excluded.candidate_payload, machine_reason=excluded.machine_reason
             """,
             (
                 task_key,
@@ -60,8 +64,8 @@ def _create_review_task(
         if cur.rowcount and cur.rowcount > 0:
             return int(cur.lastrowid)
     except sqlite3.Error:
-        # If table/schema mismatch, silently skip
-        pass
+        logging.getLogger(__name__).exception("Pipeline review task persistence failed")
+        raise
     return None
 
 
@@ -81,7 +85,7 @@ def _emit_alert_task(
         "metrics": metrics,
         "timestamp": _now_iso(),
     }
-    return enqueue_agent_task(
+    task = enqueue_agent_task(
         conn,
         task_type="pipeline_alert",
         requester_group="pipeline_monitor",
@@ -90,8 +94,13 @@ def _emit_alert_task(
         subject_id=None,
         payload=payload,
         priority=priority,
-        input_hash=json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str),
+        input_hash=hashlib.sha256(f"{stage}:{issue}".encode()).hexdigest(),
+        task_key="pipeline-alert:" + hashlib.sha256(f"{stage}:{issue}".encode()).hexdigest(),
     )
+    if not task["created"]:
+        conn.execute("UPDATE agent_tasks SET updated_at=?,payload_json=? WHERE id=? AND status!='running'", (_now_iso(),json.dumps(payload,ensure_ascii=False,default=str),task["task_id"]))
+        conn.commit()
+    return task
 
 
 def run_monitoring_cycle(settings: dict[str, Any]) -> dict[str, Any]:
@@ -125,7 +134,7 @@ def run_monitoring_cycle(settings: dict[str, Any]) -> dict[str, Any]:
                 for issue in issues:
                     review_id = _create_review_task(
                         conn,
-                        task_key=f"pipeline:{stage_name}:{_now_iso()}:{issue[:80]}",
+                        task_key="pipeline:" + hashlib.sha256(f"{stage_name}:{issue}".encode()).hexdigest(),
                         subject_type="pipeline_stage",
                         subject_id=None,
                         suggested_action="review",

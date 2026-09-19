@@ -748,7 +748,7 @@ class RelationLayerTests(unittest.TestCase):
             self.assertEqual(rows[0][6], "review")
             self.assertEqual(promoted, 0)
 
-    def test_entity_relation_builder_skips_same_source_only_pair(self):
+    def test_entity_relation_builder_skips_same_source_pair_and_preserves_external_edge(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "relations.db"
             create_relation_db(db_path)
@@ -775,7 +775,9 @@ class RelationLayerTests(unittest.TestCase):
             self.assertEqual(rows[0][0:3], (1, 2, "likely_association"))
             self.assertEqual(rows[0][3:6], (3, 2, 2))
             self.assertEqual(rows[0][6], "review")
-            self.assertEqual(weak_edges, 0)
+            # This edge belongs to co_occurrence:2, not this candidate builder.
+            # Rebuilding candidates must not delete another producer's data.
+            self.assertEqual(weak_edges, 1)
 
     def test_relation_candidate_builder_keeps_structural_only_contract_pairs_as_seed_only(self):
         with tempfile.TemporaryDirectory() as tmp:

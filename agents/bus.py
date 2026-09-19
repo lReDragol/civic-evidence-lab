@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -67,10 +68,16 @@ def enqueue_agent_task(
     priority: int = 50,
     input_hash: str | None = None,
     task_key: str | None = None,
+    subject_key: str | None = None,
+    parent_task_id: int | None = None,
+    trace_id: str | None = None,
+    deadline_at: str | None = None,
+    max_attempts: int = 3,
+    commit: bool = True,
 ) -> dict[str, Any]:
     payload = dict(payload or {})
     acceptance = dict(acceptance or {})
-    input_hash = input_hash or _json_hash({"payload": payload, "acceptance": acceptance})
+    input_hash = input_hash or _json_hash({"payload": payload, "acceptance": acceptance, "subject_key": subject_key})
     task_key = task_key or _generated_task_key(
         task_type=task_type,
         requester_group=requester_group,
@@ -80,12 +87,15 @@ def enqueue_agent_task(
         input_hash=input_hash,
     )
     now = _now_iso()
+    subject_column = "subject_key" if "subject_key" in {r[1] for r in conn.execute("PRAGMA table_info(agent_tasks)")} else "subject_id"
+    subject_value = str(subject_key or subject_id or "none") if subject_column == "subject_key" else subject_id
     cur = conn.execute(
-        """
+        f"""
         INSERT OR IGNORE INTO agent_tasks(
-            task_key, task_type, requester_group, target_group, subject_type, subject_id,
-            priority, status, input_hash, payload_json, acceptance_json, created_at, updated_at
-        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+            task_key, task_type, requester_group, target_group, subject_type, {subject_column},
+            priority, status, input_hash, payload_json, acceptance_json, created_at, updated_at,
+            parent_task_id, trace_id, deadline_at, max_attempts
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             task_key,
@@ -93,7 +103,7 @@ def enqueue_agent_task(
             requester_group,
             target_group,
             subject_type,
-            subject_id,
+            subject_value,
             int(priority),
             "pending",
             input_hash,
@@ -101,11 +111,13 @@ def enqueue_agent_task(
             _json_dumps(acceptance),
             now,
             now,
+            parent_task_id, trace_id or uuid.uuid4().hex, deadline_at, min(3, max(1, int(max_attempts))),
         ),
     )
     created = cur.rowcount > 0
     row = conn.execute("SELECT id, status FROM agent_tasks WHERE task_key=?", (task_key,)).fetchone()
-    conn.commit()
+    if commit:
+        conn.commit()
     return {"task_id": int(row["id"] if isinstance(row, sqlite3.Row) else row[0]), "created": created, "status": row["status"] if isinstance(row, sqlite3.Row) else row[1]}
 
 
@@ -117,41 +129,96 @@ def lease_agent_task(
     lease_seconds: int = 300,
 ) -> dict[str, Any] | None:
     now = _now_iso()
-    params: list[Any] = [now]
+    params: list[Any] = [now, now, now, now]
     group_filter = ""
     if target_group:
         group_filter = "AND target_group=?"
         params.append(target_group)
-    row = conn.execute(
-        f"""
-        SELECT *
-        FROM agent_tasks
-        WHERE status IN ('pending', 'needs_retry')
-          AND (lease_expires_at IS NULL OR lease_expires_at<=?)
-          {group_filter}
-        ORDER BY priority ASC, id ASC
-        LIMIT 1
-        """,
-        tuple(params),
-    ).fetchone()
-    if row is None:
-        return None
-    task_id = int(row["id"] if isinstance(row, sqlite3.Row) else row[0])
     expires_at = (datetime.now(timezone.utc) + timedelta(seconds=max(30, int(lease_seconds)))).replace(
         tzinfo=None,
         microsecond=0,
     ).isoformat()
-    conn.execute(
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute("""UPDATE agent_tasks SET status='insufficient_evidence', updated_at=?,
+            lease_token=NULL, lease_owner=NULL, lease_expires_at=NULL
+            WHERE status IN ('pending','needs_retry','running') AND
+            ((deadline_at IS NOT NULL AND deadline_at<=?) OR
+             (attempt_count>=max_attempts AND (status!='running' OR lease_expires_at<=?)))""", (now, now, now))
+        row = conn.execute(
+            f"""
+            SELECT id
+            FROM agent_tasks
+            WHERE ((
+                    status IN ('pending', 'needs_retry')
+                    AND (lease_expires_at IS NULL OR lease_expires_at<=?)
+                  )
+               OR (
+                    status='running'
+                    AND lease_expires_at IS NOT NULL
+                    AND lease_expires_at<=?
+                  ))
+              AND (available_at IS NULL OR available_at<=?)
+              AND (deadline_at IS NULL OR deadline_at>?)
+              AND attempt_count<max_attempts
+              {group_filter}
+            ORDER BY priority ASC, id ASC
+            LIMIT 1
+            """,
+            tuple(params),
+        ).fetchone()
+        if row is None:
+            conn.commit()
+            return None
+        task_id = int(row["id"] if isinstance(row, sqlite3.Row) else row[0])
+        changed = conn.execute(
+            """
+            UPDATE agent_tasks
+            SET status='running', lease_owner=?, lease_expires_at=?, updated_at=?,
+                attempt_count=COALESCE(attempt_count, 0)+1, lease_token=?, heartbeat_at=?
+            WHERE id=?
+              AND (
+                    status IN ('pending', 'needs_retry')
+                    OR (status='running' AND lease_expires_at IS NOT NULL AND lease_expires_at<=?)
+                  )
+            """,
+            (lease_owner, expires_at, now, uuid.uuid4().hex, now, task_id, now),
+        ).rowcount
+        if changed != 1:
+            conn.rollback()
+            return None
+        leased = conn.execute("SELECT * FROM agent_tasks WHERE id=?", (task_id,)).fetchone()
+        conn.commit()
+        return _row_to_dict(leased)
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def heartbeat_agent_task(
+    conn: sqlite3.Connection,
+    task_id: int,
+    *,
+    lease_owner: str,
+    lease_seconds: int = 300,
+    lease_token: str,
+) -> bool:
+    now = _now_iso()
+    expires_at = (datetime.now(timezone.utc) + timedelta(seconds=max(30, int(lease_seconds)))).replace(
+        tzinfo=None,
+        microsecond=0,
+    ).isoformat()
+    changed = conn.execute(
         """
         UPDATE agent_tasks
-        SET status='running', lease_owner=?, lease_expires_at=?, updated_at=?
-        WHERE id=? AND status IN ('pending', 'needs_retry')
+        SET lease_expires_at=?, heartbeat_at=?, updated_at=?
+        WHERE id=? AND status='running' AND lease_owner=? AND lease_token=?
+            AND lease_expires_at>? AND (deadline_at IS NULL OR deadline_at>?)
         """,
-        (lease_owner, expires_at, now, task_id),
-    )
+        (expires_at, now, now, int(task_id), lease_owner, lease_token, now, now),
+    ).rowcount
     conn.commit()
-    leased = conn.execute("SELECT * FROM agent_tasks WHERE id=?", (task_id,)).fetchone()
-    return _row_to_dict(leased)
+    return changed == 1
 
 
 def complete_agent_task(
@@ -162,28 +229,46 @@ def complete_agent_task(
     status: str = "completed",
     failure_kind: str | None = None,
     error_text: str | None = None,
-) -> None:
+    lease_owner: str | None = None,
+    lease_token: str | None = None,
+    commit: bool = True,
+    retry_seconds: int = 60,
+) -> bool:
     now = _now_iso()
-    conn.execute(
+    if not lease_owner or not lease_token:
+        raise ValueError("lease_owner and lease_token are required to complete an agent task")
+    if status not in {"completed", "needs_retry", "failed", "insufficient_evidence", "needs_user_access"}:
+        raise ValueError("Invalid completion status")
+    available_at = (datetime.now(timezone.utc) + timedelta(seconds=max(30, retry_seconds))).replace(tzinfo=None, microsecond=0).isoformat()
+    changed = conn.execute(
         """
         UPDATE agent_tasks
-        SET status=?, result_json=?, failure_kind=?, error_text=?, lease_owner=NULL, lease_expires_at=NULL,
+        SET status=CASE WHEN ?='needs_retry' AND attempt_count>=max_attempts THEN 'insufficient_evidence' ELSE ? END,
+            result_json=?, failure_kind=?, error_text=?, lease_owner=NULL, lease_expires_at=NULL, lease_token=NULL,
+            available_at=CASE WHEN ?='needs_retry' THEN ? ELSE NULL END,
+            heartbeat_at=NULL,
             completed_at=CASE WHEN ?='completed' THEN ? ELSE completed_at END,
             updated_at=?
-        WHERE id=?
+        WHERE id=? AND status='running' AND lease_owner=? AND lease_token=?
+            AND lease_expires_at>? AND (deadline_at IS NULL OR deadline_at>?)
         """,
         (
+            status,
             status,
             _json_dumps(result or {}),
             failure_kind,
             error_text,
+            status, available_at,
             status,
             now,
             now,
             int(task_id),
+            lease_owner, lease_token, now, now,
         ),
-    )
-    conn.commit()
+    ).rowcount
+    if commit:
+        conn.commit()
+    return changed == 1
 
 
 def record_agent_message(
@@ -216,25 +301,29 @@ def record_agent_artifact(
     subject_type: str | None = None,
     subject_id: int | None = None,
     source_links: list[str] | None = None,
+    subject_key: str | None = None,
+    commit: bool = True,
 ) -> int:
+    subject_column = "subject_key" if "subject_key" in {r[1] for r in conn.execute("PRAGMA table_info(agent_artifacts)")} else "subject_id"
     cur = conn.execute(
-        """
+        f"""
         INSERT INTO agent_artifacts(
-            task_id, artifact_type, subject_type, subject_id, payload_json, confidence, source_links_json, created_at
+            task_id, artifact_type, subject_type, {subject_column}, payload_json, confidence, source_links_json, created_at
         ) VALUES(?,?,?,?,?,?,?,?)
         """,
         (
             int(task_id) if task_id is not None else None,
             artifact_type,
             subject_type,
-            subject_id,
+            (subject_key or str(subject_id) if subject_id is not None else subject_key) if subject_column == "subject_key" else subject_id,
             _json_dumps(payload or {}),
             float(confidence or 0),
             json.dumps(source_links or [], ensure_ascii=False),
             _now_iso(),
         ),
     )
-    conn.commit()
+    if commit:
+        conn.commit()
     return int(cur.lastrowid)
 
 

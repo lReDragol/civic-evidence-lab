@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import logging
 import re
 import sqlite3
 from datetime import datetime, timezone
@@ -25,16 +26,18 @@ def _row_dict(row: sqlite3.Row | None) -> dict[str, Any]:
 def _rows(conn: sqlite3.Connection, sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
     try:
         return [dict(row) for row in conn.execute(sql, params).fetchall()]
-    except sqlite3.Error:
-        return []
+    except sqlite3.Error as exc:
+        logging.getLogger(__name__).exception("Monitoring query failed")
+        raise RuntimeError("Monitoring unavailable: database query failed") from exc
 
 
 def _scalar(conn: sqlite3.Connection, sql: str, params: tuple[Any, ...] = (), default: Any = 0) -> Any:
     try:
         row = conn.execute(sql, params).fetchone()
         return row[0] if row else default
-    except sqlite3.Error:
-        return default
+    except sqlite3.Error as exc:
+        logging.getLogger(__name__).exception("Monitoring scalar query failed")
+        raise RuntimeError("Monitoring unavailable: database query failed") from exc
 
 
 def _columns(conn: sqlite3.Connection, table_name: str) -> set[str]:

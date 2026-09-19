@@ -65,7 +65,30 @@ def _result_items(result: dict[str, Any]) -> list[dict[str, Any]]:
     return normalized
 
 
-def persist_search_result(conn: sqlite3.Connection, task_id: int, result: dict[str, Any]) -> dict[str, Any]:
+def persist_search_result(
+    conn: sqlite3.Connection,
+    task_id: int,
+    result: dict[str, Any],
+    *,
+    lease_owner: str | None = None,
+    lease_token: str | None = None,
+) -> dict[str, Any]:
+    if conn.in_transaction:
+        raise RuntimeError("Search result acceptance requires a clean connection")
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if not complete_agent_task(conn, task_id, result=result, lease_owner=lease_owner,
+                                   lease_token=lease_token, commit=False):
+            raise RuntimeError("Stale agent result rejected")
+        summary = _persist_search_artifacts(conn, task_id, result)
+        conn.commit()
+        return summary
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def _persist_search_artifacts(conn: sqlite3.Connection, task_id: int, result: dict[str, Any]) -> dict[str, Any]:
     payload = _task_payload(conn, task_id)
     query_text = str(
         payload.get("query")
@@ -116,11 +139,6 @@ def persist_search_result(conn: sqlite3.Connection, task_id: int, result: dict[s
         artifact_type="search_result",
         payload={"query_text": query_text, "result": result, "search_evidence_written": written},
         confidence=float(result.get("confidence") or 0),
+        commit=False,
     )
-    complete_agent_task(
-        conn,
-        int(task_id),
-        result={"search_evidence_written": written, "provider": provider, "model": model},
-    )
-    conn.commit()
     return {"search_evidence_written": written, "query_hash": query_hash}

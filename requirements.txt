@@ -19,3 +19,5 @@ rapidocr_onnxruntime
 PyMuPDF
 scikit-learn
 networkx
+warcio>=1.7.5,<2
+jsonschema>=4,<5

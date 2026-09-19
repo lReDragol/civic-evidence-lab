@@ -12,6 +12,7 @@ from typing import Any
 from PySide6.QtCore import QObject, Signal, Slot
 
 from ui.job_registry import JOB_DEFS, get_job_def, interval_for_job, serialize_jobs
+from ui.query_service import CivicQueryService
 
 
 log = logging.getLogger(__name__)
@@ -211,6 +212,7 @@ class DashboardDataService:
     def __init__(self, db: sqlite3.Connection, settings: dict[str, Any] | None = None):
         self.db = db
         self.settings = settings or {}
+        self.civic = CivicQueryService(self.settings)
 
     def bootstrap_payload(
         self,
@@ -3600,6 +3602,11 @@ class DashboardBridge(QObject):
         self.controller = controller
 
     def emit_bootstrap(self):
+        if self.service.civic.enabled:
+            # Existing listeners reload on this signal; workbench listeners
+            # ignore legacy refreshes, so do not eagerly build archive payloads.
+            self.bootstrapChanged.emit(self._json({"civic": self.service.civic.config()}))
+            return
         self.bootstrapChanged.emit(self._json(self.service.bootstrap_payload(
             running_jobs=set(self.controller.running_jobs()),
             scheduler_running=self.controller.scheduler_running(),
@@ -3608,6 +3615,55 @@ class DashboardBridge(QObject):
 
     def emit_toast(self, message: str, level: str = "info"):
         self.toastRaised.emit(self._json({"message": message, "level": level}))
+
+    @Slot(result=str)
+    def getCivicConfig(self) -> str:
+        return self._json(self.service.civic.config())
+
+    def _civic_control(self, method: str) -> str:
+        if not self.service.civic.enabled:
+            return self._json({"ok": False, "status": "unavailable", "error": "Civic workbench is disabled."})
+        handler = getattr(self.controller, method, None)
+        if not callable(handler):
+            return self._json({"ok": False, "status": "unavailable", "error": "Collection controller is unavailable."})
+        try:
+            return self._json(handler())
+        except Exception as exc:
+            log.warning("Civic collection control failed: %s (%s)", method, type(exc).__name__)
+            return self._json({"ok": False, "status": "unavailable", "error_type": type(exc).__name__,
+                               "error": "Collection control failed. Check the selected profile and runtime availability."})
+
+    @Slot(result=str)
+    def civicStartCollection(self) -> str:
+        return self._civic_control("civic_start_collection")
+
+    @Slot(result=str)
+    def civicCollectionStatus(self) -> str:
+        return self._civic_control("civic_collection_status")
+
+    @Slot(result=str)
+    def civicStopCollection(self) -> str:
+        return self._civic_control("civic_stop_collection")
+
+    @Slot(result=str)
+    def civicExportReport(self) -> str:
+        return self._civic_control("civic_export_report")
+
+    def _civic_request(self, payload_json: str, *, detail: bool = False) -> str:
+        if len(payload_json) > 16384:
+            return self._json(CivicQueryService.unavailable("", "Request is too large."))
+        payload = self._parse_json(payload_json)
+        if not payload:
+            return self._json(CivicQueryService.unavailable("", "Invalid request."))
+        return self._json(self.service.civic.request(payload, detail=detail))
+
+    @Slot(str, result=str)
+    def getCivicPage(self, payload_json: str) -> str:
+        return self._civic_request(payload_json)
+
+    @Slot(str, result=str)
+    def getCivicDetail(self, payload_json: str) -> str:
+        return self._civic_request(payload_json, detail=True)
 
     @Slot(result=str)
     def getBootstrap(self) -> str:
